@@ -476,3 +476,12 @@ jobs:
           cd spec
           java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -simulate num=20000 -depth 30 -config LedgerLens.cfg LedgerLens.tla
 
+      - name: Set up Rust for model-to-contract replay
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Replay bounded TLC behaviors against the Rust contract
+        run: python3 tools/validate_tla_trace_replay.py --jar /tmp/tla2tools.jar
+
