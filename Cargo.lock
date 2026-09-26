@@ -307,6 +307,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "conformance-tests"
+version = "0.1.0"
+dependencies = [
+ "ledgerlens-score",
+ "reference-provider",
+ "serde",
+ "serde_json",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1253,6 +1264,13 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+]
+
+[[package]]
+name = "reference-provider"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
