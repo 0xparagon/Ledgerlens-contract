@@ -86,19 +86,29 @@ should be visible too.
 
 ### CI status for this PR
 
-Not executed. Every `pull_request` run in this repository from a fork — including
-runs from other contributors — produces a workflow run with **zero jobs** and an
-instant `failure` (or sits in `action_required` awaiting approval), so
-`Contract CI` has never started for a fork PR. Verified on 2026-09-26: runs
-`36239308673` (this PR, 0 jobs), `33634316155` (Sept 2, `devjessica-cyber`, 0
-jobs), and `34721296360` (Sept 12, `action_required`).
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo check --workspace --all-targets` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test -p conformance-tests` (the 33 vectors) | **not run** |
+| `Contract CI` on the PR | **never started** |
 
-The Rust in this change — the reference provider, the conformance harness, and
-both adapters — therefore has **never been compiled**, by me or by CI. A
-maintainer needs to approve the workflow run (or push the branch into this
-repository) before the test plan in the PR description means anything. Treat
-"conformance suite exists" as a claim about the code, not as a passing result,
-until that run is green.
+The first three were run locally. `cargo test` was not, so **the conformance
+vectors have never been executed against either provider** — the suite compiles
+and is lint-clean, and nothing more than that is claimed. Treat "conformance suite
+exists" as a claim about the code, not as a passing result, until someone runs
+it.
+
+`Contract CI` cannot help: every `pull_request` run in this repository from a fork
+— including other contributors' — produces a workflow run with **zero jobs** and
+an instant `failure`, or sits in `action_required` awaiting approval. Verified
+2026-09-26: run `36239308673` (this PR, 0 jobs), `33634316155` (2 Sept,
+`devjessica-cyber`, 0 jobs), `34721296360` (12 Sept, `action_required`). A
+maintainer needs to approve the run, or push the branch into this repository,
+before the PR's own test plan means anything. Separately, `Contract CI` is red on
+`main` (push runs 887–898 fail after ~16 min of real job execution), which is a
+pre-existing condition of the base branch and not caused by this change.
 
 ## 5. Open questions for reviewers
 
