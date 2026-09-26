@@ -37,8 +37,8 @@ marketing.
 
 | Venue | Status | Link |
 |---|---|---|
-| Ledgerlens-contract issue #1248 (design note) | posted | see issue timeline |
-| Ledgerlens-contract issue #1248 (PR) | pending | — |
+| Ledgerlens-contract issue #1248 (design note) | posted | [#issuecomment-5845897788](https://github.com/Ledger-Lenz/Ledgerlens-contract/issues/1248#issuecomment-5845897788) |
+| Ledgerlens-contract issue #1248 (PR) | posted | [#1253](https://github.com/Ledger-Lenz/Ledgerlens-contract/pull/1253) (superseded by [#1254](https://github.com/Ledger-Lenz/Ledgerlens-contract/pull/1254), opened from the `wisdom2030-dotcom` fork) |
 | Stellar Discord `#soroban-contracts` / `#standards` | **not posted — maintainer action required** | — |
 | Stellar Developer Forum | **not posted — maintainer action required** | — |
 | SEP pull request against `stellar/stellarsep` (once assigned a number) | **blocked on SEP number assignment** | — |
@@ -83,6 +83,22 @@ should be visible too.
 | # | Date | Venue | Reviewer | Comment | Disposition |
 |---|---|---|---|---|---|
 | 1 | 2026-09-26 | issue #1248 | — | Design note posted; no maintainer response yet | open |
+
+### CI status for this PR
+
+Not executed. Every `pull_request` run in this repository from a fork — including
+runs from other contributors — produces a workflow run with **zero jobs** and an
+instant `failure` (or sits in `action_required` awaiting approval), so
+`Contract CI` has never started for a fork PR. Verified on 2026-09-26: runs
+`36239308673` (this PR, 0 jobs), `33634316155` (Sept 2, `devjessica-cyber`, 0
+jobs), and `34721296360` (Sept 12, `action_required`).
+
+The Rust in this change — the reference provider, the conformance harness, and
+both adapters — therefore has **never been compiled**, by me or by CI. A
+maintainer needs to approve the workflow run (or push the branch into this
+repository) before the test plan in the PR description means anything. Treat
+"conformance suite exists" as a claim about the code, not as a passing result,
+until that run is green.
 
 ## 5. Open questions for reviewers
 
