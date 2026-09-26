@@ -239,6 +239,14 @@ use soroban_sdk::{
 };
 use subtle::ConstantTimeEq;
 
+// Build-verification metadata (SEP-55 convention) embedded in the WASM
+// `contractmetav0` custom section. Constant, so the build stays reproducible;
+// the commit is bound by the release attestation. See docs/build-verification.md.
+soroban_sdk::contractmeta!(
+    key = "source_repo",
+    val = "github:Ledger-Lenz/Ledgerlens-contract"
+);
+
 pub use constants::CONFIG_DRIFT_MANIFEST_FIELDS;
 pub use errors::Error;
 #[cfg(not(target_family = "wasm"))]

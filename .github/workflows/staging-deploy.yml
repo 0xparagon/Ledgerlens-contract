@@ -1,0 +1,116 @@
+name: Staging Deploy
+
+# Continuously deploys main to the staging instance. Runs only after
+# "Contract CI" (whose `CI gate` is the required check) succeeds for a push to
+# main, so unreviewed or failing changes never deploy.
+# See docs/staging-deployment.md.
+
+on:
+  workflow_run:
+    workflows: ["Contract CI"]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+# Serialise deployments; never cancel one mid-upgrade.
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+env:
+  STELLAR_CLI_VERSION: "21.0.0"
+  NETWORK: testnet
+
+jobs:
+  deploy:
+    name: Upgrade staging and verify
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Install Stellar CLI
+        run: |
+          curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin stellar
+          ln -sf /usr/local/bin/stellar /usr/local/bin/soroban
+
+      - name: Build release artifact
+        run: |
+          cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
+          stellar contract optimize \
+            --wasm target/wasm32-unknown-unknown/release/ledgerlens_score.wasm \
+            --output target/ledgerlens_score.optimized.wasm
+
+      - name: Load staging key
+        env:
+          STAGING_ADMIN_SECRET_KEY: ${{ secrets.STAGING_ADMIN_SECRET_KEY }}
+        run: |
+          test -n "$STAGING_ADMIN_SECRET_KEY" || { echo "::error::STAGING_ADMIN_SECRET_KEY not set"; exit 1; }
+          echo "$STAGING_ADMIN_SECRET_KEY" | stellar keys add staging-admin --secret-key
+
+      - name: Upgrade, verify, roll back on failure
+        id: deploy
+        env:
+          GITHUB_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          mkdir -p evidence
+          set +e
+          scripts/staging-deploy.sh "$NETWORK" "${{ vars.STAGING_CONTRACT_ID }}" staging-admin \
+            target/ledgerlens_score.optimized.wasm evidence/staging.json 2>&1 | tee evidence/deploy.log
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-deploy-evidence
+          path: evidence/
+          retention-days: 30
+
+      - name: Publish staging status
+        if: always() && hashFiles('evidence/staging.json') != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp evidence/staging.json /tmp/staging.json
+          git fetch origin staging-status || true
+          git checkout -B staging-status origin/staging-status 2>/dev/null || git checkout --orphan staging-status
+          git rm -rfq . 2>/dev/null || true
+          mkdir -p deploy/staging && cp /tmp/staging.json deploy/staging/status.json
+          git add deploy/staging/status.json
+          git commit -qm "staging: $(jq -r .last_deployment.status deploy/staging/status.json) $(jq -r .commit deploy/staging/status.json)" || exit 0
+          git push origin staging-status
+
+      - name: Notify maintainers on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          STATUS=$(jq -r '.last_deployment.status // "unknown"' evidence/staging.json 2>/dev/null || echo unknown)
+          gh issue create --repo "${{ github.repository }}" \
+            --title "Staging deploy failed ($STATUS) for ${{ github.event.workflow_run.head_sha }}" \
+            --label staging-deploy-failure \
+            --body "$(printf 'Staging deployment of `%s` failed with status **%s** (exit code %s).\n\n- Logs: %s\n- Evidence artifact: `staging-deploy-evidence` on that run\n- CI run: %s\n\ncc @Ledger-Lenz/maintainers' \
+              "${{ github.event.workflow_run.head_sha }}" "$STATUS" "${{ steps.deploy.outputs.rc }}" "$RUN_URL" "${{ github.event.workflow_run.html_url }}")" \
+            || gh issue create --repo "${{ github.repository }}" \
+              --title "Staging deploy failed for ${{ github.event.workflow_run.head_sha }}" \
+              --body "Logs: $RUN_URL"

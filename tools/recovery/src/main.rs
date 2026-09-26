@@ -13,6 +13,8 @@
 //! * `report` — Generate a post-action verification report from a snapshot
 //!   and an export.
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
