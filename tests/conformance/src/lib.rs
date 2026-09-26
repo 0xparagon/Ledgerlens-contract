@@ -47,6 +47,19 @@ use std::fmt::Write as _;
 /// staleness arithmetic is reproducible across providers.
 pub const BASE_TIMESTAMP: u64 = 1_700_000_000;
 
+/// The portable error code for "no data for this subject" (SEP clause 4.3,
+/// `ScoreNotFound`; the consumer obligation is clause 7.2).
+///
+/// Adapters need the number because Soroban erases a contract's error *type* at
+/// the host boundary. A read declared `-> bool` has no error channel, so a
+/// provider that must refuse does it with `panic_with_error!`, and what comes back
+/// is `InvokeError::Contract(discriminant)` — the enum is gone and only the number
+/// survives. That is the whole reason the standard pins the numbers, and it is
+/// the one place where a provider that renumbers its error enum stays perfectly
+/// conformant while every one of its `NotFound` answers silently degrades to
+/// `Unavailable`.
+pub const NOT_FOUND_CODE: u32 = 6;
+
 /// The scope (asset pair, market, or jurisdiction) used by every vector.
 ///
 /// Deliberately not a real trading pair: the value only has to be a `Symbol`
@@ -607,6 +620,11 @@ pub fn run_vector(provider: &mut dyn RiskProvider, vector: &Vector) -> Outcome {
                     Outcome::Fail(format!("expected {value} on both calls, got {a} then {b}"))
                 }
                 (_, Err(e), _) | (_, _, Err(e)) => Outcome::Fail(format!("gate unavailable: {e}")),
+                (_, Ok(_), Ok(_)) => Outcome::Fail(format!(
+                    "vector {} pairs GateDeterministic with a non-bool expectation ({})",
+                    vector.id,
+                    describe(&vector.expect)
+                )),
             }
         }
         Probe::GateEmitsNoEvents => {

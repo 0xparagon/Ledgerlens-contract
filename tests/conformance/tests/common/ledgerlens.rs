@@ -16,11 +16,26 @@ use soroban_sdk::{
     Address, Env, Symbol, Vec,
 };
 
-use super::map;
+use super::{map, ProviderError};
 
 /// Model version this adapter publishes. Arbitrary but fixed, so the
 /// `model_version` round-trip vector has something to assert.
 const MODEL_VERSION: u32 = 1;
+
+/// `ledgerlens-score` has 50 error variants and the harness classifies exactly
+/// one specially. Everything the contract returns deliberately is `Rejected`,
+/// because the fact that it answered at all is the part that matters. What must
+/// not happen is `ScoreNotFound` being reported as `Rejected`: "no score for this
+/// wallet" and "this provider is paused" are different answers, and only the
+/// first is worth retrying.
+impl ProviderError for Error {
+    fn probe_error(&self) -> ProbeError {
+        match self {
+            Error::ScoreNotFound => ProbeError::NotFound,
+            _ => ProbeError::Rejected,
+        }
+    }
+}
 
 /// Drives one `ledgerlens-score` deployment through the conformance vectors.
 pub struct Adapter {
@@ -128,17 +143,13 @@ impl RiskProvider for Adapter {
 
     fn score(&mut self, subject: &Address) -> ProbeResult<ScoreView> {
         let client = LedgerLensScoreContractClient::new(&self.env, &self.registry);
-        match client.try_get_score(subject, &self.scope) {
-            Ok(Ok(score)) => Ok(ScoreView {
-                score: score.score,
-                confidence: score.confidence,
-                timestamp: score.timestamp,
-                model_version: score.model_version,
-            }),
-            Ok(Err(Error::ScoreNotFound)) => Err(ProbeError::NotFound),
-            Ok(Err(_)) => Err(ProbeError::Rejected),
-            Err(_) => Err(ProbeError::Unavailable),
-        }
+        let score = map(client.try_get_score(subject, &self.scope))?;
+        Ok(ScoreView {
+            score: score.score,
+            confidence: score.confidence,
+            timestamp: score.timestamp,
+            model_version: score.model_version,
+        })
     }
 
     fn supports(&mut self, capability: &str) -> ProbeResult<bool> {
@@ -161,7 +172,7 @@ impl RiskProvider for Adapter {
     }
 
     fn event_count(&mut self) -> usize {
-        self.env.events().all().len()
+        self.env.events().all().len() as usize
     }
 }
 

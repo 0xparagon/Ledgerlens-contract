@@ -330,7 +330,11 @@ impl ReferenceRiskRegistry {
         capabilities.push_back(symbol_short!("meta"));
 
         let mut constraints = Vec::new(&env);
-        constraints.push_back(symbol_short!("fail_closed"));
+        // `Symbol::new`, not `symbol_short!`: the string is 11 characters and a
+        // short symbol caps at 9. Same spelling the shipped contract uses, which
+        // is the point — a constraint vocabulary that differs between providers
+        // is not a vocabulary.
+        constraints.push_back(Symbol::new(&env, "fail_closed"));
 
         InterfaceMetadata {
             interface_version: INTERFACE_VERSION,

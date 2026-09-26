@@ -15,10 +15,24 @@ use soroban_sdk::{
     Address, Env, Symbol,
 };
 
-use super::map;
+use super::{map, ProviderError};
 
 /// Model version this adapter publishes.
 const MODEL_VERSION: u32 = 1;
+
+/// The reference provider has eight error variants and the harness classifies
+/// exactly one specially: `ScoreNotFound` is the "no data" answer, not a
+/// rejection and emphatically not an unavailability. Getting this backwards is
+/// the single easiest way to make a dead provider look safe, which is why the
+/// harness asserts the distinction instead of trusting the adapter.
+impl ProviderError for Error {
+    fn probe_error(&self) -> ProbeError {
+        match self {
+            Error::ScoreNotFound => ProbeError::NotFound,
+            _ => ProbeError::Rejected,
+        }
+    }
+}
 
 /// Drives one `ReferenceRiskRegistry` deployment through the vectors.
 pub struct Adapter {
@@ -117,17 +131,13 @@ impl RiskProvider for Adapter {
 
     fn score(&mut self, subject: &Address) -> ProbeResult<ScoreView> {
         let client = ReferenceRiskRegistryClient::new(&self.env, &self.registry);
-        match client.try_get_score(subject, &self.scope) {
-            Ok(Ok(score)) => Ok(ScoreView {
-                score: score.score,
-                confidence: score.confidence,
-                timestamp: score.timestamp,
-                model_version: score.model_version,
-            }),
-            Ok(Err(Error::ScoreNotFound)) => Err(ProbeError::NotFound),
-            Ok(Err(_)) => Err(ProbeError::Rejected),
-            Err(_) => Err(ProbeError::Unavailable),
-        }
+        let score = map(client.try_get_score(subject, &self.scope))?;
+        Ok(ScoreView {
+            score: score.score,
+            confidence: score.confidence,
+            timestamp: score.timestamp,
+            model_version: score.model_version,
+        })
     }
 
     fn supports(&mut self, capability: &str) -> ProbeResult<bool> {
@@ -150,7 +160,7 @@ impl RiskProvider for Adapter {
     }
 
     fn event_count(&mut self) -> usize {
-        self.env.events().all().len()
+        self.env.events().all().len() as usize
     }
 }
 
