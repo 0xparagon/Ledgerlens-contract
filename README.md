@@ -577,11 +577,20 @@ These are backed by a set of non-negotiable implementation invariants — fail-c
 
 ## Testing
 
-Run the test suite with:
+Every test in this repository is classified in [`test-tiers.toml`](test-tiers.toml) — a
+machine-readable inventory that says what each test is for and which run executes it. Three
+tiers exist, each with a wall-clock execution budget:
 
 ```bash
-cargo test
+scripts/test-tier.sh fast        # 3-minute budget; what CI runs on every PR
+scripts/test-tier.sh standard    # 30-minute budget; the rest of the per-PR coverage
+scripts/test-tier.sh nightly     # 60-minute budget; scheduled, not on every PR
 ```
+
+Use `--no-budget` locally (the budgets are ceilings for a GitHub-hosted 2-vCPU runner) and
+`--list` / `--dry-run` to see what a tier would run. `cargo test` still works for debugging a
+single suite. The model, the taxonomy, and the rules for adding or moving a test are in
+[`docs/test-tiers.md`](docs/test-tiers.md).
 
 ## Quick Start
 
@@ -779,7 +788,7 @@ pub struct RiskScore {
 
 - **Networks**: `testnet` for development, `mainnet` for production. Contract IDs per network are recorded in this repo's deployment docs and must be mirrored into `api`'s environment configuration (`CONTRACT_ID`, `RPC_URL`, `NETWORK`).
 - **Secrets**: the "service" keypair that calls `submit_score` lives in `api`'s secret store — never in `core`, `data`, or `dashboard`. This repo only ever stores the **public address** of that account on-chain.
-- **CI**: workflow templates live in `.github`; this repo's contract CI builds with `cargo build --target wasm32-unknown-unknown --release`, runs `cargo test`, checks contract-only wasm lints via `tools/check_contract_build_lints.sh`, and exercises `deploy.sh` RPC failure handling with a shell harness.
+- **CI**: workflow templates live in `.github`; this repo's contract CI builds with `cargo build --target wasm32-unknown-unknown --release`, runs the `fast` and `standard` test tiers under their own budgets (`scripts/test-tier.sh`, see [`docs/test-tiers.md`](docs/test-tiers.md)) plus the `nightly` tier on a schedule, checks contract-only wasm lints via `tools/check_contract_build_lints.sh`, and exercises `deploy.sh` RPC failure handling with a shell harness.
 - **Versioning**: tag contract releases as `contract-vX.Y.Z`. `api` should pin against a specific deployed `CONTRACT_ID` + ABI version, not "latest".
 
 ### Deployment safety notes
