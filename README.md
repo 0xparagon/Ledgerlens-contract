@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1210 -->
 - #1210: Replay tool: interactive debugger with invariant breakpoints and state diffs
+
+<!-- handsoff-issue-1213 -->
+- #1213: Prometheus exporter and alert rules as code
