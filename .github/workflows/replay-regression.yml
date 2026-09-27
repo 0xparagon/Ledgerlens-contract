@@ -36,3 +36,21 @@ jobs:
         run: |
           cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
             --verify-sequential --workers 16
+      - name: Profile replay (golden corpus)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --profile --profile-out target/replay-profile.json \
+            --profile-report target/replay-profile.txt
+      - name: Verify golden profile is deterministic
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --profile --profile-out target/replay-profile-2.json \
+            --profile-report target/replay-profile-2.txt
+          diff -u target/replay-profile.json target/replay-profile-2.json
+          diff -u target/replay-profile.txt target/replay-profile-2.txt
+      - name: Compare profile against baseline (regression gate)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --profile-compare target/replay-profile.json \
+            --profile-baseline tools/replay/baselines/profile.json \
+            --profile-threshold 0.10
