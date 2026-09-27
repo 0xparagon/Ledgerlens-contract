@@ -1,8 +1,90 @@
 # Key-Rotation Operator Runbook — LedgerLens Score Contract
 
-> **Version:** 1.0 (issue #633)  
+> **Version:** 1.1 (issues #633, #1205)  
 > **Audience:** On-call operators and contract admins  
-> **Related:** `scripts/rotate-keys-rehearsal.sh`, `docs/incident-response-runbook.md`
+> **Related:** `scripts/rotate-keys-rehearsal.sh`, `docs/incident-response-runbook.md`, `tools/recovery`
+
+---
+
+## 0. Air-Gapped Governance Signing Workflow
+
+High-value governance keys (admin multisig, service signers) must never touch an
+online machine. Governance transactions are **built online** (they need ledger
+state) but **signed offline**. This section defines the unsigned-envelope
+workflow used for every governance operation in this runbook.
+
+### 0.1 Portable Bundle Format
+
+`prepare` emits a single portable bundle (a `.govbundle` file, or a QR payload
+when small enough). The bundle is self-describing and contains:
+
+| Field | Purpose |
+|-------|---------|
+| `envelope` | The unsigned transaction envelope (base64 XDR). |
+| `network_passphrase` | Network the envelope is bound to (e.g. `Test SDF Network ; September 2015`). |
+| `summary` | Decoded, human-readable description of the operation(s). |
+| `simulation` | Expected simulation result (resource fees, return value, auth entries). |
+| `bundle_hash` | SHA-256 over the canonical serialisation of the fields above, for out-of-band comparison. |
+
+**Size limits:** file transport is capped at **256 KiB**; QR transport is capped
+at **2 KiB** (single QR) or **8 KiB** (multi-frame). `prepare` refuses to emit a
+bundle that exceeds the selected transport limit.
+
+### 0.2 Steps
+
+```bash
+# ONLINE host — build the unsigned envelope (needs ledger state)
+ledgerlens-cli gov prepare \
+  --contract $CONTRACT_ID --network $NETWORK \
+  --op add_service_signer --signer "<NEW_SIGNER_ADDRESS>" \
+  --transport file --out gov-1205.govbundle
+
+# OFFLINE device — decode independently of the online summary
+ledgerlens-cli gov inspect --in gov-1205.govbundle
+
+# OFFLINE device — sign with one or more keys (repeat per signer)
+ledgerlens-cli gov sign --in gov-1205.govbundle \
+  --key <OFFLINE_KEY_1> --out gov-1205.sig1
+ledgerlens-cli gov sign --in gov-1205.govbundle \
+  --key <OFFLINE_KEY_2> --out gov-1205.sig2
+
+# ONLINE host — combine signatures and submit
+ledgerlens-cli gov combine --in gov-1205.govbundle \
+  --sig gov-1205.sig1 --sig gov-1205.sig2 --out gov-1205.signed
+ledgerlens-cli gov submit --in gov-1205.signed --network $NETWORK
+```
+
+### 0.3 Independent Inspection (Anti-Lying-Host)
+
+`inspect` **must not trust** the `summary` produced by the online host. It
+re-decodes the `envelope` XDR from scratch on the offline device and renders its
+own summary, then compares it against the bundle's `summary` and `bundle_hash`.
+Any mismatch — including a tampered envelope, altered summary, or changed
+simulation result — aborts with a non-zero exit code and prints both summaries
+side by side. This is what detects tampering after preparation.
+
+### 0.4 Multisig Thresholds
+
+For an M-of-N governance action, run `sign` once per offline signer, each
+producing a detached signature file. `combine` collects signatures until the
+threshold is met, then attaches them to the envelope. `combine` reports the
+current signature count vs. the required threshold and refuses to `submit`
+until the threshold is satisfied.
+
+### 0.5 Offline Device Operator Checklist
+
+Before signing, the offline operator MUST confirm each item:
+
+- [ ] The offline device is physically disconnected from all networks (Wi-Fi, Ethernet, Bluetooth, USB data).
+- [ ] The bundle was transferred via the approved channel (removable media or scanned QR), never over a network.
+- [ ] `inspect` was run and its independently decoded summary matches the intended operation.
+- [ ] The `bundle_hash` matches the value received out-of-band (read aloud / separate channel) from the online operator.
+- [ ] The `network_passphrase` matches the intended network (mainnet vs. testnet).
+- [ ] The `simulation` result is expected (fees, return value, auth entries).
+- [ ] The signing key used is the correct governance key for this action.
+- [ ] After signing, the signature file is transferred back via the approved channel and the offline device is wiped of the bundle.
+
+If any check fails, **stop** and escalate per `docs/incident-response-runbook.md`.
 
 ---
 
@@ -276,24 +358,7 @@ To keep the deployment for manual inspection:
 After every key-rotation operation (production or rehearsal), a post-action report should be generated containing:
 
 - Action log with stable action IDs (T0001, T0002, etc.)
-- Pre-rotation signer configuration
-- Post-rotation signer configuration
-- Status (passed / failed / passed-with-warnings)
-- Counts of operations attempted, succeeded, and failed
-- Network and contract identifiers
-
-The `rotate-keys-rehearsal.sh` script automatically generates this report. For manual operations, record the action log and configuration before/after.
-
----
-
-## 7. Monitoring Signals
-
-| Signal | Event | What to Watch For |
-|--------|-------|-------------------|
-| `sig_add` | signer added | Unexpected signer additions |
-| `sig_rem` | signer removed | Unexpected signer removals |
-| `sig_thr` | threshold changed | Threshold changes without change request |
-| `pk_upd` | pubkey set | Unauthorised pubkey changes |
-| `pk_rot` | pubkey rotation started | Pubkey rotation without incident ticket |
-| InsufficientSigners | `Error::InsufficientSigners` | Signer set may be depleted |
-| InvalidAttestation | `Error::InvalidAttestation` | May indicate stale pubkey after rotation |
+- Pre-rotation signer set and thresholds
+- Post-rotation signer set and thresholds
+- The `bundle_hash` of each air-gapped governance bundle used (see §0)
+- Operator identities for each offline signature collected
