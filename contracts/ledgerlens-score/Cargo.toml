@@ -14,6 +14,10 @@ crate-type = ["cdylib", "rlib"]
 soroban-sdk = "21.0.0"
 subtle = { version = "2.6", default-features = false }
 libm = "0.2"
+# Shared no_std fixed-point and statistics primitives. No Soroban SDK
+# dependency, so the same audited implementation is reused by the aggregator,
+# the replay tool, the simulator and Kani harnesses (see #1192).
+ledgerlens-math = { version = "0.1.0", path = "../ledgerlens-math", default-features = false }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
