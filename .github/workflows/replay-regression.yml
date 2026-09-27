@@ -24,3 +24,15 @@ jobs:
       - name: Run replay binary
         run: |
           cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet
+      - name: Verify parallel replay matches sequential (1 worker)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --verify-sequential --workers 1
+      - name: Verify parallel replay matches sequential (4 workers)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --verify-sequential --workers 4
+      - name: Verify parallel replay matches sequential (16 workers)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --verify-sequential --workers 16
