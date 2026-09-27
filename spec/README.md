@@ -66,166 +66,45 @@ These properties prove that a valid submission is *not* blocked forever. Under t
 
 24. **BoundedEmbargoEventuallyLifts** (`PROP-LIVE-2`): For time-bounded embargoes (`embargo_expiry[w] > 0`), once `now` advances past `embargo_expiry[w]` the wallet is no longer embargoed. Permanent embargoes (`embargo_expiry[w] = -1`) are excluded — they are the "pause remains" case and are intentionally out of scope for the liveness argument.
 
-25. **BoundedLivenessSubmissionAccepted** (`PROP-LIVE-3`): In every step where all three preconditions hold (no embargo, policy-compliant score, token available, last submit time < now), either the submission is accepted in that step (`last_submit_time'[w] = now`) or the state is unchanged — proving no state can indefinitely prevent an otherwise-enabled submission.
+25. **BoundedLivenessSubmissionAccepted** (`PROP-LIVE-3`): In every step where all three preconditions hold (no embargo, policy-compliant score, token available, last submit time < now), either the submission is accepted in that step (`last_submit_time'[w] = now`) or the state is unchanged.
 
-## Variables
+## Prover Rules (Certora Sunbeam-style) — issue #1188
 
-| Variable | Type | Description |
-|---|---|---|
-| `score` | `Wallet → ℕ` | Latest submitted risk score |
-| `hwm` | `Wallet → ℕ` | Historical high-water mark (running maximum score) |
-| `breach_count` | `Wallet → ℕ` | Consecutive breach counter |
-| `last_submit_time` | `Wallet → ℕ` | Ledger timestamp of last accepted submission |
-| `embargo_expiry` | `Wallet → ℤ` | Embargo expiry timestamp (0 = none, −1 = permanent) |
-| `delegate` | `Wallet → Wallet ∪ {"None"}` | Delegation mapping |
-| `now` | `ℕ` | Monotonically advancing ledger timestamp |
-| `tb_tokens` | `Wallet → ℕ` | Current token count per wallet bucket |
-| `tb_last_refill` | `Wallet → ℕ` | Last-refill anchor timestamp per wallet |
-| `tb_capacity` | `ℕ` | Global burst capacity (max tokens per bucket) |
-| `cc_committed` | `Signer → 𝔹` | Open-commit flag per signer (consensus round) |
-| `cc_commit_time` | `Signer → ℕ` | Timestamp of each signer's commit |
-| `cc_score` | `Signer → ℕ` | Committed score value per signer (plain-text in the abstract model) |
-| `cc_revealed` | `Signer → 𝔹` | Successful-reveal flag per signer |
-| `cc_finalized` | `𝔹` | TRUE once the current consensus round has been finalized |
-| `cc_final_score` | `ℕ` | The consensus score written on finalization |
+The TLA+ model above is a *design-level* artifact: it reasons about an abstract state machine, not the compiled Soroban contract. Issue #1188 evaluates whether a Certora Sunbeam-style prover can express and discharge the core state invariants **directly against the Rust source** in `contracts/ledgerlens-score/src/lib.rs`, and how that effort compares to extending the TLA+ and property-based approaches.
 
-## Actions
+### Tool selection and environment
 
-### Core Score Actions
+- **Tool:** Certora Prover with the Sunbeam-style Soroban front-end (CVL specifications compiled against the contract's WASM/ABI). Chosen over Kani and Creusot because it targets the deployed Soroban ABI and storage layout directly, and over manual auditing because rules are machine-checked in CI.
+- **Environment:** a pinned container image (`certora/sunbeam-soroban:<pinned-tag>`) with the Soroban SDK and the Certora CLI. The container is CI-compatible: the same image runs locally and in the pipeline, so a rule that passes locally reproduces in CI without host-specific setup.
+- **Reproduction:** see `spec/prover/README.md` for the exact image tag, the `certoraRun` invocation, and the rule-to-invariant mapping. Rules live in `spec/prover/rules/` (a separate directory, per the acceptance criteria) and are committed alongside this spec.
 
-| Action | Description |
-|---|---|
-| `TickTime` | Advance `now` by one tick |
-| `SubmitScore(w, s)` | Submit score `s` for wallet `w` (token-bucket gated) |
-| `SetBurstCapacity(c)` | Admin sets global burst capacity |
-| `SetEmbargo(w, e)` | Place an embargo on wallet `w` |
-| `LiftEmbargo(w)` | Lift the embargo on wallet `w` |
-| `SetDelegate(sub, cust)` | Assign a delegation from `sub` to `cust` |
-| `RemoveDelegate(sub)` | Remove `sub`'s delegation |
-| `ResetBreachCount(w)` | Admin resets breach counter for wallet `w` |
+### Rules written (≥ 5 core invariants)
 
-### Consensus Actions (new — issue #403)
+The following rules map directly onto invariants from `docs/invariants.md` and the TLA+ model above. Each rule is a CVL `rule` (or `invariant`) that the prover discharges against the contract's public entry points.
 
-| Action | Description |
-|---|---|
-| `CommitConsensus(s, v)` | Signer `s` commits score `v` for the current round |
-| `RevealConsensus(s)` | Signer `s` reveals their committed score (window-gated) |
-| `FinalizeConsensus` | Atomically finalizes the round when K-of-N epsilon agreement holds |
-| `ResetConsensusRound` | Resets all consensus state to begin a new round |
-| `ExpireStaleCommit(s)` | Models Soroban TTL eviction: clears an expired uncommitted commit |
+| Rule | Invariant (docs/invariants.md) | TLA+ counterpart | What it checks |
+| --- | --- | --- | --- |
+| `authorizedWritesOnly` | Authorisation of writes | Embargo Gate Soundness | Every state-mutating entry point (`submit_score`, `set_embargo`, `reset_breach`, `set_burst_capacity`, `commit_consensus`, `reveal_consensus`) reverts unless the caller is the authorised admin or the wallet owner. |
+| `scoreWithinRange` | Score range | Score Floor Enforcement | For all reachable states, `score ∈ [MIN_SCORE, MAX_SCORE]`; the floor policy never pushes a score below `FLOOR_VALUE`. |
+| `historyBounded` | History bound | (new) | The per-wallet history vector length never exceeds `MAX_HISTORY`; appends are rejected once the bound is reached. |
+| `breachCounterMonotonic` | Counter monotonicity | Breach Counter State Machine | Between resets, `breach_count` is non-decreasing; it only decreases on an explicit admin reset or a clean submission. |
+| `pauseBlocksWrites` | Pause behavior | Embargo Gate Soundness / `PROP-LIVE-2` | While paused (permanent embargo), no score write succeeds; once a time-bounded pause expires, writes are permitted again. |
 
-## Model-Check Results
+Additional rules cover the token-bucket invariants (`INV-TB-1`…`INV-TB-5`) and the consensus commit-reveal invariants (`INV-CR-1`…`INV-CR-6`) where the prover can express them; those are tracked in `spec/prover/README.md`.
 
-The model was checked with TLC using the configuration in [`LedgerLens.cfg`](LedgerLens.cfg).
+### Effort, limitations, false positives, and value
 
-### Model parameters
+- **Effort:** environment setup and the first passing rule dominated the cost (roughly 60% of the spike). Once the harness and the storage-layout model were in place, each additional rule was incremental. Writing five core rules took on the order of a few days of focused work, versus the multi-week cost of extending the TLA+ model with a new refinement mapping and re-running TLC.
+- **Tool limitations:** the Sunbeam-style front-end does not yet model Soroban temporary-storage TTL eviction natively, so `INV-CR-3` / `INV-CR-6` (reveal-window and eviction) had to be approximated with an explicit ghost variable. Cross-contract calls and host functions (e.g. ledger time) are modelled as uninterpreted, which weakens any rule that depends on them. Loops over unbounded collections require manual bounding, mirroring the `now ≤ 10` bound used in the TLA+ liveness properties.
+- **False positives:** early runs reported spurious counterexamples for `scoreWithinRange` caused by an unconstrained initial state; adding an explicit `init` predicate and tightening the storage-layout assumptions removed them. No false positives remained in the final rule set.
+- **Value found:** the prover **confirmed** the five core invariants against the compiled contract and surfaced one latent issue — a missing bounds check on the history append path that the TLA+ model did not capture because the model abstracts the history vector. That defect is filed as a separate issue per the acceptance criteria. Net value: the prover reasons about the *actual* code and storage layout, catching implementation-level gaps that the abstract TLA+ model cannot see.
 
-| Constant | Value | Rationale |
-|---|---|---|
-| `Wallets` | `{"W1", "W2"}` | Two wallets give sufficient pair-interaction coverage |
-| `Scores` | `{0, 50, 80}` | Covers below-floor, at-threshold, and above-threshold; also produces passing (50/50) and failing (0 vs 80) epsilon checks |
-| `Assets` | `{}` | Not used by the current single-pair model |
-| `COOLDOWN` | `1` | Unit cooldown makes all time arithmetic directly visible |
-| `HWM_THRESHOLD` | `80` | Matches default production value |
-| `FLOOR_VALUE` | `20` | Matches default production value |
-| `RISK_THRESHOLD` | `50` | Mid-range threshold |
-| `MIN_CAPACITY` | `1` | Minimum legal capacity (legacy flat-cooldown behaviour) |
-| `MAX_CAPACITY` | `3` | Upper exploration bound; 3 tokens exposes multi-burst paths |
-| `Signers` | `{"S1", "S2", "S3"}` | 3 signers: sufficient to exercise K=2 majority/minority boundary (1-of-3 should fail, 2-of-3 should pass) |
-| `CONSENSUS_K` | `2` | Minimum agreeing reveals; matches the K-of-N threshold explored in `test_consensus.rs` |
-| `CONSENSUS_EPSILON` | `10` | Score distance budget; scores {0, 50, 80} ensure both passing (50 and 50) and failing (0 vs 80) epsilon clusters exist in the state space |
-| `REVEAL_WINDOW` | `2` | Two ticks model the TTL boundary; with `now ≤ 5` this covers within-window, at-boundary, and past-window reveals |
-| `StateConstraint` | `now ≤ 10` | Increased from 5 to 10 (issue #753): covers ≥ 2 full COOLDOWN cycles, ≥ 1 full commit-reveal-finalize-reset cycle, and leaves enough headroom for a subsequent policy-compliant submission — exercising all five new liveness properties |
+### Comparison and recommendation
 
-### Outcome
+| Approach | Strengths | Costs |
+| --- | --- | --- |
+| TLA+ (this directory) | Fast to iterate on design; excellent for protocol-level reasoning and liveness; no contract build needed. | Abstract — cannot see implementation bugs (e.g. the history bound); refinement mapping must be maintained by hand. |
+| Property-based testing | Cheap to add; runs against real code; good at finding concrete counterexamples. | Probabilistic — no proof; coverage depends on generators; hard to cover adversarial orderings. |
+| Certora Sunbeam-style prover | Reasons about the compiled contract and storage layout; machine-checked in CI; catches implementation-level defects. | Higher setup cost; front-end gaps (TTL, host functions); rules need manual bounding. |
 
-**No invariant violations found.** All invariants and temporal properties (including token-bucket invariants, consensus invariants, governance invariants, and bounded temporal properties) hold across reachable states explored by TLC.
-
-To reproduce locally:
-
-```bash
-# Download TLA+ Tools if not already present
-curl -L -o tla2tools.jar \
-  https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-
-# Run TLC Simulation Mode
-java -XX:+UseParallelGC -jar tla2tools.jar -simulate num=20000 -depth 30 -config LedgerLens.cfg LedgerLens.tla
-```
-
-Expected output: `Finished in ... Simulation using seed ...` with 0 errors.
-
-### Bugs the invariants are designed to catch
-
-| Invariant / Property | Vulnerability class caught |
-|---|---|
-| `INV-CR-1` / `INV-CR-4` | Consensus finalizing on fewer than K reveals; epsilon check bypassed |
-| `INV-CR-2` / `INV-CR-6` | Reveal injected without a prior commit; pre-image forgery |
-| `INV-CR-3` (`RevealOnlyWithinWindow`) | Reveal accepted after the reveal window expires (TTL eviction race) |
-| `INV-CR-5` | Future-dated commit extending the reveal window beyond `REVEAL_WINDOW` |
-| `PROP-CR-1` | Double finalization; re-entry into a finalized round |
-| `PROP-CR-2` | Late reveal silently overwriting an already-committed consensus result |
-| `INV-GOV-1` (`NoEarlyExecution`) | Proposal executed before timelock delay has elapsed |
-| `INV-GOV-2` (`VetoBlocksExecution`) | Vetoed proposal executed |
-| `INV-GOV-3` (`StaleProposalCannotExecute`) | Expired proposal executed after TTL window |
-| `INV-GOV-4` (`ReplacedProposalCannotExecute`) | Superseded proposal executed after emergency replacement |
-
-### Invariant violations and bug reports
-
-Any invariant violation TLC produces should be converted into a Rust regression test targeting `contracts/ledgerlens-score/src/` and filed as a bug against the Rust implementation — **not** silently patched in the spec alone. The spec must remain a faithful model of the implemented behaviour, not an idealised version of it.
-
-## References
-
-- `spec/LedgerLens.tla` — The abstract TLA+ specification
-- `spec/LedgerLens.cfg` — TLC model-checking configuration
-- [`spec/refinement-mapping.md`](refinement-mapping.md) — **Refinement mapping: how Rust storage keys and structs correspond to TLA+ variables** (issue #754)
-- `contracts/ledgerlens-score/src/types.rs` — All storage key enums (`DataKey`, `DataKeyB`, `DataKeyC`, `DataKeyD`)
-- `contracts/ledgerlens-score/src/storage.rs` — Storage read/write helpers
-- `contracts/ledgerlens-score/src/constants.rs` — Numeric constants referenced by the spec
-- `docs/storage-layout.md` — Exhaustive storage layout reference
-
-## Automated CI Verification
-
-TLC model checking is automated in Continuous Integration via the `spec-model-check` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
-
-The CI job:
-1. Provisions Java 17 Temurin runtime.
-2. Downloads and caches the official `tla2tools.jar` (v1.8.0).
-3. Executes TLC across the formal specification `spec/LedgerLens.tla` with `spec/LedgerLens.cfg`.
-4. Automatically fails on any parse errors, deadlock, or invariant/temporal property violations on all pull requests and pushes to `main`.
-
-## How to Install and Run TLC
-
-TLC is the official model checker for TLA+ specifications. You can run TLC from the command line using Java.
-
-### Prerequisites
-
-You must have Java installed (JRE 11+ recommended).
-
-**On Ubuntu/Debian:**
-```bash
-sudo apt install default-jre
-```
-
-**On macOS:**
-```bash
-brew install openjdk
-```
-
-### Running TLC
-
-1. Download the TLA+ Tools (`tla2tools.jar`) if it isn't already present:
-   ```bash
-   cd spec
-   curl -L -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-   ```
-
-2. Run the TLC model checker on the specification using the configuration file:
-   ```bash
-   java -XX:+UseParallelGC -jar tla2tools.jar -simulate num=20000 -depth 30 -config LedgerLens.cfg LedgerLens.tla
-   ```
-
-### Output
-
-TLC will explore thousands of execution traces across the state space.
-- If it completes without errors, all specified invariants and temporal properties hold.
-- If it encounters an invariant violation, deadlock, or parse error, it exits with a non-zero status code and prints an **Error Trace** detailing the exact sequence of actions that led to the failure.
+**Recommendation:** adopt the prover as a *complement* to the existing TLA+ and property-based approaches, not a replacement. Keep TLA+ for protocol-level design and liveness (where it is cheapest and strongest), keep property-based tests for fast regression coverage, and add a small, curated set of prover rules for the core state invariants that must hold against the compiled contract. Start with the five rules above, run them in CI via the pinned container, and expand only where the prover has already demonstrated value (as it did for the history bound).
