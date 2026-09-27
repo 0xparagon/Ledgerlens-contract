@@ -8,6 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Caching policy (#1224, docs/ci-performance.md): incremental compilation
+  # is useless with sccache and bloats caches.
+  CARGO_INCREMENTAL: 0
+
+# Read-only token by default; jobs that need more request it explicitly.
+permissions:
+  contents: read
 
 jobs:
   deploy-script:
@@ -28,6 +35,10 @@ jobs:
           toolchain: "1.81.0"
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -40,6 +51,16 @@ jobs:
           toolchain: "1.81.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - run: cargo clippy --all-targets -- -D warnings
 
   contract-build-lints:
@@ -52,10 +73,98 @@ jobs:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - run: tools/check_contract_build_lints.sh
 
+  # ── Unit tests: cargo-nextest, duration-balanced partitions (#1223) ──────
+  # Profiles live in .config/nextest.toml; see docs/testing.md. Nextest does
+  # not run doctests, so `doctests-benches` below covers those.
   test:
-    name: Unit tests
+    name: Unit tests (partition ${{ matrix.partition }}/4)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read   # download historical JUnit timings from main
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nextest
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.87
+      - name: Fetch historical test durations from main
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: ci.yml
+          branch: main
+          name: junit-partition-.*
+          name_is_regexp: true
+          path: test-history
+          if_no_artifact_found: warn
+      - name: Compute duration-balanced partition
+        run: |
+          cargo nextest list --workspace --message-format json > target/nextest-list.json
+          python3 tools/ci/partition_tests.py --list target/nextest-list.json \
+            --junit-dir test-history --shards 4 --index ${{ matrix.partition }} --summary \
+            > target/partition-filter.txt
+      - name: Run tests
+        run: cargo nextest run --workspace --profile ci --no-tests=pass -E "$(cat target/partition-filter.txt)"
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-partition-${{ matrix.partition }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 30
+
+  test-report:
+    name: Flaky and slow test report
+    needs: test
+    if: always() && needs.test.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: junit-partition-*
+          path: junit
+      - name: Report (fails when any test passed only on retry)
+        run: python3 tools/ci/nextest_report.py junit --json test-report.json --fail-on-flaky
+      - name: Upload report for trend tracking
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: test-report.json
+          retention-days: 90
+
+  doctests-benches:
+    name: Doctests and benches
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +172,40 @@ jobs:
         with:
           toolchain: "1.81.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+      - name: Doctests
+        run: cargo test --workspace --doc
+      - name: Benches (Criterion test mode, one iteration each)
+        run: cargo test --workspace --benches
+
+  python-tools:
+    name: CI and report tooling (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Two different machines must produce byte-identical compliance
+        # reports; both are checked against the same golden files (#1222).
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: CI tooling tests
+        run: python3 -m unittest discover -s tests/ci -v
+      - name: Compliance report golden-file tests
+        run: python3 -m unittest discover -s tools/compliance-report -p 'test_*.py' -v
+      - name: Print report hash
+        run: |
+          python3 tools/compliance-report/generate.py tools/compliance-report/testdata/corpus.jsonl \
+            --out "$RUNNER_TEMP/report" --ledger-from 1000 --ledger-to 3000
 
   production-acceptance:
     name: Production acceptance report
@@ -76,6 +218,16 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - name: Run production acceptance suite
         run: scripts/production-acceptance.sh --output target/production-readiness-report.md
       - name: Upload production readiness report
@@ -121,6 +273,16 @@ jobs:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
       - name: Record WASM byte-size evidence
         run: |
@@ -167,6 +329,10 @@ jobs:
           # only inspects Cargo.lock; contract builds remain pinned to Rust 1.81.
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-audit
         run: cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
       - name: Run security audit
@@ -204,6 +370,10 @@ jobs:
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-deny
         run: cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
       - name: Run cargo-deny checks (licenses, bans, advisories, sources)
@@ -377,6 +547,12 @@ jobs:
           targets: wasm32-unknown-unknown
       # Deliberately no Swatinem/rust-cache — each run must be a cold,
       # independent build to prove there is no cache-based non-determinism.
+      - name: Assert cold build (no compiler or target cache)
+        run: |
+          if [ -n "${RUSTC_WRAPPER:-}" ] || [ -n "${SCCACHE_GHA_ENABLED:-}" ] || [ -d target ]; then
+            echo "::error::Reproducible builds must not use sccache, rust-cache or a pre-existing target dir"
+            exit 1
+          fi
       - name: Build WASM (run 1)
         run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
       - name: Compute SHA-256 (run 1)
@@ -402,6 +578,12 @@ jobs:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
       # No cache — independent cold build, same as run 1.
+      - name: Assert cold build (no compiler or target cache)
+        run: |
+          if [ -n "${RUSTC_WRAPPER:-}" ] || [ -n "${SCCACHE_GHA_ENABLED:-}" ] || [ -d target ]; then
+            echo "::error::Reproducible builds must not use sccache, rust-cache or a pre-existing target dir"
+            exit 1
+          fi
       - name: Build WASM (run 2)
         run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
       - name: Compute SHA-256 (run 2)

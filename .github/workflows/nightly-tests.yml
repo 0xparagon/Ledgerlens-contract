@@ -1,0 +1,63 @@
+name: Nightly tests
+
+# Full nextest run with the `nightly` profile (#1223) plus real Criterion
+# benchmark runs. PR CI only runs benches in one-iteration test mode.
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  nextest-nightly:
+    name: Full test suite (nightly profile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nextest
+          save-if: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.87
+      - run: cargo nextest run --workspace --profile nightly
+      - name: Flaky and slow report
+        if: always()
+        run: python3 tools/ci/nextest_report.py target/nextest/nightly --json test-report.json --fail-on-flaky
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-test-report
+          path: |
+            target/nextest/nightly/junit.xml
+            test-report.json
+          retention-days: 90
+
+  benches:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - run: cargo bench --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion
+          retention-days: 30

@@ -288,6 +288,10 @@ The following test-improvement issues are recommended (not part of this spike):
 Each improvement is a small, targeted test addition — estimated 15–30 min per
 item for an author already familiar with the test harness.
 
+
+See [coverage.md](coverage.md) for line and branch coverage gating; coverage and
+surviving mutants should be read together.
+
 ---
 
 *Last updated: 2026-08-27 · Spike author: automated benchmark via Kiro CLI*

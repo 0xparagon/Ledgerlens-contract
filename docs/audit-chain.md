@@ -150,3 +150,9 @@ The bundle is deterministic: duplicate or out-of-order issues are normalized bef
 - **Incident response**: Reconstruct the sequence of governance actions leading up to an incident
 - **Stakeholder transparency**: Provide auditable evidence of governance decisions
 - **Fork arbitration**: If a governance dispute arises, the audit chain provides a cryptographic tie-breaker
+
+## 9. Compliance Reports
+
+Governance actions from the audit chain, with proposal lineage, are summarised
+in the deterministic compliance report described in
+[compliance-report.md](compliance-report.md).

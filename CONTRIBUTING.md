@@ -69,6 +69,10 @@ cargo test
 cargo build --target wasm32-unknown-unknown --release
 ```
 
+CI runs unit tests with [cargo-nextest](docs/testing.md) (`cargo nextest run --workspace`)
+and gates per-module coverage; see [docs/testing.md](docs/testing.md) for running test
+subsets locally and [docs/coverage.md](docs/coverage.md) for reading and improving coverage.
+
 ## Guidelines
 
 - **Read [`docs/invariants.md`](docs/invariants.md) before touching `lib.rs`.** It lists the
