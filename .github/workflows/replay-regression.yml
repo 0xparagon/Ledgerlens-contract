@@ -54,3 +54,27 @@ jobs:
             --profile-compare target/replay-profile.json \
             --profile-baseline tools/replay/baselines/profile.json \
             --profile-threshold 0.10
+      - name: Generate synthetic scenarios (golden seed)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios
+      - name: Verify synthetic scenario generation is deterministic
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios-2
+          diff -ru target/scenarios target/scenarios-2
+      - name: Verify synthetic scenario golden hashes
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios \
+            --scenario-hashes tools/replay/baselines/scenario-hashes.json \
+            --verify-scenario-hashes
+      - name: Self-test Benford conformance of generated scenarios
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios \
+            --scenario-benford-check
