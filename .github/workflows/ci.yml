@@ -111,6 +111,19 @@ jobs:
       - name: Verify mapping references only real symbols (and test the checker)
         run: bash tests/check_refinement_mapping.sh
 
+  doc-snippets:
+    name: Executable documentation snippets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Issue #1230: README function signatures and struct listings must match
+      # the contract source; shell snippets must parse, and `run` snippets must
+      # pass in a hermetic sandbox. Pure Python, no network, <1s.
+      - name: Test the snippet checker
+        run: python3 tools/check_doc_snippets.py --self-test
+      - name: Check README and integration-guide snippets
+        run: python3 tools/check_doc_snippets.py
+
   build:
     name: WASM build
     runs-on: ubuntu-latest
