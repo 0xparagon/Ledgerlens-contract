@@ -1,0 +1,138 @@
+name: SDK Compatibility
+
+# Issue #1227: build and test against the current and a candidate soroban-sdk
+# version and report ABI / WASM size / test deltas on the PR.
+# See docs/dependency-update-policy.md.
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '**/Cargo.toml'
+      - 'renovate.json'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: 'Candidate soroban-sdk version'
+        required: false
+        default: '22.0.0'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CANDIDATE_SDK: ${{ github.event.inputs.candidate || '22.0.0' }}
+
+jobs:
+  renovate-config:
+    name: Validate renovate.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx --yes --package renovate@39 -- renovate-config-validator --strict renovate.json
+
+  build:
+    name: Build (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.variant == 'candidate' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [current, candidate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
+
+      - name: Apply candidate SDK
+        if: matrix.variant == 'candidate'
+        run: |
+          find contracts tools tests -name Cargo.toml -not -path '*/target/*' \
+            -exec sed -i -E "s/(soroban-sdk = (\{ version = )?\")[0-9.]+\"/\1${CANDIDATE_SDK}\"/" {} +
+          cargo update -p soroban-sdk
+
+      - name: Build WASM
+        id: wasm
+        run: |
+          set -o pipefail
+          ok=true
+          cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score 2>&1 | tail -n 30 || ok=false
+          mkdir -p out
+          W=target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          if [ "$ok" = true ] && [ -f "$W" ]; then
+            stat -c %s "$W" > out/size
+            python3 - "$W" > out/abi.txt <<'PY'
+          import sys
+          d = open(sys.argv[1], "rb").read()
+          def leb(i):
+              r = s = 0
+              while True:
+                  b = d[i]; i += 1; r |= (b & 0x7F) << s; s += 7
+                  if b < 0x80: return r, i
+          i = 8
+          while i < len(d):
+              sid = d[i]; n, i = leb(i + 1); end = i + n
+              if sid == 7:
+                  c, i = leb(i)
+                  for _ in range(c):
+                      l, i = leb(i); print(d[i:i + l].decode()); i += l + 1; _, i = leb(i)
+              i = end
+          PY
+            sort -o out/abi.txt out/abi.txt
+          else
+            echo "build-failed" > out/size; : > out/abi.txt
+          fi
+
+      - name: Test (includes resource/CPU budget tests)
+        run: |
+          set -o pipefail
+          if cargo test --workspace 2>&1 | tail -n 40; then echo pass > out/tests; else echo fail > out/tests; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sdk-${{ matrix.variant }}
+          path: out
+
+  report:
+    name: Report deltas
+    needs: build
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          c=sdk-current; n=sdk-candidate
+          r() { cat "$1" 2>/dev/null || echo n/a; }
+          {
+            echo "### soroban-sdk compatibility (current vs \`$CANDIDATE_SDK\`)"
+            echo "| | current | candidate |"
+            echo "|---|---|---|"
+            echo "| WASM size (bytes) | $(r $c/size) | $(r $n/size) |"
+            echo "| Tests (incl. CPU budgets) | $(r $c/tests) | $(r $n/tests) |"
+            echo
+            echo "<details><summary>ABI export diff</summary>"
+            echo
+            echo '```diff'
+            diff -u $c/abi.txt $n/abi.txt || true
+            echo '```'
+            echo "</details>"
+            echo
+            echo "Reviewer checklist: docs/dependency-update-policy.md"
+          } > body.md
+          gh pr comment ${{ github.event.pull_request.number }} -R ${{ github.repository }} --body-file body.md --edit-last \
+            || gh pr comment ${{ github.event.pull_request.number }} -R ${{ github.repository }} --body-file body.md

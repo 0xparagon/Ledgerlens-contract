@@ -69,6 +69,26 @@ cargo test
 cargo build --target wasm32-unknown-unknown --release
 ```
 
+## Platform Support
+
+CI runs on Linux (`ci.yml`) and on macOS and Windows (`cross-platform.yml`). Windows users should run
+the shell tooling from WSL2. `.gitattributes` keeps scripts and fixtures LF-only, so a
+`core.autocrlf=true` checkout does not break them.
+
+| Task | Linux | macOS | Windows (native) | Windows (WSL2) |
+|---|---|---|---|---|
+| `cargo build` / `cargo test -p ledgerlens-score --lib` | ✅ | ✅ | ✅ | ✅ |
+| Tool crates (`replay`, `recovery`, `schema-gen`, `invocation-fuzzer`) | ✅ | ✅ | ✅ | ✅ |
+| WASM build (development) | ✅ | ✅ | ✅ | ✅ |
+| Reproducible release WASM (`docs/reproducible-builds.md`) | ✅ | ❌ by design | ❌ by design | ❌ by design |
+| `deploy.sh`, `scripts/*.sh` (deploy, rehearsal, canary, rollback) | ✅ | ⚠️ needs GNU `coreutils`/`sed` (`brew install coreutils gnu-sed`) | ❌ | ✅ |
+| `tools/*.sh` checks (error discriminants, build lints, SBOM) | ✅ | ⚠️ as above | ❌ | ✅ |
+| `tests/*.sh`, `tests/deploy/test_deploy.sh` | ✅ | ⚠️ as above | ❌ | ✅ |
+| Python tools (`tools/*.py`, `tests/test_traceability.py`) | ✅ | ✅ | ✅ | ✅ |
+
+Only Linux produces byte-identical release artifacts. Treat WASM built on any other platform as a
+development build and never deploy it.
+
 ## Guidelines
 
 - **Read [`docs/invariants.md`](docs/invariants.md) before touching `lib.rs`.** It lists the
