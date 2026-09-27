@@ -108,6 +108,7 @@ def aggregate(pairs_and_scores, pair_weights, decay_factors=None):
         weight_sum += decayed_weight
     
     if weight_sum == 0:
+        # On-chain: get_aggregate_score returns Err(ScoreNotFound)
         raise ValueError("All weights are zero")
     
     # Truncate division
@@ -120,7 +121,7 @@ def aggregate(pairs_and_scores, pair_weights, decay_factors=None):
 
 ### Formula
 
-When a score is older than the staleness window (default: 7 days), it is decayed using exponential decay:
+When a decay rate is configured (`set_decay_rate` with a non-zero numerator), every score is decayed by its age since submission, using exponential decay. The staleness window does **not** gate decay: a one-hour-old score is already decayed slightly. (Corrected in #1240 after differential testing; see `tools/reference-model/DISAGREEMENTS.md` D2/D4.)
 
 $$\text{decay\_factor}(t) = e^{-\lambda \cdot t}$$
 
@@ -344,8 +345,8 @@ Scores older than the staleness window (default: `DEFAULT_STALENESS_WINDOW_SECS 
 ### Staleness Filtering in `get_effective_score`
 
 1. Compute age: `age = current_timestamp - score_timestamp`
-2. If `age > staleness_window` and `decay_rate != 0`:
-   - Apply decay: `effective_score = raw_score * decay_factor(age)`
+2. If `decay_rate != 0` (at any age; the staleness window is not consulted here):
+   - Apply decay: `effective_score = raw_score * decay_factor(age) / SCALE` (truncated)
    - Set `decay_applied = true`
 3. Otherwise:
    - `effective_score = raw_score`
@@ -458,9 +459,13 @@ deterministic unit tests with explicit expected values for each property.
 ## Confidence-Floor Semantics: Formal Truth Tables (#722)
 
 The gate function `query_risk_gate_with_confidence` passes only when **all
-three** of the following conditions hold simultaneously:
+three** of the following conditions hold simultaneously. The score check is
+strict: a wallet passes only when its risk score is *below* the threshold,
+since higher scores are more suspicious. (Corrected in #1240; earlier revisions
+of these tables had the score comparison inverted. See
+`tools/reference-model/DISAGREEMENTS.md` D1.)
 
-PASS  iff  score       >= threshold
+PASS  iff  score       <  threshold
        AND confidence  >= query_conf
        AND confidence  >= global_min_confidence
 ```yaml
@@ -472,44 +477,44 @@ Where `global_min_confidence` is the admin-controlled floor set via
 
 | score | threshold | conf | query_conf | global_floor | result | reason |
 |------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   90 |          0 |            0 | PASS   | score > threshold |
-|    70 |        70 |   90 |          0 |            0 | PASS   | score == threshold (inclusive boundary) |
-|    69 |        70 |   90 |          0 |            0 | FAIL   | score < threshold |
-|     0 |         0 |   90 |          0 |            0 | PASS   | both zero |
-|   100 |       100 |   90 |          0 |            0 | PASS   | both max |
-|     0 |       100 |   90 |          0 |            0 | FAIL   | score 0, threshold max |
+|    60 |        70 |   90 |          0 |            0 | PASS   | score < threshold |
+|    70 |        70 |   90 |          0 |            0 | FAIL   | score == threshold (strict boundary) |
+|    69 |        70 |   90 |          0 |            0 | PASS   | score one below threshold |
+|     0 |         0 |   90 |          0 |            0 | FAIL   | threshold 0 blocks every wallet |
+|   100 |       100 |   90 |          0 |            0 | FAIL   | both max (score == threshold) |
+|     0 |       100 |   90 |          0 |            0 | PASS   | score 0, threshold max |
 
 ### Table 2 — Confidence vs Per-Query Confidence Threshold
 
 | score | threshold | conf | query_conf | global_floor | result | reason |
 |------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   80 |         80 |            0 | PASS   | conf == query_conf (inclusive) |
-|    80 |        70 |   79 |         80 |            0 | FAIL   | conf one below query_conf |
-|    80 |        70 |   81 |         80 |            0 | PASS   | conf above query_conf |
-|    80 |        70 |  100 |        100 |            0 | PASS   | conf == query_conf == max |
-|    80 |        70 |   99 |        100 |            0 | FAIL   | conf one below max query_conf |
-|    80 |        70 |    0 |          0 |            0 | PASS   | both zero |
+|    60 |        70 |   80 |         80 |            0 | PASS   | conf == query_conf (inclusive) |
+|    60 |        70 |   79 |         80 |            0 | FAIL   | conf one below query_conf |
+|    60 |        70 |   81 |         80 |            0 | PASS   | conf above query_conf |
+|    60 |        70 |  100 |        100 |            0 | PASS   | conf == query_conf == max |
+|    60 |        70 |   99 |        100 |            0 | FAIL   | conf one below max query_conf |
+|    60 |        70 |    0 |          0 |            0 | PASS   | both zero |
 
 ### Table 3 — Confidence vs Global Minimum Confidence Floor
 
 | score | threshold | conf | query_conf | global_floor | result | reason |
 |------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   75 |          0 |           75 | PASS   | conf == global_floor (inclusive) |
-|    80 |        70 |   74 |          0 |           75 | FAIL   | conf one below global_floor |
-|    80 |        70 |   76 |          0 |           75 | PASS   | conf above global_floor |
-|    80 |        70 |    0 |          0 |            0 | PASS   | floor is zero, never blocks |
-|    80 |        70 |  100 |          0 |          100 | PASS   | conf == global_floor == max |
+|    60 |        70 |   75 |          0 |           75 | PASS   | conf == global_floor (inclusive) |
+|    60 |        70 |   74 |          0 |           75 | FAIL   | conf one below global_floor |
+|    60 |        70 |   76 |          0 |           75 | PASS   | conf above global_floor |
+|    60 |        70 |    0 |          0 |            0 | PASS   | floor is zero, never blocks |
+|    60 |        70 |  100 |          0 |          100 | PASS   | conf == global_floor == max |
 
 ### Table 4 — Combined Constraints
 
 | score | threshold | conf | query_conf | global_floor | result | reason |
 |------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   85 |         80 |           75 | PASS   | all three conditions pass |
-|    65 |        70 |   85 |         80 |           75 | FAIL   | score < threshold |
-|    80 |        70 |   79 |         80 |           75 | FAIL   | conf < query_conf |
-|    80 |        70 |   74 |         70 |           75 | FAIL   | conf < global_floor |
-|    80 |        70 |   74 |         80 |           75 | FAIL   | conf fails both conf checks |
-|   100 |       100 |  100 |        100 |          100 | PASS   | all at maximum |
+|    60 |        70 |   85 |         80 |           75 | PASS   | all three conditions pass |
+|    80 |        70 |   85 |         80 |           75 | FAIL   | score >= threshold |
+|    60 |        70 |   79 |         80 |           75 | FAIL   | conf < query_conf |
+|    60 |        70 |   74 |         70 |           75 | FAIL   | conf < global_floor |
+|    60 |        70 |   74 |         80 |           75 | FAIL   | conf fails both conf checks |
+|    99 |       100 |  100 |        100 |          100 | PASS   | score just below max threshold, confidences at max |
 
 ### Configuration Notes
 
