@@ -149,6 +149,23 @@ pub const MAX_FINALITY_BUFFER_SECS: u64 = 86_400;
 /// Default heartbeat alert threshold — 1 hour.
 pub const DEFAULT_HEARTBEAT_ALERT_THRESHOLD_SECS: u64 = 3_600;
 
+/// Maximum overlap window accepted by a service-key rotation — 24 hours.
+///
+/// The overlap exists to bound how long a *retired* key still signs
+/// attestations, so an unbounded value is a security setting, not a
+/// convenience: `u64::MAX` would make the retired key acceptable forever.
+/// Issue #1246.
+pub const MAX_KEY_OVERLAP_SECS: u64 = 86_400;
+
+/// Maximum reveal window accepted for a sealed-bid consensus commitment —
+/// 7 days.
+///
+/// The window is stored in seconds but the commitment's temporary entry is
+/// kept alive in *ledgers*, and the conversion narrows to u32; a window above
+/// ~2^32 s truncated to 0 and collapsed the entry to its 12-ledger floor,
+/// making the reveal permanently impossible. Issue #1246.
+pub const MAX_REVEAL_WINDOW_SECS: u64 = 604_800;
+
 // ── HyperLogLog unique-wallet estimation ─────────────────────────────────────
 
 /// Minimum allowed HLL precision (2^4 = 16 registers).

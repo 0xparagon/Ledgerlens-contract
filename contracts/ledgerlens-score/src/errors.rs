@@ -77,6 +77,10 @@ impl Error {
     pub const DisputeIndexFull: Error = Error::ServiceSetFull;
     pub const ActorDisputeLimitExceeded: Error = Error::RateLimitExceeded;
     pub const EmbargoedWalletIndexFull: Error = Error::ServiceSetFull;
+    /// `overlap_secs` outside `[0, MAX_KEY_OVERLAP_SECS]` in a key rotation.
+    pub const InvalidKeyOverlap: Error = Error::InvalidThreshold;
+    /// `secs` outside `[0, MAX_REVEAL_WINDOW_SECS]` in `set_reveal_window`.
+    pub const InvalidRevealWindow: Error = Error::InvalidThreshold;
 
     pub const ModelVersionNotRegistered: Error = Error::InvalidScore;
     pub const ModelVersionDeprecated: Error = Error::Unauthorized;

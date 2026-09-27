@@ -233,6 +233,9 @@ mod test_schema_version_probes;
 #[cfg(test)]
 mod test_dos_read_patterns;
 
+#[cfg(test)]
+mod test_ledger_time_extremes;
+
 use soroban_sdk::{
     contract, contractimpl, crypto::Hash, symbol_short, token, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
@@ -6101,6 +6104,9 @@ impl LedgerLensScoreContract {
         if !storage::validate_pubkey_format(&new_key) {
             return Err(Error::InvalidPubkeyLength);
         }
+        if overlap_secs > constants::MAX_KEY_OVERLAP_SECS {
+            return Err(Error::InvalidKeyOverlap);
+        }
         Self::require_admin_auth(&env, &admin_signers)?;
         // Any previous pending key is superseded.
         storage::clear_pending_service_pubkey(&env);
@@ -6263,6 +6269,9 @@ impl LedgerLensScoreContract {
         }
         if new_key.len() != 33 && new_key.len() != 65 {
             return Err(Error::InvalidPubkeyLength);
+        }
+        if overlap_secs > constants::MAX_KEY_OVERLAP_SECS {
+            return Err(Error::InvalidKeyOverlap);
         }
         Self::require_admin_auth(&env, &admin_signers)?;
         // Any previous pending key is superseded.
@@ -6463,6 +6472,11 @@ impl LedgerLensScoreContract {
     pub fn set_reveal_window(env: Env, secs: u64) -> Result<(), Error> {
         if !storage::has_admin(&env) {
             return Err(Error::NotInitialized);
+        }
+        // Bounded because the value is converted from seconds to a u32 ledger
+        // count when the commitment is stored (storage::set_consensus_commitment).
+        if secs > constants::MAX_REVEAL_WINDOW_SECS {
+            return Err(Error::InvalidRevealWindow);
         }
         storage::get_admin(&env).require_auth();
         storage::set_reveal_window_secs(&env, secs);
@@ -9929,7 +9943,14 @@ impl LedgerLensScoreContract {
         }
 
         let score_delta = (last.score as i32) - (first.score as i32);
-        let momentum = score_delta / (time_delta as i32);
+        // Both history timestamps are caller-supplied `submit_score` arguments
+        // (rejected only when zero), so `time_delta` can be any u64 — including
+        // exactly 2^32, which `as i32` truncates to 0 and turns the division
+        // below into a divide-by-zero panic. Widen both operands instead: for
+        // every value the old expression survived, i64 division truncating
+        // toward zero gives the identical i32 result.
+        let momentum = (score_delta as i64) / (time_delta as i64);
+        let momentum = momentum.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
 
         let alert_threshold = storage::get_momentum_alert_threshold(&env);
         if alert_threshold > 0 && momentum > alert_threshold as i32 {
