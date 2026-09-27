@@ -11,6 +11,7 @@ members = [
     "tools/schema-gen",
     "tools/invocation-fuzzer",
     "tools/signer",
+    "tools/frost-ceremony",
     "tests/composability",
 ]
 
