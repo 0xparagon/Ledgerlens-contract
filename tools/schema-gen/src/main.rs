@@ -12,8 +12,8 @@
 use anyhow::{bail, Context, Result};
 use schema_gen::{
     native_risk_score_struct, struct_to_json_schema, struct_to_python, struct_to_typescript,
-    wasm_risk_score_struct, DEFAULT_OUTPUT_DIR, PYTHON_FILE, RISK_SCORE_NAME, SCHEMA_FILE,
-    TYPESCRIPT_FILE,
+    invocations_json_schema, wasm_risk_score_struct, DEFAULT_OUTPUT_DIR, INVOCATION_SCHEMA_FILE,
+    PYTHON_FILE, RISK_SCORE_NAME, SCHEMA_FILE, TYPESCRIPT_FILE,
 };
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,7 @@ fn main() -> Result<()> {
     let mut wasm_path: Option<String> = None;
     let mut out_dir = DEFAULT_OUTPUT_DIR.to_string();
     let mut check = false;
+    let mut invocations = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -38,6 +39,7 @@ fn main() -> Result<()> {
                 out_dir = args.get(i).context("`--out` requires a directory")?.clone();
             }
             "--check" => check = true,
+            "--invocations" => invocations = true,
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
@@ -97,6 +99,15 @@ fn main() -> Result<()> {
              run `cargo run -p schema-gen` and commit the changes"
         );
     }
+    if invocations {
+        let path = wasm_path
+            .as_ref()
+            .context("`--invocations` requires `--wasm` to derive the contract ABI")?;
+        let wasm = std::fs::read(path).with_context(|| format!("reading contract WASM {path}"))?;
+        let schema = format!("{}\n", serde_json::to_string_pretty(&invocations_json_schema(&wasm)?)?);
+        write_if_changed(&dir.join(INVOCATION_SCHEMA_FILE), &schema)?;
+        println!("schema-gen: {}", dir.join(INVOCATION_SCHEMA_FILE).display());
+    }
     Ok(())
 }
 
@@ -124,6 +135,7 @@ fn print_usage() {
          \x20                  (default: the native RiskScore::spec_xdr() from the source crate)\n\
          \x20  --out <dir>     Output directory (default: schemas/)\n\
          \x20  --check         Fail instead of rewriting whenever committed artifacts are stale\n\
+         \x20  --invocations   Also emit the callable ABI input schema (requires --wasm)\n\
          \x20  -h, --help      Print this help\n"
     );
 }

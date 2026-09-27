@@ -10,6 +10,31 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  environment-smoke:
+    name: Development environment smoke check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
+      - name: Build devcontainer image
+        run: docker build -f .devcontainer/Dockerfile -t ledgerlens-dev .
+      - name: Check pinned tools inside the image
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace ledgerlens-dev bash -lc '
+            rustc --version | grep -F "${{ steps.tool-versions.outputs.contract-rust }}"
+            rustc +${{ steps.tool-versions.outputs.audit-rust }} --version
+            rustup target list --installed | grep -qx wasm32-unknown-unknown
+            stellar --version | grep -F "${{ steps.tool-versions.outputs.stellar-cli }}"
+            cargo-mutants --version | grep -F "${{ steps.tool-versions.outputs.cargo-mutants }}"
+            cargo-audit --version | grep -F "${{ steps.tool-versions.outputs.cargo-audit }}"
+            cargo-deny --version | grep -F "${{ steps.tool-versions.outputs.cargo-deny }}"
+            cargo-cyclonedx --version | grep -F "${{ steps.tool-versions.outputs.cargo-cyclonedx }}"
+            shellcheck --version | grep -F "${{ steps.tool-versions.outputs.shellcheck }}"
+            java -version 2>&1 | grep -F "${{ steps.tool-versions.outputs.java }}"
+            test -f "$TLA_TOOLS_JAR"
+          '
+
   deploy-script:
     name: Deployment script checks
     runs-on: ubuntu-latest
@@ -23,9 +48,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
@@ -35,9 +62,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
@@ -47,9 +76,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: tools/check_contract_build_lints.sh
@@ -59,9 +90,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
@@ -70,9 +103,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -116,9 +151,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
@@ -160,15 +197,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
           # cargo-audit 0.22 requires Rust 1.88+ and understands the CVSS 4.0
           # records now present in the live RustSec advisory database. This job
           # only inspects Cargo.lock; contract builds remain pinned to Rust 1.81.
-          toolchain: "1.88.0"
+          toolchain: ${{ steps.tool-versions.outputs.audit-rust }}
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
-        run: cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
+        run: cargo +${{ steps.tool-versions.outputs.audit-rust }} install cargo-audit --version ${{ steps.tool-versions.outputs.cargo-audit }} --locked
       - name: Run security audit
         # RUSTSEC-2026-0009 affects time's RFC parsing. time is only pulled in
         # through serde_with -> stellar-xdr; the contract does not invoke that
@@ -176,7 +215,7 @@ jobs:
         # be parsed by the Rust 1.81 toolchain required for deployable Soroban
         # WASM. Keep this exception narrow and remove it when Soroban permits a
         # newer release toolchain.
-        run: cargo +1.88.0 audit --ignore RUSTSEC-2026-0009
+        run: cargo +${{ steps.tool-versions.outputs.audit-rust }} audit --ignore RUSTSEC-2026-0009
 
   # ── Dependency license / policy gate ────────────────────────────────────────
   #
@@ -200,12 +239,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88.0"
+          toolchain: ${{ steps.tool-versions.outputs.audit-rust }}
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-deny
-        run: cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
+        run: cargo +${{ steps.tool-versions.outputs.audit-rust }} install cargo-deny --version ${{ steps.tool-versions.outputs.cargo-deny }} --locked
       - name: Run cargo-deny checks (licenses, bans, advisories, sources)
         run: cargo-deny check
 
@@ -237,9 +278,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
+
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # master (2026-08-05)
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
 
       # ── Step 1: Verify the active toolchain matches rust-toolchain.toml ──────
@@ -334,7 +378,7 @@ jobs:
       # introduce non-determinism; the byte-for-byte WASM comparison remains
       # clean on its own.
       - name: Install cargo-cyclonedx
-        run: cargo +1.81.0 install cargo-cyclonedx --version 0.5.8 --locked
+        run: cargo +${{ steps.tool-versions.outputs.contract-rust }} install cargo-cyclonedx --version ${{ steps.tool-versions.outputs.cargo-cyclonedx }} --locked
 
       - name: Generate & validate CycloneDX SBOM (wasm32 target)
         run: tools/generate_sbom.sh
@@ -371,9 +415,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
       # Deliberately no Swatinem/rust-cache — each run must be a cold,
       # independent build to prove there is no cache-based non-determinism.
@@ -397,9 +443,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
       # No cache — independent cold build, same as run 1.
       - name: Build WASM (run 2)
@@ -452,23 +500,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: ${{ steps.tool-versions.outputs.java }}
 
       - name: Cache TLA+ tools
         uses: actions/cache@v4
         with:
           path: /tmp/tla2tools.jar
-          key: tla2tools-v1.8.0
+          key: tla2tools-v${{ steps.tool-versions.outputs.tla-tools }}
 
       - name: Download tla2tools.jar
         run: |
           if [ ! -f /tmp/tla2tools.jar ]; then
-            curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+            curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v${{ steps.tool-versions.outputs.tla-tools }}/tla2tools.jar
           fi
 
       - name: Run TLC Model Checker on LedgerLens spec

@@ -1248,6 +1248,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
@@ -1351,6 +1352,17 @@ dependencies = [
  "serde_json",
  "soroban-sdk",
  "soroban-spec",
+]
+
+[[package]]
+name = "score-submitter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

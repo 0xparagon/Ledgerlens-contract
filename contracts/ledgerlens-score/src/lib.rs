@@ -19,6 +19,11 @@ mod events;
 mod governance_actions;
 #[cfg(any(test, feature = "testutils"))]
 mod invariants;
+
+#[cfg(feature = "testutils")]
+pub fn check_invariants_for_fuzz(env: &soroban_sdk::Env) {
+    invariants::invariant_check(env);
+}
 mod parameter_governance;
 mod storage;
 mod types;

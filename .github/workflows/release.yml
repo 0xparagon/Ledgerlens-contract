@@ -10,9 +10,6 @@ permissions: {}
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pin the exact stellar CLI version used for WASM optimization.
-  # Must match EXPECTED_STELLAR_CLI_VERSION in deploy/manifests/mainnet.env.
-  STELLAR_CLI_VERSION: "21.0.0"
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
@@ -26,26 +23,31 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      contract-rust-version: ${{ steps.tool-versions.outputs.contract-rust }}
+      stellar-cli-version: ${{ steps.tool-versions.outputs.stellar-cli }}
     steps:
       # ── Checkout ──────────────────────────────────────────────────────────────
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
 
       # ── Pin Rust toolchain (must match rust-toolchain.toml and ci.yml) ────────
-      # ci.yml uses dtolnay/rust-toolchain@master with toolchain "1.81.0" and
+      # ci.yml reads the contract Rust version from toolchain-versions.json and
       # target wasm32-unknown-unknown. We replicate exactly.
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
 
       # ── Install Stellar CLI for WASM optimization ─────────────────────────────
-      # Version pinned to match deploy/manifests/mainnet.env EXPECTED_STELLAR_CLI_VERSION.
+      # Version pinned in toolchain-versions.json and matched to the deploy manifest.
       # The CLI is only needed for the `optimize` subcommand; the build itself
       # uses only cargo. We install it in a dedicated step so the version is
       # explicit and auditable.
       - name: Install Stellar CLI
         run: |
-          curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+          curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v${{ steps.tool-versions.outputs.stellar-cli }}/stellar-cli-${{ steps.tool-versions.outputs.stellar-cli }}-x86_64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C /usr/local/bin stellar
           stellar --version
 
@@ -126,9 +128,11 @@ jobs:
       # No cargo cache — cold build to prove no cache-based non-determinism.
       - name: Reproducible build (run 1)
         uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
       - name: Build WASM (run 1)
         run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
@@ -151,7 +155,7 @@ jobs:
         uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
           targets: wasm32-unknown-unknown
       - name: Build WASM (run 2)
         run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
@@ -329,8 +333,8 @@ jobs:
 
           ### Toolchain
 
-          - Rust: \`1.81.0\` (pinned in \`rust-toolchain.toml\`)
-          - Stellar CLI: \`${STELLAR_CLI_VERSION}\` (for WASM optimization)
+          - Rust: \`${{ needs.build-and-sign.outputs.contract-rust-version }}\` (pinned in \`toolchain-versions.json\`)
+          - Stellar CLI: \`${{ needs.build-and-sign.outputs.stellar-cli-version }}\` (for WASM optimization)
           - Target: \`wasm32-unknown-unknown\`
 
           ### Reproducibility

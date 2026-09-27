@@ -16,7 +16,9 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
-use soroban_sdk::xdr::{Limits, ReadXdr, ScSpecEntry, ScSpecTypeDef, ScSpecUdtStructV0};
+use soroban_sdk::xdr::{
+    Limits, ReadXdr, ScSpecEntry, ScSpecFunctionV0, ScSpecTypeDef, ScSpecUdtStructV0,
+};
 
 /// The canonical cross-repo name of the risk-score struct.
 pub const RISK_SCORE_NAME: &str = "RiskScore";
@@ -32,6 +34,9 @@ pub const TYPESCRIPT_FILE: &str = "risk_score.ts";
 
 /// Filename of the generated Python (Pydantic) artifact.
 pub const PYTHON_FILE: &str = "risk_score.py";
+
+/// Filename of the generated ABI input schema for invocation fuzzing.
+pub const INVOCATION_SCHEMA_FILE: &str = "ledgerlens_score.invocations.schema.json";
 
 /// Decode the `RiskScore` UDT struct entry natively, straight from the
 /// `#[contracttype]`-generated `spec_xdr()` on the Rust type itself — the same
@@ -102,20 +107,27 @@ pub fn json_schema_type(type_: &ScSpecTypeDef) -> Value {
         ScSpecTypeDef::Bool => json!({ "type": "boolean" }),
         ScSpecTypeDef::Void => json!({}),
         ScSpecTypeDef::Error => json!({ "type": "integer" }),
-        ScSpecTypeDef::U32
-        | ScSpecTypeDef::U64
-        | ScSpecTypeDef::U128
+        ScSpecTypeDef::U32 => json!({
+            "type": "integer", "minimum": 0, "maximum": 4294967295_u64,
+            "x-soroban-type": "u32"
+        }),
+        ScSpecTypeDef::U64 => json!({
+            "type": "integer", "minimum": 0, "maximum": 18446744073709551615_u64,
+            "x-soroban-type": "u64"
+        }),
+        ScSpecTypeDef::U128
         | ScSpecTypeDef::U256
         | ScSpecTypeDef::Timepoint
         | ScSpecTypeDef::Duration => json!({ "type": "integer", "minimum": 0 }),
-        ScSpecTypeDef::I32 | ScSpecTypeDef::I64 | ScSpecTypeDef::I128 | ScSpecTypeDef::I256 => {
-            json!({ "type": "integer" })
-        }
+        ScSpecTypeDef::I32 => json!({ "type": "integer", "x-soroban-type": "i32" }),
+        ScSpecTypeDef::I64 => json!({ "type": "integer", "x-soroban-type": "i64" }),
+        ScSpecTypeDef::I128 => json!({ "type": "integer", "x-soroban-type": "i128" }),
+        ScSpecTypeDef::I256 => json!({ "type": "integer", "x-soroban-type": "i256" }),
         ScSpecTypeDef::Bytes => bytes_schema(0),
         ScSpecTypeDef::BytesN(bytes) => bytes_schema(bytes.n),
-        ScSpecTypeDef::String | ScSpecTypeDef::Symbol | ScSpecTypeDef::Address => {
-            json!({ "type": "string" })
-        }
+        ScSpecTypeDef::String => json!({ "type": "string", "x-soroban-type": "string" }),
+        ScSpecTypeDef::Symbol => json!({ "type": "string", "x-soroban-type": "symbol" }),
+        ScSpecTypeDef::Address => json!({ "type": "string", "x-soroban-type": "address" }),
         ScSpecTypeDef::Option(option) => {
             json!({ "anyOf": [json_schema_type(&option.value_type), json!({"type": "null"})] })
         }
@@ -126,11 +138,18 @@ pub fn json_schema_type(type_: &ScSpecTypeDef) -> Value {
             ]
         }),
         ScSpecTypeDef::Vec(vec) => {
-            json!({ "type": "array", "items": json_schema_type(&vec.element_type) })
+            json!({
+                "type": "array", "items": json_schema_type(&vec.element_type),
+                "minItems": 0, "maxItems": 8, "x-soroban-type": "vec"
+            })
         }
         ScSpecTypeDef::Map(map) => json!({
             "type": "object",
-            "additionalProperties": json_schema_type(&map.value_type)
+            "x-soroban-key-type": json_schema_type(&map.key_type),
+            "additionalProperties": json_schema_type(&map.value_type),
+            "minProperties": 0,
+            "maxProperties": 8,
+            "x-soroban-type": "map"
         }),
         ScSpecTypeDef::Tuple(tuple) => json!({
             "type": "array",
@@ -138,6 +157,48 @@ pub fn json_schema_type(type_: &ScSpecTypeDef) -> Value {
         }),
         ScSpecTypeDef::Udt(udt) => json!({ "$ref": format!("#/$defs/{}", xdr_str(&udt.name)) }),
     }
+}
+
+/// Derive the callable-function input grammar directly from a contract's
+/// machine-readable `contractspecv0` section. Collection bounds are harness
+/// budgets, not claims about the contract's semantic limits.
+pub fn invocations_json_schema(wasm: &[u8]) -> Result<Value> {
+    let entries = soroban_spec::read::from_wasm(wasm).context("contract WASM spec must parse")?;
+    let functions = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ScSpecEntry::FunctionV0(function) => Some(function_to_json(function)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if functions.is_empty() {
+        bail!("contract spec contains no callable functions");
+    }
+    Ok(json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "LedgerLens score contract invocations",
+        "source": "Soroban contractspecv0",
+        "functions": functions,
+    }))
+}
+
+fn function_to_json(function: &ScSpecFunctionV0) -> Value {
+    let inputs = function
+        .inputs
+        .iter()
+        .map(|input| {
+            let name = xdr_str(&input.name);
+            json!({
+                "name": name,
+                "schema": with_risk_range(&name, json_schema_type(&input.type_)),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "name": xdr_str(&function.name.0),
+        "inputs": inputs,
+        "outputs": function.outputs.iter().map(json_schema_type).collect::<Vec<_>>(),
+    })
 }
 
 /// Attach the semantic score-domain range to a field's schema fragment.
