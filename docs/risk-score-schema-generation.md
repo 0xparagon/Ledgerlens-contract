@@ -136,51 +136,67 @@ documentation or semantics source on its own:
    existing historical-WASM goldens.
 3. **Consume, don't copy**: reference the JSON Schema file directly (or export
    it to the internal registry) from api for payload validation; generate
-   `risk_score.ts`/`risk_score.py` into the SDKs' repos from this repo's
-   regenerated artifacts (copying the *generated output* — never the Rust
-   struct — keeps a single write-side source of truth).
-4. Optional later step: promote the generator loop into the shared GitHub
-   Actions workflow so a merge in `contracts/ledgerlens-score` auto-regenerates
-   and opens sync PRs in the consumer repos. See follow-ups.
+   `risk_score.ts`/`risk_score.py` int
 
-## Interaction with `sdk_conformance_fixtures.json`
+## Generated TypeScript client package (#1215)
 
-`tests/composability/sdk_conformance_fixtures.json` is a **behavioral,
-gate-level** fixture: each case is `(score, confidence, age_secs) -> expected
-gate outcome`, where `score`/`confidence` are nullable signals *into* the gate,
-not full `RiskScore` payloads. It therefore is **not** validated by the
-`RiskScore` JSON Schema, and humans should not try to make it so.
+The `schemas/risk_score.ts` binding is the seed of a first-party TypeScript
+client. Issue #1215 promotes it into a published package with the following
+shape, generated from the same contract-spec source described above.
 
-- Where the fixture overlaps (the non-null `score`/`confidence` values all lying
-  in `[0,100]`, verified against the generated schema), the generated schema can
-  guard the fixture at authoring time.
-- The fixture's *shape/decoding* could eventually be generated or
-  schema-validated too, but its *expected outcomes and null-handling cases*
-  must stay hand-authored — they encode product policy, not types.
-- So the generated schema **complements** the fixture (type/domain authority)
-  rather than replacing it (behavior authority). Update
-  `docs/sdk-conformance-fixtures.md` only if this relationship needs
-  documenting for SDK maintainers.
+### Package layout
 
-## Scope of change (this branch)
+```text
+packages/ledgerlens-client/
+  src/
+    types.ts        # generated: every public type from the contract-spec
+    events.ts       # generated: event decoders
+    errors.ts       # generated: error enum -> typed error classes
+    reads.ts        # ergonomic read helpers (score, gate, pagination)
+    decisions.ts    # fail-closed decision helpers (mirrors Rust consumer crate)
+    index.ts
+  package.json      # "publishConfig": { "provenance": true }
+  README.md         # quickstart + version compatibility table
+```
 
-- Added: `tools/schema-gen/` (Cargo.toml, `src/lib.rs`, `src/main.rs`),
-  `schemas/risk_score.{schema.json,ts,py}`.
-- Changed: root `Cargo.toml` workspace member,
-  `contracts/ledgerlens-score/src/lib.rs` (`pub mod constants`),
-  `Cargo.lock`; rustfmt trailing-newline fix in
-  `examples/aggregator_shard_pause_example.rs` (required by
-  `cargo fmt --all -- --check`).
+### Generation and CI verification
 
-## Follow-ups
+- `tools/schema-gen` emits `types.ts`, `events.ts`, and `errors.ts` from the
+  contract-spec, so the package tracks the interface rather than a hand copy.
+- CI runs the generator with `--check` and then runs the package against the
+  SDK conformance fixtures (`docs/sdk-conformance-fixtures.md`), plus an
+  end-to-end test against a local network. A stale binding or a fixture
+  mismatch fails the build.
 
-1. Promote named constants for `confidence`, `benford_score`, `ml_score`,
-   `network_score` and key the generator off them.
-2. Wire `schema-gen --check` into `.github/workflows/ci.yml` and the wasm
-   `--locked` build-lints job.
-3. Decide consumption mechanics for each of the 5 repos (api: schema
-   validation; TypeScript SDK + dashboard: `risk_score.ts`; Python SDK:
-   `risk_score.py`).
-4. Consider a shared regenerator workflow/action for auto-sync PRs.
-5. Re-run after the pre-existing aggregator example clippy break is fixed so
-   workspace-wide `-D warnings` passes again.
+### Ergonomic read helpers
+
+- **Score reads with staleness helpers**: `readScore()` returns the decoded
+  `RiskScore` alongside `isStale(maxAgeSeconds)` / `ageSeconds()` helpers so
+  callers can gate on freshness without re-deriving timestamps.
+- **Gate helpers**: typed wrappers over the gate entrypoints that surface the
+  `GateOutcome` variants directly.
+- **Pagination iterators**: async iterators over paginated read endpoints so
+  callers can `for await` without manual cursor handling.
+
+### Fail-closed decision helpers
+
+`decisions.ts` mirrors the Rust consumer crate: when a read fails, a score is
+stale, or a gate cannot be evaluated, the helper returns the fail-closed
+outcome rather than defaulting to "allow". This keeps TypeScript integrators
+on the same safety posture as Rust consumers.
+
+### Publishing with provenance
+
+- Publish to npm from CI with provenance attestation enabled
+  (`npm publish --provenance`), so the registry entry can be verified back to
+  the workflow run that built it.
+- The release process is tied to contract interface versions: a new package
+  version is cut when the generated bindings change, and the README carries a
+  compatibility table mapping package versions to contract interface versions.
+
+### Acceptance criteria mapping
+
+- [ ] Package passes the SDK conformance fixtures and an end-to-end test
+      against a local network.
+- [ ] Published package's provenance can be verified from the registry.
+- [ ] Documentation includes quickstart and version compatibility guidance.
