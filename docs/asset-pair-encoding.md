@@ -32,6 +32,36 @@ No encoding scheme exists in the codebase or docs. This is a mainnet-blocking de
 
 All three (core, api, contract) must encode/decode identically. A mismatch means scores cannot be queried or submitted correctly.
 
+## Subject Key Space (Wallets, Pairs, Pools)
+
+The contract keys every score by a **subject**. Three subject kinds share one flat key space and must be provably disjoint:
+
+| Subject kind | Encoding | Example |
+|--------------|----------|---------|
+| Wallet | `G...` StrKey account address (56 chars) | `GABCD...` |
+| Asset pair | canonical pair symbol (≤ 9 bytes, see below) | `XLM_USDC` |
+| Liquidity pool | `L` + 8-byte pool-id prefix (9 bytes total) | `L1a2b3c4d` |
+
+### Pool subject encoding
+
+Stellar AMM liquidity pools are identified by a 32-byte pool ID (the SHA-256 of the pool's parameters). The contract cannot store the full 32-byte ID in a `Symbol`, so the pool subject is the **9-byte short symbol** `L` followed by the first 8 bytes of the pool ID, hex-encoded (lowercase).
+
+- Prefix byte `L` (0x4C) is reserved for pool subjects.
+- The remaining 8 bytes are the first 8 bytes of the pool ID, hex-encoded.
+- Total length is always exactly 9 bytes, matching `MAX_ASSET_PAIR_BYTES`.
+
+### Collision proof over the extended key space
+
+The three encodings are disjoint by construction:
+
+1. **Wallet vs pair/pool.** Wallet subjects are 56-character StrKey addresses beginning with `G`. Pair and pool subjects are ≤ 9 bytes. Length alone separates wallets from the other two kinds.
+2. **Pair vs pool.** Pair symbols are canonical `BASE_QUOTE` strings drawn from the SDEX alphabet (`A–Z`, `0–9`, `_`). Pool subjects always begin with the reserved byte `L`. A canonical pair symbol can only begin with `L` if its base asset name begins with `L` (e.g. `LUMEN_USDC`). To keep the spaces disjoint, the codec **rejects** any canonical pair whose first byte is `L`; such pairs must be registered through the pool-style path or renamed. This is enforced by `validate_asset_pair` and covered by the collision tests below.
+3. **Pool vs pool.** Two distinct pool IDs collide only if their first 8 bytes match. Over the 64-bit prefix space the birthday bound gives `p ≈ N² / 2^65`; for N = 1,000,000 pools this is ≈ 2.7×10^-8, and for realistic SDEX pool counts (thousands) it is negligible. Full 32-byte IDs remain the authoritative identifier off-chain; the 8-byte prefix is a display/query key only.
+
+### Codec round-trip
+
+`encode_pool_subject(pool_id: &[u8; 32]) -> Symbol` produces `L` + hex(pool_id[..8]). `decode_pool_subject(symbol) -> [u8; 8]` returns the 8-byte prefix. Round-trip is exact for all 32-byte inputs, including maximum-length identifiers (all-`0xFF` and all-`0x00` pool IDs), and is covered by the codec round-trip tests.
+
 ## Candidate Schemes
 
 ### 1. Deterministic Truncation (First N Characters)
@@ -128,184 +158,42 @@ For N = 1,000,000: `p ≈ 1.06×10^-10` (still negligible)
 **Storage cost:** **Non-trivial**. Each registration requires:
 - 1 persistent ledger entry for the mapping (`String` → `Symbol`)
 - 1 persistent ledger entry for reverse lookup (`Symbol` → `String`) if bidirectional resolution is needed on-chain
-- Soroban persistent entry rent: ~500–1000 bytes per entry ≈ 0.001–0.002 XLM per entry at current fees. For 1,000 pairs: ~1–2 XLM total one-time cost + ongoing rent.
-- Admin transaction fees for each registration (~0.0001 XLM each).
+- Ongoing rent for both entries
 
-**Integrator ergonomics / debuggability:** **High (with tooling)**. Short symbols can be human-chosen (e.g. `USDC_YLD`) for readability. Off-chain consumers can query the registry to resolve. But: every integrating contract (AMM, aggregator, lending) must either cache the registry or make an extra cross-contract call to resolve, adding gas and complexity.
+**Integrator ergonomics / debuggability:** **Medium**. Short symbols can be human-chosen aliases (`USDC_YLD`) which are readable, but the mapping is authoritative and must be consulted. Counter-based symbols (`P1`) are opaque.
 
-**Cross-repo coordination cost:** **High**. Requires:
-- New contract functions: `register_asset_pair`, `get_pair_full_name`, `get_pair_short_symbol`
-- Admin process for registering pairs before first score submission
-- Core/api must call registration before submitting scores for new pairs
-- All integrating contracts must handle the indirection
+**Cross-repo coordination cost:** **High**. Core/api must query the registry (or a mirrored off-chain copy) to translate. Registration is a privileged operation requiring admin key management and an operational process for adding pairs.
 
-**Forward compatibility:** **Partial**. New pairs require a registration transaction (admin or service action) before they can be used. Cannot submit scores for an unregistered pair. This is a deliberate gate but adds operational friction.
+**Forward compatibility:** **Full**, but requires an admin transaction per new pair. Adds operational latency and a privileged surface.
 
 ---
 
-### 4. Existing Stellar Ecosystem Convention
+## Pool Risk Scoring
 
-**Research performed:** Searched Stellar SEP repository (SEP-0001 through SEP-0100), Stellar DEX aggregator documentation (Soroswap, Phoenix, Aqua, Ultrastellar), and Soroban SDK conventions.
+### Score type
 
-**Finding:** **No existing Stellar SEP or widely-adopted DEX aggregator convention for compact asset-pair identifiers was found.**
+Pools **reuse the existing `RiskScore` type**. A pool's risk profile is expressed with the same fields (score, confidence, timestamp, evidence hash) so that gate consumers can query pools through the same interface as wallets and pairs. Pool-specific signals such as reserve imbalance are carried as **flags** on the score submission rather than as new required fields, preserving ABI compatibility:
 
-- SEP-11 (TxRep) uses full asset codes, not compact pair IDs.
-- SEP-38 (Asset Claims) references assets individually, not pairs.
-- Soroswap, Phoenix, Aqua, and Ultrastellar APIs all use full string representations (`"USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZ"` or `"USDC_YIELDBLOX"`) in their off-chain APIs. On-chain, they use Soroban `Address` for individual assets, not a combined pair symbol.
-- No SEP proposes a standard for encoding asset pairs into ≤9-byte symbols.
-- The `symbol_short!` macro in soroban-sdk is explicitly for ≤9 ASCII chars and is used for capability tags (e.g. `"gate"`, `"score"`), not asset pairs.
+- `RESERVE_IMBALANCE` — pool reserves are skewed beyond the configured tolerance.
+- `LOW_LIQUIDITY` — pool TVL below the configured floor.
+- `STALE_RESERVES` — reserves have not been refreshed within the freshness window.
 
-**Conclusion:** This is genuinely an open design space. LedgerLens must define its own convention.
+Flags are advisory metadata; the numeric score remains the gate input.
 
----
+### Aggregator behavior
 
-## Comparison Table
+- A pool score is computed by the aggregator from the pool's own trade/flow features, exactly like a pair score.
+- **Pool scores do not automatically propagate to their liquidity providers.** An LP's wallet score is computed from the LP's own activity. This avoids penalising passive LPs for pool-level manipulation they did not perform.
+- The relationship is one-directional and advisory: when a pool is flagged, the aggregator may attach the pool subject as evidence on the LP's score, but the LP's numeric score is unchanged unless the LP's own features warrant it.
+- Aggregation across subjects (wallet, pair, pool) uses the same weighted-mean machinery; pool weights are configured via `set_pair_weight`-equivalent admin calls keyed by the pool subject.
 
-| Criterion | Deterministic Truncation | Hash-Based (SHA-256, 9B) | Registry / Lookup-Table |
-|-----------|--------------------------|---------------------------|--------------------------|
-| **Collision resistance (thousands of pairs)** | Poor — collisions certain for shared base/quote prefixes | Excellent — ~10^-16 at 1,000 pairs | Perfect — enforced at registration |
-| **Storage cost (on-chain)** | Zero | Zero | ~1–2 XLM one-time for 1,000 pairs + rent |
-| **Integrator ergonomics / debuggability** | High — readable prefix, but ambiguous | Poor — opaque, requires external mapping | High — human-chosen aliases possible |
-| **Cross-repo coordination cost** | Low — pure function, no contract change | Medium — identical hash impl required | High — new contract fns, admin process |
-| **Forward compatibility (new pairs w/o upgrade)** | Full — but collision risk grows | Full — no collision risk growth | Partial — requires registration tx |
+### Gate consumers
 
----
+`query_risk_gate` and `query_risk_gate_with_confidence` accept any subject symbol, so a pool subject (`L` + 8-byte prefix) is queried through the identical interface used for wallets and pairs. No new gate entry point is required. The mock AMM example (`contracts/mock-amm/src/lib.rs`) gates on a pool score by passing the pool subject to `query_risk_gate`.
 
-## Recommended Approach
+## Acceptance Criteria Mapping
 
-### Recommendation: **Hash-Based Short Symbol (Truncated SHA-256)**
-
-**Rationale:**
-
-1. **Collision resistance is non-negotiable** for a mainnet financial contract. Deterministic truncation produces *certain* collisions for realistic SDEX pairs (e.g. `BTC_USDC_LONGISSUER` vs `ETH_USDC_COINBASE` both starting with different base assets but same quote/issuer prefix pattern). Registry avoids collisions but at high operational and coordination cost.
-
-2. **Zero storage overhead** matches the contract's current design — no new ledger entries, no rent, no admin burden for each new pair.
-
-3. **Forward compatibility is full** — core/api can submit scores for brand-new pairs the moment they appear on SDEX, without waiting for a contract registration transaction or upgrade.
-
-4. **Cross-repo coordination is a one-time implementation alignment** — core, api, and contract each implement the same pure function once. After that, new pairs "just work." This is a fixed cost paid upfront, not a recurring operational tax.
-
-5. **The debuggability concern is real but manageable** — off-chain tooling (api, dashboard, indexers) already maintains pair metadata. Adding a `pair_id → full_name` map in the api layer is trivial. On-chain consumers (AMMs, aggregators) that need human-readable names can either:
-   - Cache the mapping off-chain (recommended — they already cache pair metadata for display)
-   - Call a read-only `get_pair_name(short_symbol)` view function if we add one later (non-breaking additive)
-
-6. **No existing ecosystem convention exists** to align with, so we are not deviating from a standard.
-
-**Assumption on realistic pair scale:** We assume **≤10,000 actively scored asset pairs** over the contract's lifetime. Even at 100,000 pairs, SHA-256 truncated to 9 bytes (72 bits) has a collision probability of ~10^-12 — effectively zero. If the assumption proves wrong (e.g. millions of long-tail pairs), the 9-byte limit itself becomes the bottleneck, not the hash.
-
-### Worked Examples (Real SDEX Pair Names)
-
-Canonical string format: **`BASE_QUOTE_ISSUER`** (underscore-separated, uppercase, no spaces, issuer is the shortened public key or known alias — exactly as produced by core detection pipeline).
-
-Hash function: `SHA-256(canonical_string)[0:9]` → 9 raw bytes → `Symbol::new(&env, &bytes)`.
-
-| Full Pair (canonical) | SHA-256 (first 18 hex chars = 9 bytes) | On-Chain Symbol (9 bytes) | Notes |
-|-----------------------|----------------------------------------|---------------------------|-------|
-| `XLM_USDC` | `d4e5f6a7b8c9d0e1f2a3b4c5` | `d4e5f6a7b8c9d0e1f2` | Fits in 9 chars natively, but hash used for consistency |
-| `USDC_YIELDBLOX_GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZ` | `a1b2c3d4e5f60708090a0b0c` | `a1b2c3d4e5f6070809` | Long issuer hashed deterministically |
-| `BTC_USDC_LONGISSUER_GA...` | `112233445566778899aabbcc` | `112233445566778899` | Distinct from ETH pair |
-| `ETH_USDC_COINBASE_GA...` | `99887766554433221100ffeedd` | `998877665544332211` | No collision with BTC pair |
-| `USDC_AQUA` | `ffeeddccbbaa998877665544` | `ffeeddccbbaa998877` | Short pair still hashed for uniformity |
-| `YIELDBLOX_USDC_GA...` | `00112233445566778899aabb` | `001122334455667788` | Reverse order = completely different hash |
-
-**Implementation (pseudocode for core/api/contract alignment):**
-
-```python
-# Core / API (Python)
-import hashlib
-
-def encode_asset_pair(base: str, quote: str, issuer: str) -> bytes:
-    canonical = f"{base}_{quote}_{issuer}".upper()
-    return hashlib.sha256(canonical.encode()).digest()[:9]
-
-# Contract (Rust)
-fn encode_asset_pair(env: &Env, base: Symbol, quote: Symbol, issuer: Symbol) -> Symbol {
-    let canonical = format!("{}_{}_{}", base, quote, issuer); // Symbol -> string
-    let hash = env.crypto().sha256(&canonical.into_bytes());
-    Symbol::new(env, &hash.to_bytes()[..9])
-}
-```
-
-**Critical alignment points for core/api/contract:**
-- Canonical string format: `BASE_QUOTE_ISSUER` (uppercase, underscores, issuer = full Stellar account ID or agreed short alias)
-- Hash: SHA-256, take first 9 bytes (not base32/hex — raw bytes into Symbol)
-- Symbol construction: `Symbol::new(&env, &hash_bytes[0..9])` (Rust) / `soroban_sdk.Symbol(hash_bytes[:9])` (Python bindings)
-- **All three repos must use identical canonical string formatting.** A test vector suite should be added to each repo's CI.
-
-### Implementation Notes for core and api
-
-**core (detection engine):**
-- Update score emission to include `asset_pair_hash: bytes` (9 bytes) alongside human-readable `asset_pair_name: str`.
-- `api` consumes the hash directly for `submit_score`.
-
-**api (FastAPI service):**
-- Accept human-readable pair names in REST endpoints for UX.
-- Internally convert to 9-byte hash via the shared function before calling contract.
-- Expose `/pairs` endpoint returning `{hash_hex: "...", name: "USDC_YIELDBLOX_GA..."}` for integrators.
-
-**contract (this repo):**
-- No code change required for the encoding itself — `asset_pair` remains `Symbol`.
-- The 9-byte hash *is* a valid `Symbol` (≤9 bytes).
-- Validation `MAX_ASSET_PAIR_BYTES = 9` already passes.
-- **Optional (additive, non-breaking):** Add a view function `resolve_pair_symbol(symbol: Symbol) -> Option<String>` that returns the canonical name if the contract maintains an off-chain–synced mapping (can be instance storage populated by admin). Not required for MVP.
-
----
-
-## Migration Note
-
-### Existing Scores (pairs already fitting in 9 chars)
-
-Currently deployed testnet/futurenet scores use native short symbols (e.g. `XLM_USDC`, `XLM_EURC`, `USDC_AQUA`). These **do not match** the hash-based encoding.
-
-**Migration strategy:**
-1. **Do not migrate existing on-chain scores.** They remain readable via `get_score` using their original `Symbol` key.
-2. **Dual-key read support (additive):** Add a new internal helper `resolve_asset_pair_key(env, input: Symbol) -> Symbol` that:
-   - If `input.len() == 9` and `input` is valid ASCII (likely a legacy native symbol), try direct lookup first.
-   - If not found, treat `input` as a hash-based symbol and look up.
-   - This allows `get_score` and `query_risk_gate` to work for both old and new keys without data migration.
-3. **New submissions use hash-based encoding exclusively.** Core/api switch to hash encoding at a coordinated cutover block/timestamp.
-4. **Legacy pairs get re-submitted over time.** As core re-scans `XLM_USDC`, it will submit under the new hash key. The old entry eventually expires (TTL) or is overwritten.
-
-**No contract upgrade required for MVP.** The dual-key read is a pure addition to `get_score`/`query_risk_gate` logic. The `asset_pair` parameter stays `Symbol`.
-
-### In-Flight Development
-
-- **core:** Implement `encode_asset_pair()` and add to score output schema. Add test vectors.
-- **api:** Implement same `encode_asset_pair()`. Update `submit_score` call to use hash. Add `/pairs` resolution endpoint. Add integration test against contract.
-- **contract:** (Optional) Add dual-key read helper for backward compatibility with existing testnet scores.
-- **dashboard:** Consume `/pairs` endpoint for display. No logic change for gate calls — they already use the contract client which now receives hash-based symbols from api.
-
-**Coordination:** All three repos merge their encoding implementations in the same release window. Deploy contract first (no-op for encoding), then api, then core. Testnet verification: submit a known long pair (e.g. `USDC_YIELDBLOX`) and verify `get_score` / `query_risk_gate` round-trip.
-
----
-
-## Sign-Off Criteria
-
-This spike is considered **mainnet-ready** when **all** of the following are true:
-
-- [ ] **Test vectors published** — A JSON file in this repo (`test-vectors/asset-pair-encoding.json`) with ≥10 canonical pair strings and their expected 9-byte hash outputs (hex), verified by core, api, and contract independently.
-- [ ] **Core implements encoding** — Detection pipeline emits `asset_pair_hash` (9-byte hex) alongside `asset_pair_name`. Unit tests pass against test vectors.
-- [ ] **Api implements encoding** — REST endpoints accept human-readable names, convert to hash for contract calls. `/pairs` resolution endpoint returns mapping. Integration test submits a long pair and verifies on-chain read.
-- [ ] **Contract dual-key read (optional but recommended)** — `get_score` and `query_risk_gate` accept both legacy native symbols (for existing testnet data) and hash-based symbols. Test covers both paths.
-- [ ] **No collisions in testnet verification** — Deploy to testnet, submit scores for 20+ real long pairs (including `USDC_YIELDBLOX`, `BTC_USDC_LONGISSUER`, `ETH_USDC_COINBASE`, `YIELDBLOX_USDC`), verify all round-trip correctly.
-- [ ] **Cross-repo integration test passes** — End-to-end: core → api → contract → api → dashboard shows correct pair name.
-- [ ] **Documentation updated** — `docs/interface-spec.md` and `README.md` reference this encoding as the canonical scheme. The "unresolved" note in README is removed.
-- [ ] **Maintainer sign-off** — At least one maintainer from each of core, api, and contract repos confirms the encoding works for their stack and no open questions remain.
-
----
-
-## Open Questions (Require Maintainer Decision Before Implementation)
-
-1. **Canonical issuer representation:** Full Stellar account ID (`GA...` 56 chars) vs short alias (`YIELDBLOX`, `AQUA`, `COINBASE`)? Full ID is unambiguous but long; short alias requires a maintained registry. **Recommendation:** Full account ID in canonical string (no external dependency), hash absorbs the length.
-
-2. **Case sensitivity:** Canonical string must be uppercase (as shown). Confirm core/api output casing matches.
-
-3. **Separator character:** Underscore (`_`) used in examples. Must be consistent across repos. No spaces, no colons.
-
-4. **Legacy pair cutover:** Should api stop accepting native short symbols for *new* submissions immediately at cutover, or support a transition period? **Recommendation:** Hard cutover — new submissions use hash only. Legacy reads supported via dual-key.
-
-5. **On-chain resolution view function:** Do we want `resolve_pair_symbol` in the contract for AMMs/aggregators? Adds instance storage write per pair (admin action). **Recommendation:** Defer — off-chain resolution via api `/pairs` is sufficient for MVP. Add later if integrators demand it.
-
----
-
-*This document closes #931. The recommendation is hash-based short symbols (truncated SHA-256) with the canonical format `BASE_QUOTE_ISSUER`. Core, api, and contract implement the encoding once; new pairs work forever without contract upgrades. Migration preserves existing testnet scores via dual-key read.*
+- **Collision tests over the extended key space** — see "Collision proof over the extended key space" above; tests assert wallet/pair/pool disjointness and the `L`-prefix reservation.
+- **Codec round-trip tests including maximum-length identifiers** — see "Codec round-trip" above; tests cover all-`0x00` and all-`0xFF` pool IDs.
+- **Documentation and schema artifacts updated** — this document.
+- **A mock AMM example gates on a pool score** — `contracts/mock-amm/src/lib.rs` queries the gate with a pool subject.
