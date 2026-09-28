@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1150 -->
 - #1150: Custom-account (smart wallet) compatibility for admin and signer roles
+
+<!-- handsoff-issue-1152 -->
+- #1152: Bind service authorization to argument digests
