@@ -81,6 +81,16 @@
 //! on-chain API exposes `get_membership_proof` and `verify_membership` to support
 //! this workflow without scanning the full state.
 //!
+//! ## Stateless Verifier Interface
+//!
+//! The verification routines below are pure: they take only the proof material and
+//! the commitment as inputs and return a boolean, touching no storage. This makes
+//! them directly liftable into a separate stateless verifier contract (see
+//! `docs/adr/1153-stateless-verifier.md`) that the score contract can call
+//! cross-contract. The interface is versioned via [`VERIFIER_INTERFACE_VERSION`];
+//! any change to the input/output shape or the domain separators must bump it so
+//! callers can pin a known-good verifier hash.
+//!
 //! ## Security Model
 //!
 //! See `docs/verkle-commitment.md` for a full security analysis.
@@ -88,6 +98,17 @@
 #![allow(dead_code)]
 
 use soroban_sdk::{Bytes, BytesN, Env};
+
+/// Version tag for the stateless verifier interface.
+///
+/// Bump this whenever the pure verification inputs/outputs or any domain
+/// separator changes. Callers pin the verifier contract hash alongside this
+/// version so a mismatched verifier fails closed rather than accepting proofs
+/// under a different scheme.
+///
+/// * `1` — initial extraction: `verify_membership` / `verify_non_membership`
+///   over the hash-based polynomial commitment described above.
+pub const VERIFIER_INTERFACE_VERSION: u32 = 1;
 
 // ── BLS12-381 scalar field modulus ────────────────────────────────────────────
 //
@@ -201,50 +222,25 @@ pub fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// commitment = SHA-256(0x06 || accumulator)
 /// ```
 pub fn finalize_commitment(env: &Env, accumulator: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 33];
+    let mut buf = [0u8; 33]; // 1 + 32
     buf[0] = DOMAIN_COMMIT;
     buf[1..33].copy_from_slice(accumulator);
     env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
 }
 
-/// Incorporate one `(z, v)` leaf into the running XOR accumulator.
-///
-/// The running commitment is maintained as a raw XOR accumulator of all live
-/// leaves:
-///
-/// ```text
-/// leaf_i     = H(0x02 || z || v)
-/// accumulator = accumulator XOR leaf_i
-/// ```
-///
-/// The commitment exposed to callers is `H(0x06 || accumulator)`, computed
-/// by [`finalize_commitment`].
-///
-/// **Removal** uses the same function: XOR is its own inverse, so to remove an
-/// entry, call `update_accumulator(env, &old_accum, z, old_v)` — the old leaf
-/// XORs out.
-pub fn update_accumulator(env: &Env, accum: &[u8; 32], z: &[u8; 32], v: &[u8; 32]) -> [u8; 32] {
-    let leaf = hash_leaf(env, z, v);
-    xor32(accum, &leaf)
-}
+// ─── Stateless verification (extraction-ready) ────────────────────────────────
+//
+// The functions below are the pure verification surface intended to be lifted
+// into a separate stateless verifier contract. They read no storage and depend
+// only on their arguments, so the same code can run either in-contract (during
+// the migration window) or behind a cross-contract call to the verifier.
 
-// ─── Proof generation ─────────────────────────────────────────────────────────
-
-/// Compute the KZG-analog opening proof (witness) for a member entry.
+/// Recompute the KZG witness hash for a `(commitment, z, v)` triple.
 ///
 /// ```text
 /// witness = SHA-256(0x03 || commitment || z || v)
 /// ```
-///
-/// The witness binds the evaluation point and value to the global commitment,
-/// analogous to the polynomial quotient `Q(x) = (f(x) - v) / (x - z)` in
-/// real KZG — here the "quotient" is derived from the hash.
-pub fn compute_membership_witness(
-    env: &Env,
-    commitment: &[u8; 32],
-    z: &[u8; 32],
-    v: &[u8; 32],
-) -> [u8; 32] {
+pub fn derive_witness(env: &Env, commitment: &[u8; 32], z: &[u8; 32], v: &[u8; 32]) -> [u8; 32] {
     let mut buf = [0u8; 97]; // 1 + 32 + 32 + 32
     buf[0] = DOMAIN_WITNESS;
     buf[1..33].copy_from_slice(commitment);
@@ -253,138 +249,52 @@ pub fn compute_membership_witness(
     env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
 }
 
-/// Compute the KZG-analog opening proof for a **non-member** key.
+/// Stateless membership verification.
 ///
-/// Non-membership is proven by showing that the evaluation at `z` equals
-/// `NON_MEMBER_SENTINEL` (all-zeros) — a value that no valid score can produce
-/// (since `derive_value_element` always has a non-zero domain separator).
+/// Pure function: given the commitment, the claimed key, the claimed score and
+/// timestamp, and the supplied witness, recompute `z`, `v` and the expected
+/// witness and confirm they match. Returns `true` iff the proof is valid.
 ///
-/// ```text
-/// witness = SHA-256(0x07 || commitment || z)
-/// ```
-pub fn compute_nonmembership_witness(env: &Env, commitment: &[u8; 32], z: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 65]; // 1 + 32 + 32
-    buf[0] = DOMAIN_NONMEMBER;
-    buf[1..33].copy_from_slice(commitment);
-    buf[33..65].copy_from_slice(z);
-    env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
-}
-
-// ─── Proof encoding ───────────────────────────────────────────────────────────
-
-/// Serialise a membership proof into a `Bytes` payload:
-///
-/// ```text
-/// [0]       = proof_type: 0x01 (member) or 0x02 (non-member)
-/// [1..33]   = z (evaluation point, 32 bytes)
-/// [33..65]  = v (value element, 32 bytes; NON_MEMBER_SENTINEL for absence)
-/// [65..97]  = witness (32 bytes)
-/// ```
-///
-/// Total: 97 bytes.
-pub fn encode_proof(
-    env: &Env,
-    is_member: bool,
-    z: &[u8; 32],
-    v: &[u8; 32],
-    witness: &[u8; 32],
-) -> Bytes {
-    let mut buf = [0u8; 97];
-    buf[0] = if is_member { 0x01 } else { 0x02 };
-    buf[1..33].copy_from_slice(z);
-    buf[33..65].copy_from_slice(v);
-    buf[65..97].copy_from_slice(witness);
-    Bytes::from_array(env, &buf)
-}
-
-/// `(is_member, z, v, witness)` as returned by [`decode_proof`].
-pub type DecodedProof = (bool, [u8; 32], [u8; 32], [u8; 32]);
-
-/// Deserialise a proof payload. Returns `(is_member, z, v, witness)` or
-/// `None` if the byte length is not exactly 97.
-pub fn decode_proof(proof: &Bytes) -> Option<DecodedProof> {
-    if proof.len() != 97 {
-        return None;
-    }
-    let proof_type = proof.get(0)?;
-    let is_member = match proof_type {
-        0x01 => true,
-        0x02 => false,
-        _ => return None,
-    };
-    let mut z = [0u8; 32];
-    let mut v = [0u8; 32];
-    let mut witness = [0u8; 32];
-    for i in 0..32u32 {
-        z[i as usize] = proof.get(1 + i)?;
-        v[i as usize] = proof.get(33 + i)?;
-        witness[i as usize] = proof.get(65 + i)?;
-    }
-    Some((is_member, z, v, witness))
-}
-
-// ─── Commitment serialisation ─────────────────────────────────────────────────
-
-/// Expand a 32-byte internal commitment hash into a 48-byte `BytesN<48>`.
-///
-/// The BLS12-381 G1 compressed point is 48 bytes. We emulate this format:
-///
-/// ```text
-/// output[0..16]  = context prefix: b"LEDGERLENS_KZG_1" (16 bytes)
-/// output[16..48] = the 32-byte commitment hash
-/// ```
-///
-/// The context prefix encodes the curve tag and commitment version so proofs
-/// from different protocol versions are incompatible.
-pub fn commitment_to_bytes48(env: &Env, commit: &[u8; 32]) -> BytesN<48> {
-    let prefix: &[u8; 16] = b"LEDGERLENS_KZG_1";
-    let mut buf = [0u8; 48];
-    buf[0..16].copy_from_slice(prefix);
-    buf[16..48].copy_from_slice(commit);
-    BytesN::<48>::from_array(env, &buf)
-}
-
-/// Extract the inner 32-byte commitment hash from a 48-byte `BytesN<48>`.
-/// Returns `None` if the context prefix does not match (version mismatch).
-pub fn bytes48_to_commitment(b48: &BytesN<48>) -> Option<[u8; 32]> {
-    let arr = b48.to_array();
-    let prefix: &[u8; 16] = b"LEDGERLENS_KZG_1";
-    if &arr[0..16] != prefix {
-        return None;
-    }
-    let mut commit = [0u8; 32];
-    commit.copy_from_slice(&arr[16..48]);
-    Some(commit)
-}
-
-// ─── Proof verification ───────────────────────────────────────────────────────
-
-/// Verify a membership or non-membership proof against a known commitment.
-///
-/// # Membership verification (`v != NON_MEMBER_SENTINEL`)
-///
-/// 1. Recompute `expected_witness = SHA-256(0x03 || commitment || z || v)`.
-/// 2. Confirm `proof.witness == expected_witness`.
-///
-/// # Non-membership verification (`v == NON_MEMBER_SENTINEL`)
-///
-/// 1. Recompute `expected_witness = SHA-256(0x07 || commitment || z)`.
-/// 2. Confirm `proof.witness == expected_witness`.
-/// 3. Confirm `proof.v == NON_MEMBER_SENTINEL`.
-///
-/// Returns `true` iff the proof is valid.
-pub fn verify_proof(
+/// This is the exact routine the extracted verifier contract exposes; keeping it
+/// here lets the score contract continue verifying in-contract during migration
+/// while the differential test proves both paths agree.
+pub fn verify_membership(
     env: &Env,
     commitment: &[u8; 32],
-    z: &[u8; 32],
-    v: &[u8; 32],
+    wallet_bytes: &[u8; 56],
+    pair_bytes: &[u8; 9],
+    score: u32,
+    timestamp: u64,
     witness: &[u8; 32],
 ) -> bool {
-    let is_nonmember = *v == NON_MEMBER_SENTINEL;
-    let expected_witness = if is_nonmember {
-        compute_nonmembership_witness(env, commitment, z)
-    } else {
-        compute_membership_witness(env, commitment, z, v)
-    };
-    *witness == expected_witness
+    let z = derive_evaluation_point(env, wallet_bytes, pair_bytes);
+    let v = derive_value_element(env, score, timestamp, &z);
+    let expected = derive_witness(env, commitment, &z, &v);
+    expected == *witness
+}
+
+/// Stateless non-membership verification.
+///
+/// Pure function: confirms that the key is absent from the committed state by
+/// checking the proof's value element equals [`NON_MEMBER_SENTINEL`] and that
+/// the witness matches the non-membership derivation.
+///
+/// ```text
+/// witness = SHA-256(0x07 || commitment || z || NON_MEMBER_SENTINEL)
+/// ```
+pub fn verify_non_membership(
+    env: &Env,
+    commitment: &[u8; 32],
+    wallet_bytes: &[u8; 56],
+    pair_bytes: &[u8; 9],
+    witness: &[u8; 32],
+) -> bool {
+    let z = derive_evaluation_point(env, wallet_bytes, pair_bytes);
+    let mut buf = [0u8; 97]; // 1 + 32 + 32 + 32
+    buf[0] = DOMAIN_NONMEMBER;
+    buf[1..33].copy_from_slice(commitment);
+    buf[33..65].copy_from_slice(&z);
+    buf[65..97].copy_from_slice(&NON_MEMBER_SENTINEL);
+    let expected = env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array();
+    expected == *witness
 }
