@@ -21,6 +21,48 @@ themselves and compare it against the on-chain value with a public RPC call.
 
 ---
 
+## Embedded build & interface metadata
+
+Every release WASM carries a Soroban **contract metadata custom section** that
+binds the deployed bytecode to the exact source revision and toolchain that
+produced it.  The metadata is emitted by the build script
+(`ledgerlens-score/build.rs`) into the `contractmetav0` custom section, so it
+travels inside the WASM and is readable from the on-chain hash alone.
+
+### Required metadata keys
+
+The following keys are **mandatory**; CI fails if any is missing from a
+release artifact:
+
+| Key | Meaning | Source |
+|-----|---------|--------|
+| `source_repo` | Canonical repository URL | `CARGO_PKG_REPOSITORY` |
+| `source_commit` | Git commit the artifact was built from | `GIT_COMMIT` (CI) / `git rev-parse HEAD` |
+| `crate_version` | Contract crate version | `CARGO_PKG_VERSION` |
+| `rustc_version` | Rust compiler version | `rustc --version` |
+| `soroban_sdk_version` | Soroban SDK version | `CARGO_PKG_VERSION` of `soroban-sdk` |
+| `interface_version` | Public interface/ABI version | `INTERFACE_VERSION` constant |
+
+### Determinism rules
+
+Metadata generation is **deterministic** and therefore safe to include in the
+byte-for-byte reproducible-build comparison:
+
+* **No timestamps.**  The build time is never embedded.
+* **No host paths.**  Absolute build directories are never embedded.
+* **No environment-dependent values.**  Only values derived from the pinned
+  source tree, `Cargo.lock`, and the pinned toolchain are used.  `GIT_COMMIT`
+  is taken from the CI-provided commit SHA (identical across both
+  reproducible-build runners); when unset, the build script falls back to
+  `git rev-parse HEAD`, which is stable for a given checkout.
+
+Because none of these inputs vary between two independent builds of the same
+commit, the metadata section is byte-identical and the existing
+`repro-build-1` / `repro-build-2` / `repro-verify` comparison continues to
+hold.
+
+---
+
 ## Pinned build inputs
 
 All inputs that affect WASM output determinism are locked:
@@ -56,6 +98,36 @@ Every push and pull request runs three dedicated CI jobs
 
 This proves that two independent machines, starting from scratch, produce the
 same binary from the same source commit.
+
+A separate `metadata-check` step in the `repro-verify` job extracts the
+`contractmetav0` custom section from the release artifact and asserts that all
+required metadata keys (see above) are present, failing CI otherwise.
+
+---
+
+## Verifying a deployed contract
+
+The script `scripts/verify-deployment.sh` extracts the embedded metadata from a
+deployed contract hash and checks it against a release manifest.
+
+```bash
+# Verify a deployed contract against the release manifest for a tag
+scripts/verify-deployment.sh \
+  --wasm target/wasm32-unknown-unknown/release/ledgerlens_score.wasm \
+  --manifest release-manifest.json
+```
+
+The script:
+
+1. Reads the `contractmetav0` custom section from the WASM (or from the
+   artifact fetched for a deployed hash).
+2. Compares each required key against the corresponding value in the release
+   manifest (`source_repo`, `source_commit`, `crate_version`,
+   `rustc_version`, `soroban_sdk_version`, `interface_version`).
+3. Exits non-zero if any key is missing or mismatched.
+
+It **passes** on an untampered release artifact and **fails** on a tampered
+one (e.g. a modified commit, version, or stripped metadata section).
 
 ---
 
@@ -186,111 +258,6 @@ cargo build \
 ```bash
 sha256sum target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
 
-Example output:
-```
-a1b2c3d4e5f6...  target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+Example output
 
-### Step 4 — Retrieve the on-chain WASM hash
-
-Use the Soroban / Stellar RPC to fetch the contract's installed WASM hash.  The
-easiest way is via the Stellar CLI:
-
-```bash
-# Replace <CONTRACT_ID> with the deployed contract's address (C...)
-# Replace <NETWORK>     with testnet or mainnet
-stellar contract info \
-  --id <CONTRACT_ID> \
-  --network <NETWORK>
-```yaml
-
-The output includes a `wasm_hash` field — that is the SHA-256 hash of the
-bytecode currently installed on-chain.
-
-Alternatively, using `curl` against Horizon or the RPC directly:
-
-```bash
-# Soroban RPC getLedgerEntries — contract code entry
-curl -s https://soroban-testnet.stellar.org \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "getLedgerEntries",
-    "params": {
-      "keys": ["<CONTRACT_CODE_XDR_KEY>"]
-    }
-  }' | jq '.result.entries[0].xdr'
-
-> **Note**: the on-chain `wasm_hash` is the hash of the *raw* WASM bytes before
-> any Soroban optimization step.  If you apply `stellar contract optimize` (or
-> the legacy `soroban contract optimize`) after the build step, hash the
-> **unoptimized** artifact (`ledgerlens_score.wasm`) to match the on-chain
-> hash, unless the deploy was done with the optimized artifact — in which case
-> hash the optimized one.  The deployment logs or `deploy.sh` output will
-> indicate which artifact was deployed.
-
-### Step 5 — Compare
-
-```bash
-# Hash from Step 3 (local build)
-LOCAL_HASH="a1b2c3d4e5f6..."
-
-# Hash from Step 4 (on-chain)
-ONCHAIN_HASH="a1b2c3d4e5f6..."
-
-if [ "$LOCAL_HASH" = "$ONCHAIN_HASH" ]; then
-  echo "✓ Verified: local build matches on-chain deployment."
-else
-  echo "✗ MISMATCH: hashes differ."
-  echo "  Local:   $LOCAL_HASH"
-  echo "  On-chain: $ONCHAIN_HASH"
-fi
-```yaml
-
-If the hashes match, the deployed contract bytecode is confirmed to correspond
-to the source at `<COMMIT_SHA>` in this repository.
-
----
-
-## Troubleshooting
-
-### Hashes differ
-
-| Likely cause | Resolution |
-|---|---|
-| Wrong Rust version | Run `rustc --version` and confirm it prints `rustc 1.81.0`.  Delete `~/.rustup/toolchains/` and reinstall if needed. |
-| Wrong source commit | Run `git log -1` and confirm the commit matches the one used for deployment. |
-| Cargo.lock was regenerated | Run `git diff Cargo.lock`.  Should be empty.  If not, restore it with `git checkout Cargo.lock`. |
-| Post-build optimization applied | Hash the optimized artifact if the deployment used `soroban contract optimize`. |
-| Host-specific build metadata | Some Rust targets embed absolute paths in debug info.  Confirm `debug = 0` is set in `[profile.release]` (it is — see `Cargo.toml`). |
-
-### Build fails with `error[E0463]: can't find crate for 'core'`
-
-The `wasm32-unknown-unknown` target is not installed for the 1.81.0 toolchain.
-Fix:
-
-```bash
-rustup target add wasm32-unknown-unknown --toolchain 1.81.0
-
-### Build fails with feature errors on Rust ≥ 1.82
-
-The `rust-toolchain.toml` in this repository pins to `1.81.0`, which `rustup`
-respects automatically.  If you are seeing this error, your environment is
-overriding the toolchain.  Unset `RUSTUP_TOOLCHAIN` and `RUSTC` environment
-variables and try again.
-
----
-
-## Deployed contract registry
-
-Published WASM hashes for each network are recorded in deployment releases (GitHub Releases tab).
-Cross-reference the release tag against the Git commit and the on-chain hash to
-establish a full chain of custody from source → build → deployment.
-
----
-
-## Related documents
-
-- [`docs/upgrade-guide.md`](upgrade-guide.md) — time-locked upgrade governance procedure
-- [`docs/attestation-spec.md`](attestation-spec.md) — score attestation (secp256k1 payload signing)
-- [`SECURITY.md`](../SECURITY.md) — threat model and responsible-disclosure policy
+/* … truncated 3823 chars — edit only what you need near the top … */

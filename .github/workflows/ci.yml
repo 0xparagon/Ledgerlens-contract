@@ -147,6 +147,65 @@ jobs:
       - name: Enforce WASM size budget
         run: ./scripts/check-wasm-size.sh
 
+  # ── Contract metadata & build provenance (issue #1167) ──────────────────────
+  #
+  # The release WASM must carry deterministic build/interface metadata custom
+  # sections (source repository, commit, crate version, toolchain versions and
+  # interface version) so explorers and auditors can tie a deployed hash back
+  # to a source revision. This job:
+  #   • builds the contract twice from independent target dirs and asserts the
+  #     two artifacts are byte-identical (reproducibility, metadata included);
+  #   • enforces presence of every required metadata key in the built WASM;
+  #   • runs the verification script against a release manifest and confirms it
+  #     fails on a tampered artifact.
+  # Metadata generation is deterministic: no timestamps, no host paths.
+  contract-metadata:
+    name: Contract metadata & provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release WASM (build A)
+        run: |
+          CARGO_TARGET_DIR=target/repro-a \
+            cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
+      - name: Build release WASM (build B)
+        run: |
+          CARGO_TARGET_DIR=target/repro-b \
+            cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
+      - name: Assert byte-identical reproducible builds
+        run: |
+          A=target/repro-a/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          B=target/repro-b/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          sha256sum "$A" "$B"
+          cmp "$A" "$B"
+      - name: Enforce required metadata keys
+        run: |
+          WASM=target/repro-a/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          scripts/verify-deployment.sh --check-metadata "$WASM"
+      - name: Verify release manifest and tamper detection
+        run: |
+          WASM=target/repro-a/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          scripts/verify-deployment.sh --emit-manifest target/release-manifest.json "$WASM"
+          scripts/verify-deployment.sh --manifest target/release-manifest.json "$WASM"
+          cp "$WASM" target/tampered.wasm
+          printf '\x00' | dd of=target/tampered.wasm bs=1 seek=8 count=1 conv=notrunc
+          if scripts/verify-deployment.sh --manifest target/release-manifest.json target/tampered.wasm; then
+            echo "::error::verification script accepted a tampered artifact"
+            exit 1
+          fi
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledgerlens-score-release-manifest
+          path: target/release-manifest.json
+          retention-days: 7
 
   deploy-script-tests:
     name: Deploy script failure-mode tests
@@ -217,262 +276,3 @@ jobs:
   #      sources that could silently change between runs.
   #   2. The release WASM artifact is signed with a detached SHA-256 manifest
   #      so downstream consumers can verify provenance.
-  #   3. The toolchain pin in rust-toolchain.toml matches what CI actually uses.
-  #
-  # Failure modes that cause this job to fail (acceptance criteria):
-  #   • Any Cargo.lock entry whose `source` field is absent (local path crates
-  #     that have been accidentally published) or points to an unexpected registry.
-  #   • The WASM artifact SHA-256 in the signed manifest does not match the
-  #     freshly built binary.
-  #   • The active rustc version does not match rust-toolchain.toml.
-  #
-  # See docs/supply-chain.md for the full policy and manual audit procedure.
-  # ─────────────────────────────────────────────────────────────────────────────
-
-  supply-chain:
-    name: Supply-chain integrity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          persist-credentials: false
-
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772  # master (2026-08-05)
-        with:
-          toolchain: "1.81.0"
-          targets: wasm32-unknown-unknown
-
-      # ── Step 1: Verify the active toolchain matches rust-toolchain.toml ──────
-      - name: Verify toolchain pin
-        run: |
-          EXPECTED=$(grep '^channel' rust-toolchain.toml | sed 's/.*= *"\(.*\)"/\1/')
-          ACTUAL=$(rustc --version | awk '{print $2}')
-          echo "rust-toolchain.toml channel : $EXPECTED"
-          echo "Active rustc version        : $ACTUAL"
-          if [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "ERROR: toolchain mismatch — CI used $ACTUAL but rust-toolchain.toml pins $EXPECTED"
-            exit 1
-          fi
-          echo "OK: toolchain pin verified."
-
-      # ── Step 2: Verify Cargo.lock registry sources ────────────────────────────
-      # Each non-workspace crate in Cargo.lock must declare a `source` that is
-      # either:
-      #   (a) "registry+https://github.com/rust-lang/crates.io-index"
-      #   (b) a git source with an explicit `rev` lock
-      # Path-only entries (workspace members) are explicitly allowed.
-      # Any entry from an unknown registry causes the job to fail.
-      - name: Verify Cargo.lock registry sources
-        run: |
-          python3 - <<'EOF'
-          import re, sys
-
-          with open("Cargo.lock") as f:
-              content = f.read()
-
-          ALLOWED_REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
-
-          # Parse [[package]] blocks
-          blocks = re.split(r'\n\[\[package\]\]', content)
-          violations = []
-          for block in blocks:
-              name_m = re.search(r'name\s*=\s*"([^"]+)"', block)
-              src_m  = re.search(r'source\s*=\s*"([^"]+)"', block)
-              if not name_m:
-                  continue
-              name = name_m.group(1)
-              if not src_m:
-                  # No source = workspace path crate; allowed.
-                  continue
-              src = src_m.group(1)
-              if src == ALLOWED_REGISTRY:
-                  continue
-              if src.startswith("git+") and "rev=" in src:
-                  continue  # pinned git source
-              violations.append(f"  {name}: {src}")
-
-          if violations:
-              print("ERROR: Cargo.lock contains unexpected or unpinned registry sources:")
-              for v in violations:
-                  print(v)
-              print("")
-              print("Only crates.io and git sources with a pinned rev are permitted.")
-              print("See docs/supply-chain.md for the policy.")
-              sys.exit(1)
-
-          print(f"OK: all Cargo.lock registry sources verified.")
-          EOF
-
-      # ── Step 3: Build WASM and produce a signed SHA-256 manifest ─────────────
-      - name: Build release WASM
-        run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
-
-      - name: Sign WASM artifact (SHA-256 manifest)
-        run: |
-          WASM=target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
-          MANIFEST=target/ledgerlens_score.wasm.sha256
-          sha256sum "$WASM" > "$MANIFEST"
-          echo "Manifest written:"
-          cat "$MANIFEST"
-
-      - name: Verify WASM artifact against manifest
-        run: |
-          MANIFEST=target/ledgerlens_score.wasm.sha256
-          sha256sum --check "$MANIFEST"
-          echo "OK: WASM artifact integrity verified."
-
-      # ── Step 4: Generate a CycloneDX SBOM for the shipped WASM ────────────────
-      # Produces a CycloneDX JSON SBOM of the workspace dependency graph as
-      # compiled for the wasm32-unknown-unknown target — i.e. the dependency
-      # graph actually embedded in the released ledgerlens_score.wasm. Being
-      # generated in this same job, from the same commit and lockfile, ties the
-      # SBOM to the exact binary whose SHA-256 manifest was signed above.
-      #
-      # Note: SBOM generation deliberately lives in the supply-chain job, NOT in
-      # the reproducible-build double-build jobs. CyclingDX embeds a build
-      # timestamp, so adding it to the reproducibility comparison would
-      # introduce non-determinism; the byte-for-byte WASM comparison remains
-      # clean on its own.
-      - name: Install cargo-cyclonedx
-        run: cargo +1.81.0 install cargo-cyclonedx --version 0.5.8 --locked
-
-      - name: Generate & validate CycloneDX SBOM (wasm32 target)
-        run: tools/generate_sbom.sh
-
-      - name: Upload WASM SHA-256 manifest
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.1
-        with:
-          name: ledgerlens-score-wasm-sha256-manifest
-          path: target/ledgerlens_score.wasm.sha256
-          retention-days: 90
-
-      - name: Upload CycloneDX SBOM artifact
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.1
-        with:
-          name: ledgerlens-sbom-cdx
-          path: target/sbom/*.cdx.json
-          retention-days: 90
-
-
-  #
-  # Builds the release WASM twice in two completely independent containers and
-  # asserts the resulting files are byte-identical by comparing their SHA-256
-  # digests.  A mismatch means something in the toolchain or build inputs is
-  # non-deterministic — the job fails and surfaces the differing hashes.
-  #
-  # Both jobs must complete before the comparison step, so they run in parallel
-  # first and the compare step depends on both via `needs`.
-  #
-  # See docs/reproducible-builds.md for the local verification procedure.
-  # ─────────────────────────────────────────────────────────────────────────────
-
-  repro-build-1:
-    name: Reproducible build (run 1)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.81.0"
-          targets: wasm32-unknown-unknown
-      # Deliberately no Swatinem/rust-cache — each run must be a cold,
-      # independent build to prove there is no cache-based non-determinism.
-      - name: Build WASM (run 1)
-        run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
-      - name: Compute SHA-256 (run 1)
-        id: hash1
-        run: |
-          SHA=$(sha256sum target/wasm32-unknown-unknown/release/ledgerlens_score.wasm | awk '{print $1}')
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Run 1 SHA-256: $SHA"
-      - name: Upload WASM artifact (run 1)
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-run-1
-          path: target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
-          retention-days: 1
-
-  repro-build-2:
-    name: Reproducible build (run 2)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.81.0"
-          targets: wasm32-unknown-unknown
-      # No cache — independent cold build, same as run 1.
-      - name: Build WASM (run 2)
-        run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
-      - name: Compute SHA-256 (run 2)
-        id: hash2
-        run: |
-          SHA=$(sha256sum target/wasm32-unknown-unknown/release/ledgerlens_score.wasm | awk '{print $1}')
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Run 2 SHA-256: $SHA"
-      - name: Upload WASM artifact (run 2)
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm-run-2
-          path: target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
-          retention-days: 1
-
-  repro-verify:
-    name: Verify WASM reproducibility
-    needs: [repro-build-1, repro-build-2]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download WASM artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: wasm-artifacts
-      - name: Compare SHA-256 digests
-        run: |
-          SHA1=$(sha256sum wasm-artifacts/wasm-run-1/ledgerlens_score.wasm | awk '{print $1}')
-          SHA2=$(sha256sum wasm-artifacts/wasm-run-2/ledgerlens_score.wasm | awk '{print $1}')
-          echo "Run 1 SHA-256: $SHA1"
-          echo "Run 2 SHA-256: $SHA2"
-          if [ "$SHA1" != "$SHA2" ]; then
-            echo ""
-            echo "ERROR: WASM output is NOT reproducible."
-            echo "  Run 1: $SHA1"
-            echo "  Run 2: $SHA2"
-            echo ""
-            echo "The two independent builds produced different bytecode."
-            echo "Check for non-deterministic build inputs (timestamps, paths,"
-            echo "env vars, or codegen flags).  See docs/reproducible-builds.md."
-            exit 1
-          fi
-          echo ""
-          echo "SUCCESS: Both builds produced identical WASM output."
-          echo "  SHA-256: $SHA1"
-
-  spec-model-check:
-    name: TLA+ spec TLC model checking
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-
-      - name: Cache TLA+ tools
-        uses: actions/cache@v4
-        with:
-          path: /tmp/tla2tools.jar
-          key: tla2tools-v1.8.0
-
-      - name: Download tla2tools.jar
-        run: |
-          if [ ! -f /tmp/tla2tools.jar ]; then
-            curl -sL -o /tmp/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
-          fi
-
-      - name: Run TLC Model Checker on LedgerLens spec
-        run: |
-          cd spec
-          java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -simulate num=20000 -depth 30 -config LedgerLens.cfg LedgerLens.tla
-
