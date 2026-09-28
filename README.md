@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1135 -->
 - #1135: Historical signer-set epochs so past attestations stay verifiable after rotation
+
+<!-- handsoff-issue-1136 -->
+- #1136: Time-travel reads: get_score_at(timestamp) over stored history
