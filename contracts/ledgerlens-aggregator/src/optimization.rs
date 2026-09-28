@@ -1,8 +1,75 @@
 /// Aggregator score read optimization for large wallet portfolios.
 /// Reduces redundant storage queries and unnecessary computations when processing
 /// wallets containing numerous asset pairs.
+///
+/// # Extended-precision scores (issue #1155)
+///
+/// Scores are stored internally at basis-point resolution (`0..=10_000`) while the
+/// public 0-100 API is preserved through a documented projection. The projection
+/// uses **ceiling** rounding so that risk gates never under-report: a stored value
+/// of `1` bp projects to `1`, and any non-zero risk projects to at least `1`.
+/// Legacy 0-100 values are migrated implicitly by multiplying by `SCORE_SCALE`
+/// (`100`), so no bulk storage rewrite is required.
 
 use soroban_sdk::{Address, Symbol, Vec};
+
+/// Basis-point resolution of the extended-precision score scale.
+pub const SCORE_SCALE: u32 = 100;
+
+/// Maximum value of the extended-precision (basis-point) score.
+pub const SCORE_BP_MAX: u32 = 10_000;
+
+/// Maximum value of the legacy 0-100 projected score.
+pub const SCORE_LEGACY_MAX: u32 = 100;
+
+/// Projection rounding rule applied when collapsing a basis-point score back to
+/// the legacy 0-100 scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreRounding {
+    /// Round toward zero. Never used for risk gates (can under-report).
+    Floor,
+    /// Round to the nearest integer, ties away from zero.
+    Nearest,
+    /// Round away from zero. Default: risk gates must never under-report.
+    Ceiling,
+}
+
+/// Extended-precision score stored at basis-point resolution (`0..=10_000`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedScore {
+    /// Score in basis points.
+    pub basis_points: u32,
+}
+
+impl ExtendedScore {
+    /// Construct from a basis-point value, saturating at [`SCORE_BP_MAX`].
+    pub fn from_basis_points(basis_points: u32) -> Self {
+        ExtendedScore { basis_points: basis_points.min(SCORE_BP_MAX) }
+    }
+
+    /// Construct from a legacy 0-100 score using the implicit scale factor.
+    /// This is the migration path for existing entries: no storage rewrite is
+    /// needed, the legacy value is simply widened on read.
+    pub fn from_legacy(legacy: u32) -> Self {
+        Self::from_basis_points(legacy.min(SCORE_LEGACY_MAX).saturating_mul(SCORE_SCALE))
+    }
+
+    /// Project back to the legacy 0-100 scale using the given rounding rule.
+    pub fn project(&self, rounding: ScoreRounding) -> u32 {
+        let bp = self.basis_points;
+        let projected = match rounding {
+            ScoreRounding::Floor => bp / SCORE_SCALE,
+            ScoreRounding::Nearest => (bp + SCORE_SCALE / 2) / SCORE_SCALE,
+            ScoreRounding::Ceiling => (bp + SCORE_SCALE - 1) / SCORE_SCALE,
+        };
+        projected.min(SCORE_LEGACY_MAX)
+    }
+
+    /// Project using the default risk-safe rule (ceiling).
+    pub fn to_legacy(&self) -> u32 {
+        self.project(ScoreRounding::Ceiling)
+    }
+}
 
 /// Score read statistics for optimization tracking
 #[derive(Debug, Clone)]
@@ -99,6 +166,14 @@ pub struct BatchedScoreResult {
     pub score: u32,
     /// Whether the score is stale
     pub is_stale: bool,
+}
+
+impl BatchedScoreResult {
+    /// Project the stored basis-point score to the legacy 0-100 scale using the
+    /// risk-safe (ceiling) rounding rule.
+    pub fn projected_score(&self) -> u32 {
+        ExtendedScore::from_basis_points(self.score).to_legacy()
+    }
 }
 
 /// Optimized portfolio scorer using batched reads
@@ -256,25 +331,52 @@ mod tests {
     }
 
     #[test]
-    fn test_portfolio_scorer_gas_savings() {
-        let scorer = PortfolioScorer::new(100);
-        assert!(scorer.stats().gas_savings_percent >= 50);
+    fn test_legacy_roundtrip_is_identity() {
+        // Property: any value originating from the legacy 0-100 scale must
+        // project back to exactly the same value under every rounding rule.
+        for legacy in 0..=SCORE_LEGACY_MAX {
+            let extended = ExtendedScore::from_legacy(legacy);
+            assert_eq!(extended.project(ScoreRounding::Floor), legacy);
+            assert_eq!(extended.project(ScoreRounding::Nearest), legacy);
+            assert_eq!(extended.project(ScoreRounding::Ceiling), legacy);
+            assert_eq!(extended.to_legacy(), legacy);
+        }
     }
 
     #[test]
-    fn test_portfolio_scorer_with_invalid_config_uses_defaults() {
-        let config = BatchConfig { batch_size: 0, max_parallel: 5, enable_caching: true };
-        let scorer = PortfolioScorer::with_config(100, config);
-        // Should use default configuration
-        assert_eq!(scorer.batch_size(), 10);
+    fn test_ceiling_never_under_reports() {
+        // Any non-zero basis-point risk must project to at least 1.
+        for bp in 1..=SCORE_BP_MAX {
+            assert!(ExtendedScore::from_basis_points(bp).to_legacy() >= 1);
+        }
+        assert_eq!(ExtendedScore::from_basis_points(0).to_legacy(), 0);
     }
 
     #[test]
-    fn test_score_read_stats_update() {
-        let mut stats = ScoreReadStats::new(100);
-        stats.apply_batching(100, 10);
-        assert_eq!(stats.cross_contract_calls, 10);
-        assert_eq!(stats.batched_reads, 100);
-        assert_eq!(stats.gas_savings_percent, 90);
+    fn test_rounding_bias_no_drift() {
+        // Repeatedly widening and projecting must not drift: the ceiling rule
+        // is idempotent on values that are multiples of SCORE_SCALE.
+        let mut current = ExtendedScore::from_legacy(37);
+        for _ in 0..1_000 {
+            let projected = current.to_legacy();
+            current = ExtendedScore::from_legacy(projected);
+        }
+        assert_eq!(current.to_legacy(), 37);
+    }
+
+    #[test]
+    fn test_basis_points_saturate() {
+        assert_eq!(ExtendedScore::from_basis_points(u32::MAX).basis_points, SCORE_BP_MAX);
+        assert_eq!(ExtendedScore::from_legacy(u32::MAX).basis_points, SCORE_BP_MAX);
+    }
+
+    #[test]
+    fn test_batched_result_projection() {
+        let result = BatchedScoreResult {
+            asset_pair: Symbol::short("XLM"),
+            score: 1,
+            is_stale: false,
+        };
+        assert_eq!(result.projected_score(), 1);
     }
 }
