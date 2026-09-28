@@ -61,6 +61,65 @@ surfaces as `InvalidAttestation` via an explicit equality check, rather than
 as a confusing signature-recovery failure against a digest the caller never
 intended to sign.
 
+## 2a. Bounded evidence digest (issue #1133)
+
+A submission may optionally anchor a **bounded evidence digest** — a compact
+commitment to the off-chain evidence that produced the score — so disputes and
+audits can tie an on-chain score back to the evidence without storing the
+evidence itself on-chain.
+
+```rust
+pub struct EvidenceDigest {
+    /// Algorithm tag for the digest. Only `1` (SHA-256) is currently
+    /// accepted; any other value is rejected with `Error::InvalidAttestation`.
+    pub algorithm: u32,
+    /// The 32-byte digest produced by `algorithm` over the canonical
+    /// evidence encoding (§2b).
+    pub digest: BytesN<32>,
+    /// Optional short locator scheme id (e.g. which off-chain store the
+    /// evidence lives in). `0` means "no locator scheme". Bounded to a
+    /// single byte; values above `255` are rejected.
+    pub locator_scheme: u32,
+}
+```
+
+Strict size limits are enforced on every field: `algorithm` must be a known
+tag, `digest` is exactly 32 bytes by type, and `locator_scheme` must fit in a
+single byte (`0..=255`). Unknown algorithm tags and out-of-range locator
+schemes are rejected with `Error::InvalidAttestation` before any signature
+work is done.
+
+### 2b. What the digest commits to
+
+The digest is computed **off-chain** by the detection pipeline over the
+canonical evidence encoding, which is the concatenation, in order, of:
+
+| Field | Width | Encoding |
+|---|---|---|
+| `evidence_schema_version` | 4 bytes | `u32`, little-endian |
+| `wallet` | 56 bytes | G... StrKey encoding, ASCII |
+| `asset_pair` | 9 bytes | ASCII bytes of the `Symbol`, zero-padded right |
+| `score` | 4 bytes | `u32`, little-endian |
+| `timestamp` | 8 bytes | `u64`, little-endian |
+| `evidence_blob` | variable | raw bytes of the off-chain evidence record |
+
+`digest = SHA-256(canonical_evidence_encoding)`. The digest therefore commits
+to the exact evidence record and the score/timestamp it produced, but not to
+the evidence bytes themselves — an auditor who holds the evidence can
+recompute the digest and compare it against the on-chain value.
+
+### 2c. How an auditor recomputes it
+
+1. Fetch the evidence record referenced by `locator_scheme` (or from the
+   auditor's own archive if `locator_scheme == 0`).
+2. Rebuild the canonical evidence encoding from §2b using the on-chain
+   `wallet`, `asset_pair`, `score`, and `timestamp` from the provenance
+   snapshot.
+3. Compute `SHA-256` over that encoding.
+4. Compare the result against the `digest` returned by the provenance query
+   (§7). A mismatch means the evidence does not correspond to the on-chain
+   score.
+
 ## 3. Commitment preimage layout
 
 `compute_commitment` builds a single byte buffer and hashes it with SHA-256.
@@ -87,6 +146,31 @@ Total preimage length: 211 bytes (56 + 9 + 4 + 1 + 1 + 8 + 4 + 4 + 56 + 32 +
 locked down by the golden-vector and domain-separation tests in
 `test_attestation_domain_compat.rs` (issue #696): any field that is omitted,
 resized, or reordered changes the pinned digest and fails the suite.
+
+### 3a. Versioned, domain-separated extension for the evidence digest
+
+The evidence digest is folded into the signed payload in a **versioned,
+domain-separated** way so that submissions which omit it keep the exact
+211-byte preimage above and continue to verify unchanged:
+
+- When `evidence_digest` is `None`, the preimage is byte-for-byte identical to
+the v2 layout in the table above (211 bytes). No existing payload bytes
+change.
+- When `evidence_digest` is `Some`, the preimage is the 211-byte v2 layout
+  followed by a domain-separation tag and the digest fields:
+
+| Field | Width | Encoding |
+|---|---|---|
+| `domain_tag` | 8 bytes | ASCII `"EVIDENCE"` — separates the extended payload from the base payload |
+| `algorithm` | 4 bytes | `u32`, little-endian |
+| `digest` | 32 bytes | raw digest bytes |
+| `locator_scheme` | 1 byte | `u8` (validated `0..=255`) |
+
+Extended preimage length: 211 + 8 + 4 + 32 + 1 = 256 bytes. Because the base
+payload is a fixed 211 bytes and the extension is appended after a fixed
+domain tag, the two layouts cannot collide: a v2 payload can never be
+reinterpreted as an extended payload or vice versa. The `domain_tag` is what
+makes this domain-separated rather than a bare concatenation.
 
 Rationale for the StrKey (`to_string()`) encoding of `wallet` and the
 contract address: these are the only stable, deterministic byte
@@ -125,6 +209,11 @@ instance) cannot be replayed against another.
      known.
 5. Any mismatch at any step is `Error::InvalidAttestation`.
 
+Because the evidence digest is part of the recomputed commitment (§3a), any
+tampering with `algorithm`, `digest`, or `locator_scheme` changes the
+commitment and therefore invalidates the signature — the digest is
+authenticated by the same signature that covers the rest of the payload.
+
 ## 5. Key format and canonicalization
 
 `set_service_pubkey` (and `rotate_service_pubkey`) enforce **SEC-1 canonical
@@ -158,145 +247,6 @@ Examples of rejected inputs:
 | 64     | any         | Wrong length (one byte short of an uncompressed key)   |
 | 66     | any         | Wrong length (one byte over an uncompressed key)       |
 | 33     | `0x00`      | Invalid prefix for compressed key                      |
-| 33     | `0x01`      | Invalid prefix for compressed key                      |
-| 33     | `0x04`      | `0x04` is only valid for 65-byte uncompressed keys     |
-| 33     | `0x05`–`0xFF` | Invalid prefix for compressed key                   |
-| 65     | `0x00`–`0x03` | Invalid prefix for uncompressed key                 |
-| 65     | `0x05`–`0xFF` | Invalid prefix for uncompressed key                 |
+| 33     | `0x01`      | Invalid prefix for co
 
-### 5.3 What canonicalization does NOT check
-
-- **Point-on-curve validity**: Soroban's host does not expose a secp256k1
-  point-validation function at key-set time. A blob with a valid prefix but
-  coordinates that do not lie on secp256k1 is accepted at storage time; it
-  will simply never match any key recovered by `secp256k1_recover` during
-  `verify_attestation`, making every subsequent attestation fail with
-  `Error::InvalidAttestation`. Operators should set only genuine public keys.
-- **Low-order or weak points**: same reasoning — rejected at signature-verify
-  time by the host, not at key-set time.
-- **All-zero or all-`0xFF` payloads**: a 33-byte `0x02 || 0x00…00` passes the
-  prefix check. It is not a valid secp256k1 point, so no signature will ever
-  verify against it.
-
-### 5.4 Verification path (recap from §4)
-
-`secp256k1_recover` always returns a 65-byte uncompressed point. Comparison
-against the stored key depends on the stored format:
-
-- **Stored as 65 bytes**: constant-time compare directly.
-- **Stored as 33 bytes**: derive the compressed form from the recovered point
-  (`0x02`/`0x03` parity prefix + x-coordinate), then constant-time compare.
-  No additional elliptic-curve arithmetic is required — the recovered point's
-  coordinates are already available.
-
-The `pubkeys_match` helper in `storage.rs` encapsulates this dispatch and is
-shared between the active-key and pending-key (overlap-window) comparison
-paths.
-
-## 6. Migration & Cross-Deployment Binding
-
-As of `CONTRACT_VERSION` 4, attestations now include `contract_id` and `contract_version` fields.
-These fields cryptographically bind the signature to one specific contract deployment and version,
-preventing cross-deployment and cross-version replay attacks.
-
-**Operators running existing service signers must update their signing code to include
-`contract_id` and `contract_version` in the digest.** Existing signatures without these
-fields will be rejected as `InvalidAttestation` after this upgrade.
-
-The digest layout changed from 175 bytes to 211 bytes (see §3). Signers must recompute
-all attestations using the updated preimage format.
-
-### Domain-separation review (issue #401)
-
-Confirmed: the signed payload already binds each attestation to one specific
-contract instance and network, closing the cross-shard/cross-network replay
-vector described in #401. Concretely:
-
-- `compute_commitment` (§3) hashes `env.current_contract_address().to_string()`
-  and `env.ledger().network_id()` **read directly from the executing
-  contract**, not from any attacker- or signer-supplied field. This is the
-  binding that actually matters: it means the recomputed digest for contract
-  B can never equal a commitment signed for contract A's address, regardless
-  of what the attestation's own `contract_id` field claims.
-- The `contract_id` / `contract_version` fields on `ScoreAttestation` are
-  additional preimage inputs and a version gate (`contract_version` is
-  checked against `CONTRACT_VERSION` before the commitment is even
-  recomputed), but `contract_id` itself is *not* separately compared against
-  `env.current_contract_address()`. That's safe rather than a gap: it's
-  redundant with the self-derived binding above, since any mismatch there
-  already makes the recomputed digest fail to match `attestation.commitment`.
-- `test_attestation.rs::test_attestation_signed_for_one_instance_rejected_on_another_instance`
-  deploys two real contract instances sharing one service pubkey (the
-  multi-shard scenario #401 describes), signs a valid attestation against
-  instance A, and confirms the identical attestation is rejected with
-  `InvalidAttestation` when replayed against instance B.
-
-No ABI change or attestation-version bump was needed — the binding predates
-this review; the gap was that it wasn't documented or covered by a
-cross-instance test, both of which this section and the test above now
-provide.
-
-## 7. Key-rotation overlap window (issue #697)
-
-Both attestation key slots — the single service pubkey (`set_service_pubkey`
-/ `ScoreAttestation`) and the aggregate threshold pubkey
-(`set_aggregate_service_pubkey` / `ThresholdAttestation`) — support a
-**bounded overlap window** during rotation, so in-flight submissions signed
-with the outgoing key are not orphaned by a rotation that happens mid-flight,
-while still bounding how long the outgoing key remains usable.
-
-### Rotation record
-
-`rotate_service_pubkey(admin_signers, new_key, overlap_secs)` and
-`rotate_aggregate_service_pubkey(admin_signers, new_key, overlap_secs)` each
-record a **pending key** paired with an **expiry bound**:
-
-- Activation is implicit and immediate: the new key is accepted (as the
-  *pending* key) from the moment the rotation call executes.
-- `expiry = env.ledger().timestamp() + overlap_secs` at the time of the call
-  — the upper bound of the window. `get_pending_service_pubkey()` /
-  `get_pending_aggregate_pubkey()` return `(pending_key, expiry)` so
-  operators and monitoring tooling can read both bounds of the window
-  on-chain.
-- `overlap_secs == 0` skips the pending state entirely: the new key is
-  promoted to active immediately and the old key stops verifying in the same
-  call.
-
-### Verification during the window
-
-`verify_signature` (single-key) and `verify_threshold_attestation`
-(aggregate) both:
-
-1. First check whether a pending key exists and its `expiry` has already
-   passed. If so, the pending key is **promoted to active and the pending
-   slot is cleared** before verification proceeds — this happens on the very
-   next call after expiry, not on a timer, so there is no ledger-close race
-   where neither slot is authoritative.
-2. Check the signature against the **active** key.
-3. If that fails and a pending key is still recorded with `now <= expiry`,
-   check the signature against the **pending** key too.
-
-The net effect: during `[rotation call, expiry]`, both the old (active) and
-new (pending) keys verify. After `expiry`, only the new key verifies — a
-signature from the retired key is rejected with `Error::InvalidAttestation`
-exactly as any other unrecognized key, closing the window rather than
-leaving it open indefinitely. See `test_dual_key_pubkey.rs` (single-key) and
-`test_aggregate_key_rotation.rs` (aggregate) for the deterministic tests
-proving this, including the post-expiry rejection case.
-
-### Compatibility
-
-- **No ABI break**: `rotate_aggregate_service_pubkey` /
-  `get_pending_aggregate_pubkey` are new, additive endpoints;
-  `set_aggregate_service_pubkey` (instant, no-overlap rotation) is
-  unchanged. The single-key `rotate_service_pubkey` /
-  `get_pending_service_pubkey` pair already existed (issue #295) and is
-  unchanged here.
-- **New storage key**: `PendingAggregateServicePubKey` (instance storage),
-  mirroring the pre-existing `PendingServicePubKey`.
-- **New event** `agg_pkrt` (topics: `agg_pkrt`; data: `(new_key,
-  overlap_expiry)`), mirroring the pre-existing `pk_rot`. Additive only.
-- **Bounded work**: verification does at most one extra storage read and one
-  extra signature comparison, regardless of how many rotations have
-  occurred — there is exactly one pending-key slot per key type, not a
-  growing history.
+/* … truncated 7551 chars — edit only what you need near the top … */
