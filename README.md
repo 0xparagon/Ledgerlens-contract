@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1143 -->
 - #1143: Packed single-word storage encoding for the latest RiskScore
+
+<!-- handsoff-issue-1145 -->
+- #1145: Signed retraction notices for erroneous scores
