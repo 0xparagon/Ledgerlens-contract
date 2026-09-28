@@ -88,3 +88,92 @@ No unbounded loop or caller-controlled iteration is introduced.
   unchanged `require_admin_auth` result. Only after an operator opts a
   policy in via `set_policy_approval` does that policy's mapped endpoints
   require the extra approver signature.
+
+## Feature-flag registry with timelocked kill switches (#1151)
+
+Issue #1151 adds a second, orthogonal administrative axis: a governed
+feature-flag registry that can *disable* an individual optional subsystem
+quickly, while *re-enabling* it stays subject to a timelock and a higher
+quorum. This is deliberately separate from the capability partitioning
+above (which governs *who* may call an endpoint) and from the global and
+pair pauses (which halt *all* or *paired* activity).
+
+### Flag set and meaning of "disabled"
+
+`FeatureFlag` (in `types.rs`) names one stable identifier per optional
+subsystem. Each flag documents what "disabled" means for its guarded
+entry points:
+
+| Flag | Subsystem | Disabled means |
+|---|---|---|
+| `ZkRangeProofs` | zero-knowledge range proofs | reject writes **and** reads |
+| `VerkleCommitments` | Verkle commitments | reject writes **and** reads |
+| `Delegation` | delegation | reject writes (reads still served) |
+| `Disputes` | disputes | reject writes (reads still served) |
+| `Escrow` | escrow | reject writes **and** reads |
+| `OracleAdapter` | oracle adapter | reject writes (reads still served) |
+
+"Reject writes" means any state-mutating entry point of that subsystem
+returns `Error::FeatureDisabled`; "reject reads" means its read-only
+entry points return the same error. Flags default to *enabled* (the
+subsystem is live), so behavior is unchanged until an operator acts.
+
+### Fast disable, timelocked enable
+
+- **Disable** is fast and guardian-level: `disable_feature(env, flag)`
+  requires `require_guardian_auth` and takes effect immediately.
+- **Enable** is slow and higher-quorum: `propose_enable_feature(env, flag)`
+  records a pending enable with `now + FEATURE_ENABLE_TIMELOCK`, and
+  `execute_enable_feature(env, flag)` only succeeds after the timelock has
+  elapsed and requires the higher `require_admin_auth` quorum.
+- Both directions emit events: `feat_dis` (disable) and `feat_en`
+  (enable executed), plus `feat_en_prop` for the proposal.
+
+### One shared check helper
+
+Every guarded entry point calls the single helper
+`Self::require_feature_enabled(env, flag)`, which reads the flag and
+returns `Error::FeatureDisabled` when it is off. No entry point inlines
+its own flag read, so the check is uniform and auditable.
+
+### Structural test
+
+`test_feature_flag_guard_coverage` in `test_feature_flags.rs` enumerates
+the public entry points of each flagged module and asserts each one calls
+`require_feature_enabled` for its flag. A new public entry point added to
+a flagged module without the guard fails this test.
+
+### Interaction with global pause and pair pause
+
+These three mechanisms are independent and compose as follows:
+
+| Mechanism | Scope | Effect |
+|---|---|---|
+| Global pause | whole contract | all entry points reject |
+| Pair pause | a specific pair | that pair's entry points reject |
+| Feature flag | one optional subsystem | that subsystem's entry points reject |
+
+A call is permitted only when the global pause is off, the relevant pair
+is not paused, **and** the subsystem's feature flag is enabled. The
+feature flag is checked *after* the pause checks, so a globally paused
+contract still reports the pause error first. Disabling a feature never
+bypasses a pause, and pausing never bypasses a disabled feature.
+
+### `supports_interface`
+
+Flags are published through `supports_interface` so consumers can detect
+which optional subsystems are currently live and degrade gracefully
+instead of calling into a disabled subsystem.
+
+### Compatibility summary
+
+- **New `Error::FeatureDisabled`** variant (additive; within the XDR cap).
+- **New storage keys** `FeatureEnabled(FeatureFlag)` and
+  `FeatureEnablePending(FeatureFlag)` — additive, no existing key changes.
+- **New events** `feat_dis`, `feat_en_prop`, `feat_en` — additive.
+- **New public ABI surface**: `disable_feature`, `propose_enable_feature`,
+  `execute_enable_feature`, `is_feature_enabled`, and the `FeatureFlag`
+  type, all additive.
+- **Behavior change (only when explicitly configured):** every flag
+  defaults to enabled, so all guarded entry points behave exactly as
+  before until an operator disables a feature.
