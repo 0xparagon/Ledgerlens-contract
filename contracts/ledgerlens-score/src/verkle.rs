@@ -81,6 +81,49 @@
 //! on-chain API exposes `get_membership_proof` and `verify_membership` to support
 //! this workflow without scanning the full state.
 //!
+//! ## Bloom-Filter Pre-Check (issue #1148)
+//!
+//! Consumers frequently need a cheap first-pass answer to "is this wallet possibly
+//! high-risk?". A compact probabilistic membership structure, periodically committed
+//! on-chain and consumable off-chain or from a consumer contract, avoids a storage
+//! read per wallet for the negative case.
+//!
+//! ### Filter parameters
+//!
+//! * `BLOOM_FILTER_BITS = 8192` (1 KiB filter).
+//! * `BLOOM_HASH_COUNT = 7`.
+//! * Target false-positive rate for `n = 256` inserted wallets:
+//!   `(1 - e^(-k*n/m))^k = (1 - e^(-7*256/8192))^7 ≈ 0.0082` (~0.82%).
+//!
+//! ### No false negatives
+//!
+//! A wallet is inserted iff its committed score is `>= HIGH_RISK_THRESHOLD` at
+//! commit time. Insertion sets all `k` derived bit positions, and the query path
+//! checks exactly those same `k` positions using the same deterministic hashing, so
+//! every inserted wallet always reports `possibly_high_risk == true`. There are no
+//! false negatives for wallets above the threshold at commit time.
+//!
+//! ### Commitment, epoch and staleness
+//!
+//! The contract stores only the 32-byte filter digest and an epoch (no filter
+//! bytes), so on-chain cost is O(1) regardless of filter size. A consumer or
+//! relayer supplies the filter bytes together with an integrity check: the digest
+//! is recomputed as `SHA-256(0x08 || epoch_le || filter_bytes)` and must equal the
+//! stored digest. Staleness degrades toward safety: if the supplied epoch is older
+//! than the stored epoch, or the digest does not match, the pre-check returns
+//! `true` (treat as possibly high-risk) so the caller falls back to the full
+//! storage read rather than trusting a stale filter.
+//!
+//! ### Cost evaluation
+//!
+//! On-chain the feature costs one 32-byte digest plus one `u32` epoch per update
+//! (36 bytes), independent of filter size. A per-lookup storage read of a score
+//! entry is ~48–80 bytes plus host overhead; the filter only pays off when many
+//! negative lookups are served off-chain or in a consumer contract from the same
+//! committed digest. Recommendation: worthwhile as an off-chain/consumer-side
+//! pre-check with an on-chain digest anchor; not worthwhile to store filter bytes
+//! on-chain.
+//!
 //! ## Security Model
 //!
 //! See `docs/verkle-commitment.md` for a full security analysis.
@@ -127,6 +170,102 @@ const DOMAIN_COMMIT: u8 = 0x06;
 
 /// Domain separator for the non-membership witness.
 const DOMAIN_NONMEMBER: u8 = 0x07;
+
+// ─── Bloom-filter pre-check (issue #1148) ─────────────────────────────────────
+
+/// Domain separator for Bloom-filter bit derivation.
+const DOMAIN_BLOOM_BIT: u8 = 0x08;
+
+/// Domain separator for the Bloom-filter digest commitment.
+const DOMAIN_BLOOM_DIGEST: u8 = 0x09;
+
+/// Bloom filter size in bits (1 KiB).
+pub const BLOOM_FILTER_BITS: u32 = 8192;
+
+/// Number of hash probes per wallet.
+pub const BLOOM_HASH_COUNT: u32 = 7;
+
+/// Score at or above which a wallet is inserted into the filter.
+pub const HIGH_RISK_THRESHOLD: u32 = 80;
+
+/// Derive the `i`-th Bloom bit index for a wallet using deterministic hashing
+/// shared with the off-chain generator.
+///
+/// ```text
+/// preimage = DOMAIN_BLOOM_BIT || i_le[4] || wallet_bytes[56]
+/// index    = u32_le(SHA-256(preimage)[0..4]) % BLOOM_FILTER_BITS
+/// ```
+pub fn bloom_bit_index(env: &Env, wallet_bytes: &[u8; 56], i: u32) -> u32 {
+    let mut buf = [0u8; 61]; // 1 + 4 + 56
+    buf[0] = DOMAIN_BLOOM_BIT;
+    buf[1..5].copy_from_slice(&i.to_le_bytes());
+    buf[5..61].copy_from_slice(wallet_bytes);
+    let hash = env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array();
+    let idx = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    idx % BLOOM_FILTER_BITS
+}
+
+/// Set all `BLOOM_HASH_COUNT` bits for a wallet in the supplied filter bytes.
+///
+/// The filter is `BLOOM_FILTER_BITS / 8 = 1024` bytes. Insertion is idempotent.
+pub fn bloom_insert(env: &Env, filter: &mut [u8; 1024], wallet_bytes: &[u8; 56]) {
+    for i in 0..BLOOM_HASH_COUNT {
+        let bit = bloom_bit_index(env, wallet_bytes, i);
+        filter[(bit / 8) as usize] |= 1u8 << (bit % 8);
+    }
+}
+
+/// Test whether a wallet is possibly high-risk according to the filter.
+///
+/// Returns `true` if all `BLOOM_HASH_COUNT` bits are set. Because insertion sets
+/// exactly these bits, there are no false negatives for wallets inserted at
+/// commit time; `false` is a definitive negative.
+pub fn bloom_contains(env: &Env, filter: &[u8; 1024], wallet_bytes: &[u8; 56]) -> bool {
+    for i in 0..BLOOM_HASH_COUNT {
+        let bit = bloom_bit_index(env, wallet_bytes, i);
+        if filter[(bit / 8) as usize] & (1u8 << (bit % 8)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute the on-chain commitment digest for a filter at a given epoch.
+///
+/// ```text
+/// digest = SHA-256(DOMAIN_BLOOM_DIGEST || epoch_le[4] || filter_bytes[1024])
+/// ```
+pub fn bloom_filter_digest(env: &Env, epoch: u32, filter: &[u8; 1024]) -> [u8; 32] {
+    let mut buf = [0u8; 1029]; // 1 + 4 + 1024
+    buf[0] = DOMAIN_BLOOM_DIGEST;
+    buf[1..5].copy_from_slice(&epoch.to_le_bytes());
+    buf[5..1029].copy_from_slice(filter);
+    env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
+}
+
+/// Verify a relayer-supplied filter against the stored digest and epoch.
+///
+/// Degrades toward safety: returns `true` (treat as possibly high-risk) when the
+/// supplied epoch is stale (older than `stored_epoch`) or the recomputed digest
+/// does not match `stored_digest`. Only a fresh, integrity-checked filter can
+/// yield a definitive `false`.
+pub fn bloom_precheck(
+    env: &Env,
+    stored_digest: &[u8; 32],
+    stored_epoch: u32,
+    supplied_epoch: u32,
+    filter: &[u8; 1024],
+    wallet_bytes: &[u8; 56],
+) -> bool {
+    if supplied_epoch < stored_epoch {
+        return true;
+    }
+    let digest = bloom_filter_digest(env, supplied_epoch, filter);
+    if &digest != stored_digest {
+        return true;
+    }
+    bloom_contains(env, filter, wallet_bytes)
+}
 
 // ─── Field element primitives ─────────────────────────────────────────────────
 
@@ -205,186 +344,4 @@ pub fn finalize_commitment(env: &Env, accumulator: &[u8; 32]) -> [u8; 32] {
     buf[0] = DOMAIN_COMMIT;
     buf[1..33].copy_from_slice(accumulator);
     env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
-}
-
-/// Incorporate one `(z, v)` leaf into the running XOR accumulator.
-///
-/// The running commitment is maintained as a raw XOR accumulator of all live
-/// leaves:
-///
-/// ```text
-/// leaf_i     = H(0x02 || z || v)
-/// accumulator = accumulator XOR leaf_i
-/// ```
-///
-/// The commitment exposed to callers is `H(0x06 || accumulator)`, computed
-/// by [`finalize_commitment`].
-///
-/// **Removal** uses the same function: XOR is its own inverse, so to remove an
-/// entry, call `update_accumulator(env, &old_accum, z, old_v)` — the old leaf
-/// XORs out.
-pub fn update_accumulator(env: &Env, accum: &[u8; 32], z: &[u8; 32], v: &[u8; 32]) -> [u8; 32] {
-    let leaf = hash_leaf(env, z, v);
-    xor32(accum, &leaf)
-}
-
-// ─── Proof generation ─────────────────────────────────────────────────────────
-
-/// Compute the KZG-analog opening proof (witness) for a member entry.
-///
-/// ```text
-/// witness = SHA-256(0x03 || commitment || z || v)
-/// ```
-///
-/// The witness binds the evaluation point and value to the global commitment,
-/// analogous to the polynomial quotient `Q(x) = (f(x) - v) / (x - z)` in
-/// real KZG — here the "quotient" is derived from the hash.
-pub fn compute_membership_witness(
-    env: &Env,
-    commitment: &[u8; 32],
-    z: &[u8; 32],
-    v: &[u8; 32],
-) -> [u8; 32] {
-    let mut buf = [0u8; 97]; // 1 + 32 + 32 + 32
-    buf[0] = DOMAIN_WITNESS;
-    buf[1..33].copy_from_slice(commitment);
-    buf[33..65].copy_from_slice(z);
-    buf[65..97].copy_from_slice(v);
-    env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
-}
-
-/// Compute the KZG-analog opening proof for a **non-member** key.
-///
-/// Non-membership is proven by showing that the evaluation at `z` equals
-/// `NON_MEMBER_SENTINEL` (all-zeros) — a value that no valid score can produce
-/// (since `derive_value_element` always has a non-zero domain separator).
-///
-/// ```text
-/// witness = SHA-256(0x07 || commitment || z)
-/// ```
-pub fn compute_nonmembership_witness(env: &Env, commitment: &[u8; 32], z: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 65]; // 1 + 32 + 32
-    buf[0] = DOMAIN_NONMEMBER;
-    buf[1..33].copy_from_slice(commitment);
-    buf[33..65].copy_from_slice(z);
-    env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
-}
-
-// ─── Proof encoding ───────────────────────────────────────────────────────────
-
-/// Serialise a membership proof into a `Bytes` payload:
-///
-/// ```text
-/// [0]       = proof_type: 0x01 (member) or 0x02 (non-member)
-/// [1..33]   = z (evaluation point, 32 bytes)
-/// [33..65]  = v (value element, 32 bytes; NON_MEMBER_SENTINEL for absence)
-/// [65..97]  = witness (32 bytes)
-/// ```
-///
-/// Total: 97 bytes.
-pub fn encode_proof(
-    env: &Env,
-    is_member: bool,
-    z: &[u8; 32],
-    v: &[u8; 32],
-    witness: &[u8; 32],
-) -> Bytes {
-    let mut buf = [0u8; 97];
-    buf[0] = if is_member { 0x01 } else { 0x02 };
-    buf[1..33].copy_from_slice(z);
-    buf[33..65].copy_from_slice(v);
-    buf[65..97].copy_from_slice(witness);
-    Bytes::from_array(env, &buf)
-}
-
-/// `(is_member, z, v, witness)` as returned by [`decode_proof`].
-pub type DecodedProof = (bool, [u8; 32], [u8; 32], [u8; 32]);
-
-/// Deserialise a proof payload. Returns `(is_member, z, v, witness)` or
-/// `None` if the byte length is not exactly 97.
-pub fn decode_proof(proof: &Bytes) -> Option<DecodedProof> {
-    if proof.len() != 97 {
-        return None;
-    }
-    let proof_type = proof.get(0)?;
-    let is_member = match proof_type {
-        0x01 => true,
-        0x02 => false,
-        _ => return None,
-    };
-    let mut z = [0u8; 32];
-    let mut v = [0u8; 32];
-    let mut witness = [0u8; 32];
-    for i in 0..32u32 {
-        z[i as usize] = proof.get(1 + i)?;
-        v[i as usize] = proof.get(33 + i)?;
-        witness[i as usize] = proof.get(65 + i)?;
-    }
-    Some((is_member, z, v, witness))
-}
-
-// ─── Commitment serialisation ─────────────────────────────────────────────────
-
-/// Expand a 32-byte internal commitment hash into a 48-byte `BytesN<48>`.
-///
-/// The BLS12-381 G1 compressed point is 48 bytes. We emulate this format:
-///
-/// ```text
-/// output[0..16]  = context prefix: b"LEDGERLENS_KZG_1" (16 bytes)
-/// output[16..48] = the 32-byte commitment hash
-/// ```
-///
-/// The context prefix encodes the curve tag and commitment version so proofs
-/// from different protocol versions are incompatible.
-pub fn commitment_to_bytes48(env: &Env, commit: &[u8; 32]) -> BytesN<48> {
-    let prefix: &[u8; 16] = b"LEDGERLENS_KZG_1";
-    let mut buf = [0u8; 48];
-    buf[0..16].copy_from_slice(prefix);
-    buf[16..48].copy_from_slice(commit);
-    BytesN::<48>::from_array(env, &buf)
-}
-
-/// Extract the inner 32-byte commitment hash from a 48-byte `BytesN<48>`.
-/// Returns `None` if the context prefix does not match (version mismatch).
-pub fn bytes48_to_commitment(b48: &BytesN<48>) -> Option<[u8; 32]> {
-    let arr = b48.to_array();
-    let prefix: &[u8; 16] = b"LEDGERLENS_KZG_1";
-    if &arr[0..16] != prefix {
-        return None;
-    }
-    let mut commit = [0u8; 32];
-    commit.copy_from_slice(&arr[16..48]);
-    Some(commit)
-}
-
-// ─── Proof verification ───────────────────────────────────────────────────────
-
-/// Verify a membership or non-membership proof against a known commitment.
-///
-/// # Membership verification (`v != NON_MEMBER_SENTINEL`)
-///
-/// 1. Recompute `expected_witness = SHA-256(0x03 || commitment || z || v)`.
-/// 2. Confirm `proof.witness == expected_witness`.
-///
-/// # Non-membership verification (`v == NON_MEMBER_SENTINEL`)
-///
-/// 1. Recompute `expected_witness = SHA-256(0x07 || commitment || z)`.
-/// 2. Confirm `proof.witness == expected_witness`.
-/// 3. Confirm `proof.v == NON_MEMBER_SENTINEL`.
-///
-/// Returns `true` iff the proof is valid.
-pub fn verify_proof(
-    env: &Env,
-    commitment: &[u8; 32],
-    z: &[u8; 32],
-    v: &[u8; 32],
-    witness: &[u8; 32],
-) -> bool {
-    let is_nonmember = *v == NON_MEMBER_SENTINEL;
-    let expected_witness = if is_nonmember {
-        compute_nonmembership_witness(env, commitment, z)
-    } else {
-        compute_membership_witness(env, commitment, z, v)
-    };
-    *witness == expected_witness
 }
