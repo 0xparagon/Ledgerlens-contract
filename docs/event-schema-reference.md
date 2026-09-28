@@ -234,156 +234,25 @@ All events include a `EVENT_VERSION` (currently `1`) in their topic array to ena
 - **Topic**: `("svc_res",)`
 - **Data**: `ServiceResumedEvent { last_active_at, gap_secs }`
 - **Use Case**: Track service recovery and gap duration
-- **Example**: Service returned online after 18-minute gap
 
-#### `hb_upd`
-- **Topic**: `("hb_upd",)`
-- **Data**: `u64` (heartbeat threshold in seconds)
-- **Use Case**: Track heartbeat configuration changes
-- **Example**: Heartbeat threshold changed to 1800 seconds
+### 9. Consumer Decision Receipt Events
 
-### 9. Admin & Authorization Events
+#### `gate_rcpt`
+- **Topic**: `("gate_rcpt", EVENT_VERSION, subject, correlation_id)`
+- **Data**: `(revision: u64, threshold: u32, policy: Symbol, decision: bool)`
+- **Stability**: `Stable` — schema is frozen for the current `EVENT_VERSION`; field additions require a version bump.
+- **Use Case**: Audit and dispute handling for consumer gate calls. Ties a consumer decision to the exact score revision and policy used.
+- **Emission**: Emitted only by the opt-in receipt entry point (`evaluate_gate_with_receipt`). The pure query path (`evaluate_gate`) remains read-only and emits nothing.
+- **Cost**: The receipt path writes an event (and consumes quota where enabled), so it costs more than the pure query path. Consumers that do not need an on-chain record should use the pure query path.
+- **Privacy**: Event contents are limited to values the caller could already read via the pure query (subject, revision, threshold, policy, decision). The `correlation_id` is caller-supplied and carries no additional on-chain data.
+- **Example**: Subject=G..., revision=7, threshold=75, policy="strict", decision=true, correlation_id=0x1234
 
-#### `adm_init`
-- **Topic**: `("adm_init", EVENT_VERSION)`
-- **Data**: `(from: Address, to: Address)`
-- **Use Case**: Log admin transfer initiations
-- **Example**: Admin transfer initiated from 0xabc... to 0xdef...
+#### `gate_rcpt_den`
+- **Topic**: `("gate_rcpt_den", EVENT_VERSION, caller)`
+- **Data**: `(reason_code: u32)`
+- **Stability**: `Stable`
+- **Reason Codes**: 1=unauthorized_caller, 2=quota_exceeded
+- **Use Case**: Alert when a receipt request is rejected before evaluation (spam guard). No decision is emitted in this case.
+- **Example**: Unauthorized caller attempted a receipt; reason_code=1
 
-#### `adm_done`
-- **Topic**: `("adm_done", EVENT_VERSION)`
-- **Data**: `Address` (new admin)
-- **Use Case**: Confirm new admin is active
-- **Example**: New admin 0xdef... accepted transfer
-
-#### `adm_canc`
-- **Topic**: `("adm_canc", EVENT_VERSION)`
-- **Data**: `Address` (admin)
-- **Use Case**: Track cancelled admin transfers
-- **Example**: Admin transfer cancelled by current admin
-
-### 10. Model Version Events
-
-#### `mv_prop`
-- **Topic**: `("mv_prop",)`
-- **Data**: `(version: u32, executable_after: u64)`
-- **Use Case**: Log model version proposals
-- **Example**: Model v4 proposed; active after timestamp 1700086400
-
-#### `mv_act`
-- **Topic**: `("mv_act",)`
-- **Data**: `u32` (active model version)
-- **Use Case**: Confirm model version activation
-- **Example**: Model v4 now active
-
-#### `mv_depr`
-- **Topic**: `("mv_depr",)`
-- **Data**: `u32` (deprecated version)
-- **Use Case**: Alert when model versions are retired
-- **Example**: Model v2 deprecated; no longer accepted
-
-#### `mv_reg`
-- **Topic**: `("mv_reg",)`
-- **Data**: `u32` (registered version)
-- **Use Case**: Track new model registrations
-- **Example**: Model v5 registered (available for proposal/activation)
-
-### 11. Dispute Events
-
-#### `disp_open`
-- **Topic**: `("disp_open", challenger)`
-- **Data**: `(asset_pair, bond: i128, deadline: u64)`
-- **Use Case**: Alert when disputes are initiated
-- **Example**: Dispute opened; resolution deadline in 7 days
-
-#### `disp_res`
-- **Topic**: `("disp_res", challenger)`
-- **Data**: `(asset_pair, corrected_score: u32, bond_returned: i128)`
-- **Use Case**: Confirm dispute resolution
-- **Example**: Dispute resolved; score corrected to 65; bond returned
-
-#### `disp_to`
-- **Topic**: `("disp_to", challenger)`
-- **Data**: `(asset_pair, bond: i128, bonus: i128)`
-- **Use Case**: Track dispute timeout resolutions
-- **Example**: Dispute timed out; bond + bonus forfeited
-
-### 12. Data Integrity Events
-
-#### `scr_dlt`
-- **Topic**: `("scr_dlt", EVENT_VERSION, wallet, asset_pair)`
-- **Data**: `(prev_score, new_score, delta_abs, trend, consecutive_trend)`
-- **Use Case**: Monitor score changes for anomalies
-- **Example**: Score jumped 25 points; trend=+1, consecutive=3
-
-#### `jump`
-- **Topic**: `("jump", wallet, asset_pair)`
-- **Data**: `(prev_score, new_score, delta, model_version, timestamp)`
-- **Use Case**: Alert on anomalous score jumps
-- **Example**: Score jumped 35 points; model v3
-
-#### `clr_hist`
-- **Topic**: `("clr_hist", EVENT_VERSION, wallet)`
-- **Data**: `Symbol` (asset_pair)
-- **Use Case**: Audit score history deletions
-- **Example**: History cleared for XLM/USD
-
-#### `clr_scr`
-- **Topic**: `("clr_scr", EVENT_VERSION, wallet)`
-- **Data**: `Symbol` (asset_pair)
-- **Use Case**: Audit score deletions
-- **Example**: Score cleared for BTC/USDT
-
-## Event Indexer Implementation Tips
-
-### 1. Handle Optional Versions
-Some events omit EVENT_VERSION (legacy events). Always check topic array length.
-
-```python
-def parse_topic(topic):
-    if len(topic) >= 2 and isinstance(topic[1], int):
-        version = topic[1]
-    else:
-        version = 1  # default
-    return version
-```yaml
-
-### 2. Aggregate by Category
-Create tables indexed by event category for fast queries:
-
-```sql
-CREATE TABLE event_streams (
-    event_type TEXT,         -- e.g., "bat_summ", "upg_exec"
-    category TEXT,           -- "data_quality", "governance", etc.
-    timestamp INT64,
-    data JSON,
-    PRIMARY KEY (category, timestamp)
-);
-
-### 3. Alert on Anomalies
-Baseline normal event frequencies, then alert on deviations:
-
-```python
-# Normal: ~100-200 score submissions per 5-minute window
-# Alert if < 50 or > 500
-def check_submission_rate(window_5min):
-    submissions = count_events("score", window_5min)
-    if submissions < 50 or submissions > 500:
-        alert("Anomalous submission rate: " + submissions)
-```yaml
-
-### 4. Cross-Reference Events
-Link related events for context:
-
-```python
-# When bat_summ shows high rejections, find associated events:
-# - bat_rej_* (specific rejection types)
-# - thresh (recent threshold changes?)
-# - paused (contract paused?)
-# - model_version_* (model update?)
-
-## See Also
-
-- [Operator Alerts Guide](./operator-alerts.md)
-- [Event Emission Code](../contracts/ledgerlens-score/src/events.rs)
-- [Event Tests](../contracts/ledgerlens-score/src/test_batch_error_events.rs)
+/* … truncated 4839 chars — edit only what you need near the top … */
