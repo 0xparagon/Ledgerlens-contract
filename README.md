@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1139 -->
 - #1139: Confidence intervals alongside point confidence
+
+<!-- handsoff-issue-1140 -->
+- #1140: WASM hash allowlist registry for upgrade proposals
