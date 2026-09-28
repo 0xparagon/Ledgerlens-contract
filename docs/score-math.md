@@ -280,373 +280,159 @@ pub fn get_interpolated_score(
     
     // Interpolation: find the bracketing pair
     for i in 0..(history.len() - 1) {
-        let a = &history[i];
-        let b = &history[i + 1];
-        
-        if a.timestamp <= timestamp && timestamp <= b.timestamp {
-            let dt = (b.timestamp - a.timestamp) as i128;
-            if dt == 0 {
-                return a.score;
-            }
-            
-            let num = (timestamp - a.timestamp) as i128 * (b.score as i128 - a.score as i128);
-            return (a.score as i128 + num / dt) as u32;
-        }
+        let 
+
+---
+
+## Asset-Level Risk Score (Derived from Holder Wallet Scores)
+
+Protocols listing an asset care about the asset's risk, not only individual wallets. The asset-level score summarises the risk distribution of the wallets that hold or trade the asset, without requiring an on-chain scan of all holders.
+
+### Derivation
+
+The asset score is a **holder-weighted aggregation with a concentration penalty**. It is a pure function suitable for the shared math crate:
+
+$$\text{asset\_score} = \text{clamp}_{0}^{100}\left( \frac{\sum_{i=1}^{n} w_i \cdot s_i}{\sum_{i=1}^{n} w_i} \cdot \left(1 - \rho \cdot C\right) \right)$$
+
+Where:
+- $s_i$ = wallet score for contributing holder $i$ (0–100)
+- $w_i$ = contribution weight of holder $i$ (e.g. volume or balance, scaled by `SCALE`)
+- $n$ = number of contributing wallets
+- $C$ = concentration index of the weight distribution (0–1)
+- $\rho$ = concentration penalty coefficient (configurable, default $\rho = 0.5$)
+
+**Concentration index** (normalised Herfindahl–Hirschman Index):
+
+$$C = \frac{n \cdot \sum_{i=1}^{n} w_i^2}{\left(\sum_{i=1}^{n} w_i\right)^2} - \frac{1}{n}$$
+
+$C = 0$ when all weights are equal; $C \to 1$ when a single holder dominates. The penalty therefore reduces the score when a few large holders dominate the distribution, which is the intended behaviour: an asset whose risk is concentrated in one wallet is riskier than the same average spread across many wallets.
+
+### Why Holder-Weighted with a Concentration Penalty?
+
+- **Holder-weighted** (rather than a plain unweighted mean) reflects that a wallet holding most of the supply matters more to the asset's risk than a dust holder.
+- **Concentration penalty** prevents a single large holder from masking a risky distribution and prevents the score from being dominated by one actor.
+- **Pure function**: the derivation depends only on the list of `(weight, score)` pairs, so it is deterministic, testable, and identical on-chain and off-chain.
+
+### Integer Implementation
+
+```rust
+const SCALE: u64 = 1_000_000;
+const MIN_CONTRIBUTORS: u32 = 5;   // sparse-data threshold
+const RHO: u64 = 500_000;          // concentration penalty coefficient (0.5)
+
+/// Pure derivation. Returns `None` when fewer than `MIN_CONTRIBUTORS`
+/// wallets contribute (sparse data — no score is published).
+pub fn derive_asset_score(contributors: &[(u64, u32)]) -> Option<u32> {
+    let n = contributors.len() as u64;
+    if n < MIN_CONTRIBUTORS as u64 {
+        return None;
     }
-    
-    history.last().score
+
+    let mut weight_sum: u64 = 0;
+    let mut weighted_sum: u64 = 0;
+    let mut sq_sum: u64 = 0;
+
+    for &(w, s) in contributors {
+        weight_sum = weight_sum.checked_add(w)?;
+        weighted_sum = weighted_sum.checked_add(w.checked_mul(s as u64)?)?;
+        sq_sum = sq_sum.checked_add(w.checked_mul(w)?)?;
+    }
+
+    if weight_sum == 0 {
+        return None;
+    }
+
+    // Weighted mean, scaled by SCALE.
+    let mean = weighted_sum.checked_mul(SCALE)? / weight_sum;
+
+    // Normalised HHI concentration index, scaled by SCALE.
+    // C = n * sq_sum / weight_sum^2 - 1/n
+    let hhi = n.checked_mul(sq_sum)?.checked_mul(SCALE)? / weight_sum.checked_mul(weight_sum)?;
+    let inv_n = SCALE / n;
+    let concentration = hhi.saturating_sub(inv_n);
+
+    // Penalty factor = 1 - rho * C, clamped to [0, SCALE].
+    let penalty = SCALE.saturating_sub(RHO.checked_mul(concentration)? / SCALE);
+
+    // Apply penalty and clamp to [0, 100].
+    let score = mean.checked_mul(penalty)? / SCALE;
+    Some(score.min(100) as u32)
 }
-```yaml
+```
 
 **Integer arithmetic notes:**
-- Numerator is `(timestamp - a.timestamp) * (b.score - a.score)` as `i128` to avoid overflow.
-- Division truncates (integer division).
-- Cast back to `u32` for the result.
+- All intermediate values are `u64`; multiplications are checked and overflow returns `None`.
+- Division truncates toward zero, matching the rest of the crate.
+- The result is bounded to `[0, 100]` by construction and by the final `min(100)` clamp.
 
----
+### Off-Chain Reference
 
-## Overflow Handling
+```python
+SCALE = 1_000_000
+MIN_CONTRIBUTORS = 5
+RHO = 500_000
 
-The contract uses checked arithmetic throughout the hot path to prevent silent overflows:
+def derive_asset_score(contributors):
+    """contributors: list of (weight, score) tuples."""
+    n = len(contributors)
+    if n < MIN_CONTRIBUTORS:
+        return None
 
-### Checked Operations
+    weight_sum = sum(w for w, _ in contributors)
+    if weight_sum == 0:
+        return None
 
-- **`get_aggregate_score`:**
-  - `checked_mul(weight, decay_factor)` → error on overflow
-  - `checked_div(SCALE)` → error on division by zero
-  - `checked_mul(decayed_weight, score)` → error on overflow
-  - `checked_add(weighted_sum, product)` → error on overflow
-  
-- **`decay_fixed`:**
-  - `checked_mul` for `lambda_num * age_secs`
-  - `checked_mul` for intermediate products
-  - Saturating subtraction for negative results
+    weighted_sum = sum(w * s for w, s in contributors)
+    sq_sum = sum(w * w for w, _ in contributors)
 
-### Error Propagation
+    mean = (weighted_sum * SCALE) // weight_sum
+    hhi = (n * sq_sum * SCALE) // (weight_sum * weight_sum)
+    concentration = max(0, hhi - SCALE // n)
+    penalty = max(0, SCALE - (RHO * concentration) // SCALE)
+    score = (mean * penalty) // SCALE
+    return min(score, 100)
+```
 
-When overflow is detected:
-- Functions that compose checked operations return `Err(Error::ArithmeticOverflow)`.
-- Callers must handle this error.
-- On-chain, overflow is visible to integrators as an explicit error, preventing silent failures.
+### Sparse Data
 
-### Off-Chain Simulation
+A score is only published when at least `MIN_CONTRIBUTORS` wallets contribute. Below that threshold the derivation returns `None` and no asset score is stored or emitted. This avoids publishing a score derived from one or two wallets, which would be trivially manipulable and statistically meaningless.
 
-To avoid overflow in Python, use arbitrary-precision integers (Python 3 does this automatically for `int`). In other languages, use 128-bit or 256-bit integers for intermediate calculations.
+### Maintenance Model: Incremental vs. Committed Off-Chain Result
 
----
+Two maintenance strategies were considered:
 
-## Staleness and Filtering
+| Strategy | Cost | Latency | Trust |
+| --- | --- | --- | --- |
+| **Incremental on-chain** — update the running aggregate on every submission | O(1) per submission, but requires storing running sums (`weight_sum`, `weighted_sum`, `sq_sum`) and recomputing the penalty each time; storage writes on every submission | Immediate | Fully on-chain, no extra trust |
+| **Periodically committed off-chain result** — compute off-chain, commit the result on-chain | O(1) per commit (one write per epoch); off-chain compute is free | Up to one epoch | Requires a trusted committer or a verification path |
 
-### Staleness Window
+**Chosen approach: incremental on-chain maintenance.** The running sums (`weight_sum`, `weighted_sum`, `sq_sum`) are small fixed-size values, so each submission costs a bounded number of storage reads/writes and the derivation itself is O(1) given the sums. This keeps the score fully on-chain and avoids introducing a trusted committer. The periodically-committed off-chain variant is cheaper in storage writes but adds a trust assumption and latency; it is documented here as the fallback if submission volume makes per-submission writes prohibitive.
 
-Scores older than the staleness window (default: `DEFAULT_STALENESS_WINDOW_SECS = 604,800` seconds = 7 days) are considered stale.
+### Threat Model: Manipulation
 
-### Staleness Filtering in `get_effective_score`
+- **Sybil wallets (many tiny contributors).** An attacker splitting holdings across many wallets inflates $n$ and lowers the concentration index, but each wallet's weight is tiny, so the weighted mean is dominated by the honest large holders. The `MIN_CONTRIBUTORS` threshold alone does not stop sybils, so the concentration penalty is applied to the *weight* distribution: sybil wallets with negligible weight do not meaningfully change $C$, and the weighted mean is unchanged. To further resist sybils, weights should be derived from on-chain balances/volume rather than self-reported values.
+- **Single-holder dominance.** A single dominant holder would otherwise set the score; the concentration penalty reduces the score as $C \to 1$, so dominance lowers rather than raises the published score.
+- **Score inflation via dust.** Because the aggregation is weight-proportional, dust contributions cannot move the mean; they only add to $n$, which is bounded by the concentration term.
+- **Replay / stale contributions.** Contributions must be timestamped and decayed using the existing `decay_fixed` path so that stale wallet scores do not indefinitely influence the asset score.
 
-1. Compute age: `age = current_timestamp - score_timestamp`
-2. If `age > staleness_window` and `decay_rate != 0`:
-   - Apply decay: `effective_score = raw_score * decay_factor(age)`
-   - Set `decay_applied = true`
-3. Otherwise:
-   - `effective_score = raw_score`
-   - Set `decay_applied = false`
+### Test Vectors
 
-### Embargo Filtering
+Deterministic vectors for the derivation, including degenerate distributions:
 
-Embargoed wallets are checked separately:
-- `is_embargoed(wallet)` returns `true` if the wallet is on the embargo list.
-- `get_effective_score` returns `Err(ScoreEmbargoed)` if the wallet is embargoed.
-- `query_risk_gate` returns `false` if the wallet is embargoed.
+| Contributors `(weight, score)` | Expected |
+| --- | --- |
+| `[]` | `None` (below min) |
+| `[(1, 50)]` | `None` (below min) |
+| `[(1, 50); 4]` | `None` (below min) |
+| `[(1, 50); 5]` | `50` (uniform, no penalty) |
+| `[(1, 0); 5]` | `0` |
+| `[(1, 100); 5]` | `100` |
+| `[(100, 80), (1, 20); 4]` | weighted mean ≈ 79, reduced by concentration penalty |
+| `[(1, 50); 1000]` | `50` (uniform, no penalty) |
 
----
+### Invariants
 
-## Asset-Class Policy Profiles
-
-Different asset categories (stablecoins, volatile assets, thin markets, high-value pairs) warrant different risk-threshold policies. `get_effective_risk_threshold(asset_pair)` resolves the threshold to use for a pair:
-
-1. If the pair has been assigned a class via `set_pair_asset_class(pair, class)` **and** that class has an override via `set_asset_class_policy(class, risk_threshold)`, the class override is returned.
-2. Otherwise, the global `risk_threshold` (set via `set_risk_threshold`) is returned.
-
-Lookup is a pure function of on-chain storage — same inputs always produce the same result — and pairs with no assigned class, or classes with no configured override, safely fall back to the global default rather than erroring. See `contracts/ledgerlens-score/src/test_asset_class_policy.rs` for fixtures covering the default-fallback and override-resolution paths.
-
----
-
-## Precision Limits and Rounding
-
-### Integer Truncation, Not Rounding
-
-All divisions truncate toward zero. For example:
-7 / 2 = 3  (not 3.5 rounded to 4)
-```yaml
-
-This behavior is deterministic and matches across platforms.
-
-### Precision Loss
-
-When computing:
-aggregate = (weighted_sum / weight_sum)
-```yaml
-
-The result is truncated. For example, if the true average is 42.7, the contract returns 42. Off-chain simulators must use the same truncation to match.
-
-### Decimal Precision
-
-Fixed-point representation with `SCALE = 10^6` provides 6 decimal places. Values are stored as integers, so no floating-point rounding errors occur.
-
----
-
-## Cross-Reference: Formula Documentation in Source Code
-
-The following functions in `contracts/ledgerlens-score/src/lib.rs` reference this document:
-
-- **`get_aggregate_score` (line ~1850):** See [§ Weighted Average](#weighted-average) for the formula and fixed-point implementation notes.
-- **`get_effective_score` (line ~1601):** See [§ Staleness and Filtering](#staleness-and-filtering) and [§ Exponential Decay](#exponential-decay) for staleness filtering and decay logic.
-- **`get_interpolated_score` (line ~1709):** See [§ Linear Interpolation](#linear-interpolation) for the formula and fixed-point implementation notes.
-- **`decay_fixed` (line ~5340):** See [§ Exponential Decay](#exponential-decay) for the Taylor series approximation and fixed-point arithmetic.
-
----
-
-## Off-Chain Simulation Checklist
-
-When building an off-chain simulator (indexer, backend, analytics):
-
-- [ ] Use integer arithmetic with the same `SCALE = 1,000,000` factor.
-- [ ] Implement truncating division (not rounding).
-- [ ] Use 64-bit or larger integers for intermediate calculations to prevent overflow.
-- [ ] Implement the decay Taylor series with the same 4-term expansion.
-- [ ] Handle edge cases: empty wallet lists, all-zero weights, invalid thresholds.
-- [ ] Test against on-chain results with known inputs to verify precision.
-
----
-
----
-
-## Monotonicity of Aggregate Score Under Pair Reweighting (#721)
-
-When pair weights are changed while input scores remain fixed, the aggregate
-score changes in predictable, monotone directions.
-
-### Monotonicity Properties
-
-| Property | Statement |
-|---|---|
-| M1 | Increasing the weight of a pair whose score is **above** the current aggregate **raises** (or preserves) the aggregate. |
-| M2 | Increasing the weight of a pair whose score is **below** the current aggregate **lowers** (or preserves) the aggregate. |
-| M3 | Setting all weights to zero is a degenerate case; the contract returns an error when `weight_sum = 0`. |
-| M4 | A single pair with a very large weight dominates the aggregate: `agg → score_dominant` as `weight_dominant → ∞`. |
-| M5 | If all pairs have the same score `S`, any positive reweighting leaves `agg = S`. |
-| M6 | `max_pair_score` always equals the maximum individual score, independent of reweighting. |
-
-### Worked Examples
-
-**Example 1 — raising a high-score pair's weight:**
-- Pairs: A (score=80, w=1), B (score=20, w=1) → `agg = floor((80+20)/2) = 50`
-- Raise A's weight to 10: `agg = floor((10×80 + 1×20)/11) = floor(820/11) = 74` ✓ (increased)
-
-**Example 2 — raising a low-score pair's weight:**
-- Pairs: A (score=20, w=1), B (score=80, w=1) → `agg = 50`
-- Raise A's weight to 10: `agg = floor((10×20 + 1×80)/11) = floor(280/11) = 25` ✓ (decreased)
-
-### Test Coverage
-
-Monotonicity properties are verified in
-`contracts/ledgerlens-score/src/test_monotonicity_reweight.rs` using
-deterministic unit tests with explicit expected values for each property.
-
----
-
-## Confidence-Floor Semantics: Formal Truth Tables (#722)
-
-The gate function `query_risk_gate_with_confidence` passes only when **all
-three** of the following conditions hold simultaneously:
-
-PASS  iff  score       >= threshold
-       AND confidence  >= query_conf
-       AND confidence  >= global_min_confidence
-```yaml
-
-Where `global_min_confidence` is the admin-controlled floor set via
-`set_global_min_confidence`.
-
-### Table 1 — Score vs Threshold (confidence always passes)
-
-| score | threshold | conf | query_conf | global_floor | result | reason |
-|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   90 |          0 |            0 | PASS   | score > threshold |
-|    70 |        70 |   90 |          0 |            0 | PASS   | score == threshold (inclusive boundary) |
-|    69 |        70 |   90 |          0 |            0 | FAIL   | score < threshold |
-|     0 |         0 |   90 |          0 |            0 | PASS   | both zero |
-|   100 |       100 |   90 |          0 |            0 | PASS   | both max |
-|     0 |       100 |   90 |          0 |            0 | FAIL   | score 0, threshold max |
-
-### Table 2 — Confidence vs Per-Query Confidence Threshold
-
-| score | threshold | conf | query_conf | global_floor | result | reason |
-|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   80 |         80 |            0 | PASS   | conf == query_conf (inclusive) |
-|    80 |        70 |   79 |         80 |            0 | FAIL   | conf one below query_conf |
-|    80 |        70 |   81 |         80 |            0 | PASS   | conf above query_conf |
-|    80 |        70 |  100 |        100 |            0 | PASS   | conf == query_conf == max |
-|    80 |        70 |   99 |        100 |            0 | FAIL   | conf one below max query_conf |
-|    80 |        70 |    0 |          0 |            0 | PASS   | both zero |
-
-### Table 3 — Confidence vs Global Minimum Confidence Floor
-
-| score | threshold | conf | query_conf | global_floor | result | reason |
-|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   75 |          0 |           75 | PASS   | conf == global_floor (inclusive) |
-|    80 |        70 |   74 |          0 |           75 | FAIL   | conf one below global_floor |
-|    80 |        70 |   76 |          0 |           75 | PASS   | conf above global_floor |
-|    80 |        70 |    0 |          0 |            0 | PASS   | floor is zero, never blocks |
-|    80 |        70 |  100 |          0 |          100 | PASS   | conf == global_floor == max |
-
-### Table 4 — Combined Constraints
-
-| score | threshold | conf | query_conf | global_floor | result | reason |
-|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
-|    80 |        70 |   85 |         80 |           75 | PASS   | all three conditions pass |
-|    65 |        70 |   85 |         80 |           75 | FAIL   | score < threshold |
-|    80 |        70 |   79 |         80 |           75 | FAIL   | conf < query_conf |
-|    80 |        70 |   74 |         70 |           75 | FAIL   | conf < global_floor |
-|    80 |        70 |   74 |         80 |           75 | FAIL   | conf fails both conf checks |
-|   100 |       100 |  100 |        100 |          100 | PASS   | all at maximum |
-
-### Configuration Notes
-
-- `global_min_confidence` is set admin-only via `set_global_min_confidence(floor: u32)`.
-- Valid range: `[0, 100]`. Setting to 0 disables the floor (never blocks on confidence alone).
-- The floor applies retroactively: raising it causes already-submitted scores with lower
-  confidence to fail future gate queries without resubmission.
-
-### Test Coverage
-
-Truth tables are verified row-by-row in
-`contracts/ledgerlens-score/src/test_confidence_floor_truth_tables.rs`.
-
----
-
-## Model-Version Risk-Policy Compatibility (#723)
-
-The active risk policy defines an allowlist of approved model versions.
-Score submissions that carry an unapproved or retired version are rejected
-deterministically at submission time.
-
-### Version Lifecycle
-
-                  register_model_version(v, delay)
-                           │
-                    delay elapsed?
-                    ┌─── No ───→  Proposed  (not yet accepted)
-                    │
-                    └─── Yes ──→  Active    (accepted by risk policy)
-                                      │
-                              deprecate_model_version(v)
-                                      │
-                                  Deprecated  (permanently retired)
-```yaml
-
-### Compatibility Rules
-
-| Registry state | Submitted version | Outcome |
-|---|---|---|
-| Empty (no versions registered) | any | ACCEPTED (fallback: no restriction) |
-| Non-empty | Active version | ACCEPTED |
-| Non-empty | Proposed version (delay not elapsed) | REJECTED |
-| Non-empty | Deprecated version | REJECTED |
-| Non-empty | Unknown version (never registered) | REJECTED |
-
-### Read API
-
-- `is_model_version_active(version: u32) -> bool` — returns `true` if and only if the version
-  is in the Active state. Off-chain tooling should call this before submitting to avoid a
-  wasted transaction.
-- `get_model_versions() -> Vec<ModelVersionEntry>` — returns the full registry with each
-  entry's `version`, `status`, and `metadata` bytes.
-
-### ABI / Storage Notes
-
-- The registry is stored under a persistent storage key (`MODEL_VERSIONS`).
-- Deprecation is irreversible: a deprecated version cannot be re-activated.
-- The maximum registry size is bounded by `MAX_MODEL_VERSIONS` (defined in `constants.rs`)
-  to prevent unbounded storage growth.
-
-### Test Coverage
-
-Model-version policy compatibility is verified in
-`contracts/ledgerlens-score/src/test_model_version_policy_compat.rs`.
-Existing lifecycle tests live in
-`contracts/ledgerlens-score/src/test_model_version.rs`.
-
----
-
-## Bounded Drift Checks for Consecutive Score Updates (#724)
-
-Consecutive score updates for the same `(wallet, asset_pair)` are checked
-against a configurable drift threshold (the "jump threshold").  A score change
-whose absolute delta exceeds the threshold is classified as a suspicious jump
-and triggers an on-chain event.
-
-### Jump Threshold
-
-| Parameter | Storage function | Description |
-|---|---|---|
-| `jump_threshold` | `set_jump_threshold(threshold: u32)` | Maximum permitted absolute delta between consecutive scores. Default: 50. |
-
-`get_jump_threshold() -> u32` returns the current threshold.
-
-### Drift Check Logic
-
-delta = |new_score - previous_score|
-
-if delta > jump_threshold:
-    emit ScoreJumpAnomalyEvent { wallet, pair, prev, new, delta, timestamp }
-    increment jump_anomaly_count for (wallet, pair)
-
-# The submission is still stored (fail-soft by default).
-# Use is_flagged=true to mark emergency overrides.
-```yaml
-
-**Notes:**
-- The first submission for a `(wallet, pair)` has no previous score, so it is
-  never classified as a drift anomaly.
-- The boundary is **exclusive**: `delta == jump_threshold` is accepted without
-  an anomaly; `delta == jump_threshold + 1` triggers the anomaly.
-- Score drops (decreasing changes) are subject to the same check as increases.
-
-### Jump Stats API
-
-- `get_jump_stats(wallet: Address, pair: Symbol) -> (u32, u64)` — returns
-  `(anomaly_count, last_anomaly_timestamp)` for the given wallet/pair.
-  Operators can poll this to detect wallets with frequent suspicious jumps.
-
-### Drift Threshold Guidelines
-
-| Threshold value | Behavior |
-|---|---|
-| 0 | Any change from the previous score triggers an anomaly (maximum sensitivity). |
-| 50 (default) | Changes of more than 50 points are flagged. Covers model recalibrations. |
-| 100 | Only the most extreme jumps (score goes from one extreme to another) are flagged. |
-
-### ABI / Storage Notes
-
-- `jump_threshold` is configurable post-deploy by admin multisig via
-  `set_jump_threshold`.
-- `ScoreJumpAnomalyEvent` is emitted on the `jmp_ano` topic with data
-  `(prev_score, new_score, abs_delta, threshold, timestamp)`.
-- Jump stats are stored per `(wallet, asset_pair)` under a persistent key.
-
-### Test Coverage
-
-Drift boundary conditions are verified in
-`contracts/ledgerlens-score/src/test_bounded_drift.rs`, covering within-threshold,
-at-boundary, one-above-boundary, drops, first-submission, configurable threshold,
-and counter increment cases.
-
----
-
-## References
-
-- **Interface specification:** [`docs/interface-spec.md`](interface-spec.md)
-- **Contract source:** `contracts/ledgerlens-score/src/lib.rs`
-- **Constants:** `contracts/ledgerlens-score/src/constants.rs`
-
+- **Bounded:** the result is always in `[0, 100]` (or `None`).
+- **Monotone:** increasing any contributor's score (holding weights fixed) never decreases the asset score; increasing a contributor's weight toward a higher-scoring wallet never decreases the asset score.
+- **Permutation-stable:** the result is independent of the order of `contributors` (the sums are commutative).
+- **Degenerate:** an empty or below-threshold contributor set yields `None`; an all-zero weight set yields `None`.
