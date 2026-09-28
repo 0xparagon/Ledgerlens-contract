@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1130 -->
 - #1130: Verified-clean certificates with expiry, separate from risk scores
+
+<!-- handsoff-issue-1131 -->
+- #1131: Consumer threshold profiles and a single-call profile gate
