@@ -12,6 +12,67 @@ A WASM upgrade replaces the contract's code on-chain, enabling bug fixes, featur
 
 ---
 
+## Expedited Security-Patch Lane
+
+The standard 48-hour timelock is the right default, but it is too slow to respond to a live exploit. The **expedited lane** shortens the delay *only* when a set of compensating controls hold. It is a break-glass path, not a routine deployment channel.
+
+### When to use the lane
+
+Use the expedited lane **only** for an active or imminent security incident where the standard timelock would leave funds or state exposed, for example:
+
+- A live exploit draining funds or corrupting scores.
+- A critical vulnerability that is publicly known and trivially exploitable.
+- A compromised dependency or admin path that must be neutralized immediately.
+
+Do **not** use the lane for feature releases, gas optimizations, refactors, or any change that can wait 48 hours. Misuse is itself a governance incident (see *Follow-up governance event* below).
+
+### Preconditions
+
+All of the following must hold before an expedited proposal is accepted:
+
+- [ ] The contract is initialized and an admin set exists.
+- [ ] No other upgrade proposal is pending (standard or expedited).
+- [ ] The expedited cooldown has elapsed since the last expedited execution.
+- [ ] The proposal is signed by at least the **expedited quorum** (a strict superset of the standard admin threshold — e.g. a supermajority of admins rather than a simple majority).
+- [ ] The new WASM hash is already installed on-chain and matches the proposed hash.
+
+### Quorum and delay floor
+
+- **Quorum:** the expedited lane requires a **higher approval threshold** than the standard lane. Where the standard lane accepts the normal admin threshold, the expedited lane requires the configured expedited quorum (supermajority of admins). Insufficient signatures are rejected with `Error::InsufficientExpeditedQuorum`.
+- **Minimum delay floor:** the expedited delay is shorter than the standard delay but may **never** be reduced below the configured floor (`expedited_delay_floor`). The effective delay is `max(expedited_delay, expedited_delay_floor)`. The floor is a hard invariant: no expedited proposal can become executable before `proposed_at + expedited_delay_floor`.
+- **Scope:** the expedited lane can only shorten **its own** delay. It cannot modify, shorten, or bypass the standard upgrade delay, the veto window, or any other timelock in the system.
+
+### Cooldown
+
+To prevent the lane from becoming a routine deployment path, expedited executions are rate-limited by a **cooldown**. After an expedited upgrade executes, no new expedited proposal may be accepted until `cooldown` seconds have elapsed. Attempts during the cooldown are rejected with `Error::ExpeditedCooldownActive`. The cooldown applies only to the expedited lane and does not affect standard proposals.
+
+### Effect on the system during the pause window
+
+While an expedited proposal is pending, the contract enters a **mandatory pause window**:
+
+- All **state-changing** entry points (score submission, admin/settings mutation, standard upgrade propose/execute) are **blocked** and return `Error::ContractPaused`.
+- **Read-only** entry points (`get_score`, `get_pending_upgrade`, `get_version`, risk-gate queries) remain available so integrators and monitors can observe state.
+- The pause is enforced for the entire expedited window, from proposal acceptance until execution or veto.
+- The **veto surface is broadened**: any single admin may veto an expedited proposal at any time before execution, and the veto immediately lifts the pause and clears the proposal.
+
+### Post-upgrade automatic verification checklist
+
+Immediately after an expedited execution, the contract runs (and operators must confirm) the following automatic checks before the pause is lifted:
+
+- [ ] New code hash matches the proposed hash.
+- [ ] Contract responds to a read-only probe (`get_version` / `get_score`) without trapping.
+- [ ] Admin set and critical configuration are intact.
+- [ ] No state-changing call reverts unexpectedly once the pause is lifted.
+- [ ] Integrator smoke test (risk gate enforced) passes on testnet before mainnet reliance.
+
+If any check fails, treat it as a failed upgrade and re-propose the previous WASM through the standard lane.
+
+### Mandatory follow-up governance event
+
+Every expedited execution **must** be followed by a governance event: a post-incident review published to the governance forum within the incident SLA, covering the trigger, the compensating controls that held, the verification results, and a decision on whether to keep or tighten the lane. The expedited execution emits an `expedited_upgrade_executed` event that references this follow-up obligation.
+
+---
+
 ## Pre-Upgrade Checklist
 
 Before proposing an upgrade, complete the following:
@@ -226,69 +287,6 @@ This returns the contract version number (e.g., `2` or `3`). If your new WASM in
 
 ## Rollback Options
 
-**On-chain WASM upgrades are not automatically reversible.** If the new code is buggy, you must take action:
+**On-chain WASM upgrades are not au
 
-### Option A: Re-Propose the Previous WASM
-
-1. Obtain the previous WASM binary (from version control or backups).
-2. Compute its SHA-256 hash.
-3. Propose that hash as a new upgrade.
-4. Wait the delay again.
-5. Execute.
-
-**Time cost:** 48 hours + execution time.
-
-### Option B: Propose a Hotfix
-
-1. If the issue is minor, prepare a new WASM with a fix.
-2. Follow the same proposal and execution flow.
-
-**Time cost:** 48 hours + execution time.
-
-### Option C: Pause the Contract (Temporary)
-
-If the issue is critical and you cannot afford to wait 48 hours, call `pause`:
-
-```bash
-soroban contract invoke \
-  --network testnet \
-  --source-account YOUR_ADMIN_ADDRESS \
-  --contract-id LEDGERLENS_CONTRACT_ID \
-  -- pause \
-  --admin-signers '[ADMIN_ADDRESS]'
-
-This disables all score submissions and queries (returning `Error::ContractPaused`). Integrators will see the contract is offline. Resume it with `unpause` once the fix is ready.
-
----
-
-## Troubleshooting
-
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| "UpgradeAlreadyPending" | An upgrade is already proposed | `veto_upgrade` to clear it, then propose again |
-| "UpgradeNotReady" | Delay has not elapsed | Wait longer; check `get_pending_upgrade` for exact time |
-| "NoPendingUpgrade" | Tried to execute without proposing first | Run `propose_upgrade` first |
-| "Unauthorized" | Admin signature invalid | Ensure correct admin address(es) and proper signing |
-| Contracts still call old function name | New WASM removed/renamed a function | Ensure breaking changes were announced to integrators |
-| Queries fail after upgrade | Contract state is corrupted | Check backups, consider `pause` + rollback |
-
----
-
-## Security Best Practices
-
-1. **Test on testnet first:** Propose and execute the upgrade on testnet before mainnet.
-2. **Sign with hardware wallet:** Use a Ledger or HSM for admin keys, never hot wallets.
-3. **Multisig is recommended:** Require at least 2 of 3 admins to sign upgrades, preventing single-key compromise.
-4. **Announce widely:** Give integrators 48+ hours notice so they can prepare.
-5. **Monitor closely:** Watch on-chain events and integrator feedback immediately after execution.
-6. **Have a rollback plan:** Know exactly how to re-propose the old WASM if needed.
-7. **Validate the deploy manifest:** For a fresh deployment (not an in-place upgrade), `deploy.sh` validates `deploy/manifest.json` for the target network — admin identity, service address, upgrade delay, cooldown, risk threshold, and schema version — before building or submitting any transaction. See `deploy/validate_manifest.sh` for the checks and bounds.
-
----
-
-## References
-
-- **Interface specification:** [`docs/interface-spec.md`](interface-spec.md)
-- **Upgrade-related constants:** `MIN_UPGRADE_DELAY_SECS = 172,800` (48 hours), `MAX_UPGRADE_DELAY_SECS = 1,209,600` (14 days)
-- **Contract source:** `contracts/ledgerlens-score/src/lib.rs`
-
+/* … truncated 2985 chars — edit only what you need near the top … */
