@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1158 -->
 - #1158: Cold-start priors for newly listed asset pairs
+
+<!-- handsoff-issue-1161 -->
+- #1161: Bounded top-K riskiest wallets index per asset pair
