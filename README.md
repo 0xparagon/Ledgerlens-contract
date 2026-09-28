@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1146 -->
 - #1146: Signer reward accrual and pull-based claims funded from gate fees
+
+<!-- handsoff-issue-1147 -->
+- #1147: Per-key revision counters for optimistic-concurrency consumer reads
