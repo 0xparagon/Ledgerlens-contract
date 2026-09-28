@@ -832,3 +832,6 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1154 -->
 - #1154: SEP-41 token transfer guard reference gated by the risk registry
+
+<!-- handsoff-issue-1156 -->
+- #1156: Bounded on-chain gate-policy expression evaluator
