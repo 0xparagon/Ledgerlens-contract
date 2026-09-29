@@ -19,6 +19,9 @@ mod events;
 mod governance_actions;
 #[cfg(any(test, feature = "testutils"))]
 mod invariants;
+/// Pure fee-tier computation for the tiered gate fee schedule; see
+/// `rent_relay_credits.rs` for where it's wired into `query_risk_gate_metered`.
+mod fee_schedule;
 mod parameter_governance;
 /// Second `#[contractimpl]` block for `LedgerLensScoreContract`, kept in its
 /// own file rather than inline in this one to avoid hand-editing an already
@@ -65,6 +68,8 @@ mod test_keeper_rewards;
 mod test_relay_attestation;
 #[cfg(test)]
 mod test_gate_credits;
+#[cfg(test)]
+mod test_gate_fee_tiers;
 
 #[cfg(test)]
 mod test_invariants;
@@ -261,7 +266,7 @@ pub use types::{
     AdaptiveRateLimit, AdaptiveThresholdConfig, AggregateRiskScore, AlertAckRecord, AlertType,
     AuditorScoreExport, BatchAttestation, BatchEntryResult, BatchResult, BatchScoreResult,
     ConfigExportBundle, ConfigExportEntry, DecayCurve, DeletionApprovalPolicy,
-    DeletionAuditWarning, DeletionPreflight, EffectiveRiskScore, EmbargoExpiry,
+    DeletionAuditWarning, DeletionPreflight, EffectiveRiskScore, EmbargoExpiry, FeeTier,
     FlashProtectionMode, HllSketch, InterfaceMetadata, InterpolationMethod, MaybeRiskScore,
     MaybeScoreAttestation, MaybeThresholdAttestation, ModelSubmission, ModelVersionStats,
     ModelVersionStatus, NormalizedSubmission, OperatorScoreExport, ParamChangeProposal, ParamValue,

@@ -199,6 +199,22 @@ pub const DEFAULT_KEEPER_REWARD_WINDOW: u32 = 0;
 /// governance parameter is mis-set.
 pub const MAX_KEEPER_REWARD_PER_ENTRY: i128 = 1_000_000_000;
 
+// ── Tiered gate fee schedule ──────────────────────────────────────────────
+//
+// See `docs/operations/runbook.md`. Bounds the fee-tier schedule's storage
+// footprint (a single `Vec<FeeTier>` read/written whole, so it must stay
+// small) and each tier's fee amount, independent of what governance sets.
+
+/// Maximum number of tiers `set_fee_tier_schedule` accepts.
+pub const MAX_FEE_TIERS: u32 = 10;
+
+/// Hard ceiling on any single tier's flat per-call fee.
+pub const MAX_GATE_FEE_TIER: i128 = 1_000_000_000;
+
+/// Default rolling-window length (ledgers) for per-consumer call-volume
+/// accounting — roughly 1 day at Stellar's ~5s average ledger close time.
+pub const DEFAULT_FEE_TIER_WINDOW_LEDGERS: u32 = 17_280;
+
 /// Maximum number of concurrently pending parameter-change proposals.
 pub const MAX_PENDING_PARAMETER_PROPOSALS: u32 = 10;
 

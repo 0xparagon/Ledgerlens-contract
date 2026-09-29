@@ -24,7 +24,8 @@ use soroban_sdk::{
 use subtle::ConstantTimeEq;
 
 use crate::errors::Error;
-use crate::types::RelayScoreAttestation;
+use crate::fee_schedule::compute_gate_fee;
+use crate::types::{FeeTier, RelayScoreAttestation};
 use crate::{events, storage, LedgerLensScoreContract};
 
 #[contractimpl]
@@ -701,5 +702,189 @@ impl LedgerLensScoreContract {
         );
         events::gate_credit_revenue_withdrawn(&env, &recipient, amount);
         Ok(())
+    }
+}
+
+#[contractimpl]
+impl LedgerLensScoreContract {
+    // ═════════════════════════════════════════════════════════════════════
+    // Issue: Tiered gate fee schedule
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    // See `docs/operations/runbook.md`. `query_risk_gate_metered` is a new,
+    // additive entry point that debits a consumer's prepaid gate credits
+    // (above) per a governed volume-tiered fee schedule, then delegates to
+    // the existing, unmodified `query_risk_gate_with_confidence` for the
+    // actual gate decision — so this never changes the behavior or ABI of
+    // `query_risk_gate` itself.
+
+    /// Governance: replaces the fee-tier schedule. `tiers` must be sorted
+    /// strictly ascending by `min_volume` (the first tier's `min_volume`
+    /// need not be `0` — see `compute_gate_fee`'s "below first tier" case,
+    /// which prices at `0`). Takes effect immediately for calls made from
+    /// this point forward; does not and cannot retroactively change fees
+    /// already charged for prior calls, since each call's fee is computed
+    /// and debited synchronously at call time — there is no stored
+    /// per-call record this could rewrite.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidFeeTierSchedule`] if `tiers` is not strictly
+    ///   ascending by `min_volume`, exceeds `MAX_FEE_TIERS`, or any tier's
+    ///   fee is negative or exceeds `MAX_GATE_FEE_TIER`.
+    pub fn set_fee_tier_schedule(
+        env: Env,
+        admin_signers: Vec<Address>,
+        tiers: Vec<FeeTier>,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        if tiers.len() > crate::constants::MAX_FEE_TIERS {
+            return Err(Error::InvalidFeeTierSchedule);
+        }
+        let mut prev_min_volume: Option<u32> = None;
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.fee < 0 || tier.fee > crate::constants::MAX_GATE_FEE_TIER {
+                return Err(Error::InvalidFeeTierSchedule);
+            }
+            if let Some(prev) = prev_min_volume {
+                if tier.min_volume <= prev {
+                    return Err(Error::InvalidFeeTierSchedule);
+                }
+            }
+            prev_min_volume = Some(tier.min_volume);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::set_fee_tier_schedule(&env, &tiers);
+        events::fee_tier_schedule_set(&env, tiers.len());
+        Ok(())
+    }
+
+    pub fn get_fee_tier_schedule(env: Env) -> Vec<FeeTier> {
+        storage::get_fee_tier_schedule(&env)
+    }
+
+    /// Governance: sets the rolling window length (ledgers) used for
+    /// per-consumer call-volume accounting.
+    pub fn set_fee_tier_window_ledgers(
+        env: Env,
+        admin_signers: Vec<Address>,
+        window_ledgers: u32,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        if window_ledgers == 0 {
+            return Err(Error::InvalidFeeTierSchedule);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::set_fee_tier_window_ledgers(&env, window_ledgers);
+        Ok(())
+    }
+
+    /// Governance: grants `consumer` a fee exemption (computed fee is
+    /// always `0`, regardless of the tier schedule) until `expires_at`
+    /// (ledger timestamp), tagged with an operator-defined `reason_code`
+    /// (e.g. "public-good protocol", "internal testing"). Changeable only
+    /// by governance; every change is auditable via
+    /// [`events::fee_exemption_set`].
+    ///
+    /// # Errors
+    /// - [`Error::InvalidExemptionExpiry`] if `expires_at` is not in the
+    ///   future.
+    pub fn set_fee_exemption(
+        env: Env,
+        admin_signers: Vec<Address>,
+        consumer: Address,
+        expires_at: u64,
+        reason_code: u32,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidExemptionExpiry);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::set_fee_exemption(&env, &consumer, expires_at, reason_code);
+        events::fee_exemption_set(&env, &consumer, expires_at, reason_code);
+        Ok(())
+    }
+
+    /// Governance: revokes `consumer`'s exemption immediately (rather than
+    /// waiting for it to expire naturally).
+    pub fn clear_fee_exemption(
+        env: Env,
+        admin_signers: Vec<Address>,
+        consumer: Address,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::clear_fee_exemption(&env, &consumer);
+        Ok(())
+    }
+
+    /// Returns `Some((expires_at, reason_code))` if `consumer` currently
+    /// has an unexpired exemption, else `None` (including if the stored
+    /// record has expired but not yet been cleared — `query_risk_gate_metered`
+    /// checks the expiry itself rather than relying on eager cleanup).
+    pub fn get_fee_exemption(env: Env, consumer: Address) -> Option<(u64, u32)> {
+        match storage::get_fee_exemption(&env, &consumer) {
+            Some((expires_at, reason_code)) if expires_at > env.ledger().timestamp() => {
+                Some((expires_at, reason_code))
+            }
+            _ => None,
+        }
+    }
+
+    /// Metered, credit-funded variant of `query_risk_gate`. Computes the
+    /// fee for this call from `consumer`'s current volume tier (or `0` if
+    /// `consumer` has an active exemption), debits it from `consumer`'s
+    /// prepaid gate-credit balance, then delegates to the unmodified
+    /// `query_risk_gate_with_confidence` for the actual gate decision.
+    ///
+    /// `consumer` is the entity being billed — not necessarily `wallet`
+    /// (the wallet being scored). `consumer.require_auth()` is required so
+    /// only the consumer itself (or a contract acting with the consumer's
+    /// authorization) can spend that consumer's credit.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialized`] if the contract has no admin yet.
+    /// - [`Error::InsufficientGateCredits`] if the computed fee exceeds
+    ///   `consumer`'s current credit balance. The gate is *not* evaluated
+    ///   in this case — callers must have funded credit before querying,
+    ///   there is no partial/free fallback.
+    pub fn query_risk_gate_metered(
+        env: Env,
+        consumer: Address,
+        wallet: Address,
+        asset_pair: Symbol,
+        gate_threshold: u32,
+    ) -> Result<bool, Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        consumer.require_auth();
+
+        let fee = match Self::get_fee_exemption(env.clone(), consumer.clone()) {
+            Some(_) => 0,
+            None => {
+                let volume_before_call = storage::advance_consumer_volume_window(&env, &consumer);
+                let tiers = storage::get_fee_tier_schedule(&env);
+                compute_gate_fee(&tiers, volume_before_call)
+            }
+        };
+
+        if fee > 0 {
+            storage::debit_gate_balance(&env, &consumer, fee)?;
+            storage::sub_gate_credit_liability(&env, fee);
+            storage::add_gate_credit_revenue(&env, fee);
+        }
+        events::gate_query_metered(&env, &consumer, fee);
+
+        Ok(Self::query_risk_gate_with_confidence(env, wallet, asset_pair, gate_threshold, 0))
     }
 }

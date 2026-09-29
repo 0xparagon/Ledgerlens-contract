@@ -3724,7 +3724,10 @@ pub fn set_fee_tier_schedule(env: &Env, tiers: &Vec<FeeTier>) {
 }
 
 pub fn get_fee_tier_window_ledgers(env: &Env) -> u32 {
-    env.storage().instance().get(&DataKeyF::FeeTierWindowLedgers).unwrap_or(17_280)
+    env.storage()
+        .instance()
+        .get(&DataKeyF::FeeTierWindowLedgers)
+        .unwrap_or(crate::constants::DEFAULT_FEE_TIER_WINDOW_LEDGERS)
 }
 
 pub fn set_fee_tier_window_ledgers(env: &Env, window: u32) {
