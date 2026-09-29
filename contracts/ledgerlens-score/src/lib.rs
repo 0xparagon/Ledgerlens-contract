@@ -63,6 +63,8 @@ mod test_ttl_rent_manager;
 mod test_keeper_rewards;
 #[cfg(test)]
 mod test_relay_attestation;
+#[cfg(test)]
+mod test_gate_credits;
 
 #[cfg(test)]
 mod test_invariants;

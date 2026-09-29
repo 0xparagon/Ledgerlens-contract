@@ -503,3 +503,203 @@ impl LedgerLensScoreContract {
         Ok(env.crypto().sha256(&preimage))
     }
 }
+
+#[contractimpl]
+impl LedgerLensScoreContract {
+    // ═════════════════════════════════════════════════════════════════════
+    // Issue: Prepaid gate-query credits
+    // ═════════════════════════════════════════════════════════════════════
+    //
+    // See `docs/security/prepaid-gate-credits.md`. Consumers deposit once
+    // into a per-depositor credit balance; metered gate queries
+    // (`query_risk_gate_metered`, in the tiered-fee-schedule section below)
+    // debit that balance instead of doing a token transfer on every call.
+    // Token transfers happen *only* on deposit and withdraw — a debit is
+    // pure accounting, moving the debited amount from the depositor's
+    // liability bucket into governance-withdrawable revenue without moving
+    // any tokens, which is what keeps `query_risk_gate_metered` cheap.
+    //
+    // Solvency: `GateCreditLiabilityTotal` (what's owed back to
+    // depositors) and `GateCreditRevenue` (governance-withdrawable) are
+    // both O(1) running counters, disjoint from each other and from every
+    // other token balance the contract tracks (the keeper-reward pool and
+    // relay-tip pool above, and the legacy `FeeToken`/`AccumulatedFees`
+    // path are all separate storage keys and may even be separate tokens).
+    // The contract's `GateCreditToken` holdings must always be >=
+    // liability + revenue; see `test_gate_credits.rs` for the property-style
+    // check across randomized operation sequences.
+    //
+    // Depositor protection: withdrawals are *never* gated by `is_paused`,
+    // and there is no admin/governance operation anywhere in this contract
+    // that can move funds out of `GateCreditLiabilityTotal` other than a
+    // depositor's own authorized withdrawal — governance can configure
+    // fees going forward and can withdraw already-earned `GateCreditRevenue`,
+    // but can never seize unspent deposited credit.
+
+    /// Governance: configures the SEP-41 token accepted for gate-credit
+    /// deposits. Changing this does **not** retroactively convert existing
+    /// balances — they remain denominated in whatever token was configured
+    /// when deposited. Operators changing this should ensure outstanding
+    /// balances in the old token are fully withdrawn first (`get_gate_credit_token`
+    /// lets integrators verify which token is currently active before
+    /// depositing).
+    pub fn set_gate_credit_token(
+        env: Env,
+        admin_signers: Vec<Address>,
+        token: Address,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::set_gate_credit_token(&env, &token);
+        Ok(())
+    }
+
+    pub fn get_gate_credit_token(env: Env) -> Option<Address> {
+        storage::get_gate_credit_token(&env)
+    }
+
+    /// Governance: sets the delay (seconds) a withdrawal request must wait
+    /// before `withdraw_gate_credits` can complete it. `0` disables the
+    /// delay (immediate withdrawal).
+    pub fn set_gate_credit_withdrawal_delay(
+        env: Env,
+        admin_signers: Vec<Address>,
+        delay_secs: u64,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::set_gate_credit_withdrawal_delay(&env, delay_secs);
+        Ok(())
+    }
+
+    pub fn get_gate_credit_balance(env: Env, depositor: Address) -> i128 {
+        storage::get_gate_credit_balance(&env, &depositor)
+    }
+
+    /// Deposits `amount` of the configured gate-credit token from
+    /// `depositor` into their credit balance. The only token transfer in
+    /// the deposit path.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidCreditAmount`] if `amount <= 0`.
+    /// - [`Error::GateCreditTokenNotSet`] if no token is configured.
+    pub fn deposit_gate_credits(env: Env, depositor: Address, amount: i128) -> Result<i128, Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidCreditAmount);
+        }
+        depositor.require_auth();
+        let token = storage::get_gate_credit_token(&env).ok_or(Error::GateCreditTokenNotSet)?;
+        token::TokenClient::new(&env, &token).transfer(
+            &depositor,
+            &env.current_contract_address(),
+            &amount,
+        );
+        let new_balance = storage::credit_gate_balance(&env, &depositor, amount);
+        storage::add_gate_credit_liability(&env, amount);
+        events::gate_credit_deposited(&env, &depositor, amount, new_balance);
+        Ok(new_balance)
+    }
+
+    /// Requests withdrawal of `amount` from `depositor`'s balance. The
+    /// amount is still counted in the depositor's spendable balance (and
+    /// thus still debitable by a metered query) until
+    /// `withdraw_gate_credits` actually completes it — this call only
+    /// starts the optional timelock; it does not reserve funds.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidCreditAmount`] if `amount <= 0` or exceeds the
+    ///   depositor's current balance.
+    pub fn withdraw_gate_credits_request(
+        env: Env,
+        depositor: Address,
+        amount: i128,
+    ) -> Result<u64, Error> {
+        depositor.require_auth();
+        let balance = storage::get_gate_credit_balance(&env, &depositor);
+        if amount <= 0 || amount > balance {
+            return Err(Error::InvalidCreditAmount);
+        }
+        let delay = storage::get_gate_credit_withdrawal_delay(&env);
+        let unlock_at = env.ledger().timestamp().saturating_add(delay);
+        storage::set_gate_credit_withdrawal_request(&env, &depositor, amount, unlock_at);
+        events::gate_credit_withdrawal_requested(&env, &depositor, amount, unlock_at);
+        Ok(unlock_at)
+    }
+
+    /// Completes a previously-requested withdrawal once its unlock time has
+    /// passed, transferring `amount` back to `depositor`. **Never** gated
+    /// by `is_paused` or any other admin-controlled switch — unspent credit
+    /// is always eventually withdrawable by its depositor, by design.
+    ///
+    /// # Errors
+    /// - [`Error::NoWithdrawalRequest`] if no request is pending.
+    /// - [`Error::WithdrawalNotYetUnlocked`] if called before the delay
+    ///   from `withdraw_gate_credits_request` has elapsed.
+    /// - [`Error::InvalidCreditAmount`] if the balance has since dropped
+    ///   below the requested amount (e.g. spent on metered queries after
+    ///   the request was made) — the request is cleared either way so the
+    ///   depositor can request a smaller amount.
+    pub fn withdraw_gate_credits(env: Env, depositor: Address) -> Result<i128, Error> {
+        depositor.require_auth();
+        let (amount, unlock_at) = storage::get_gate_credit_withdrawal_request(&env, &depositor)
+            .ok_or(Error::NoWithdrawalRequest)?;
+        if env.ledger().timestamp() < unlock_at {
+            return Err(Error::WithdrawalNotYetUnlocked);
+        }
+        storage::clear_gate_credit_withdrawal_request(&env, &depositor);
+        let balance = storage::get_gate_credit_balance(&env, &depositor);
+        if amount > balance {
+            return Err(Error::InvalidCreditAmount);
+        }
+        storage::debit_gate_balance(&env, &depositor, amount)?;
+        storage::sub_gate_credit_liability(&env, amount);
+        let token = storage::get_gate_credit_token(&env).ok_or(Error::GateCreditTokenNotSet)?;
+        token::TokenClient::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &depositor,
+            &amount,
+        );
+        events::gate_credit_withdrawn(&env, &depositor, amount);
+        Ok(amount)
+    }
+
+    pub fn get_gate_credit_liability_total(env: Env) -> i128 {
+        storage::get_gate_credit_liability_total(&env)
+    }
+
+    pub fn get_gate_credit_revenue(env: Env) -> i128 {
+        storage::get_gate_credit_revenue(&env)
+    }
+
+    /// Governance withdrawal of already-debited fee revenue. Scoped
+    /// entirely to `GateCreditRevenue` / `GateCreditToken` — structurally
+    /// unable to touch `GateCreditLiabilityTotal`, so this can never seize
+    /// depositor funds regardless of `amount`.
+    pub fn withdraw_gate_credit_revenue(
+        env: Env,
+        admin_signers: Vec<Address>,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        if !storage::has_admin(&env) {
+            return Err(Error::NotInitialized);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidCreditAmount);
+        }
+        Self::require_admin_auth(&env, &admin_signers)?;
+        storage::sub_gate_credit_revenue(&env, amount)?;
+        let token = storage::get_gate_credit_token(&env).ok_or(Error::GateCreditTokenNotSet)?;
+        token::TokenClient::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        events::gate_credit_revenue_withdrawn(&env, &recipient, amount);
+        Ok(())
+    }
+}
