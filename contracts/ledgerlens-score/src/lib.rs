@@ -20,6 +20,12 @@ mod governance_actions;
 #[cfg(any(test, feature = "testutils"))]
 mod invariants;
 mod parameter_governance;
+/// Second `#[contractimpl]` block for `LedgerLensScoreContract`, kept in its
+/// own file rather than inline in this one to avoid hand-editing an already
+/// very large `impl` block: permissionless keeper TTL-extension rewards,
+/// the permissionless attested-relay path, prepaid gate-query credits, and
+/// the tiered gate fee schedule.
+mod rent_relay_credits;
 mod storage;
 mod types;
 mod verkle;
@@ -53,6 +59,8 @@ mod test_batch_ttl_optimization;
 mod test_storage_contracts;
 #[cfg(test)]
 mod test_ttl_rent_manager;
+#[cfg(test)]
+mod test_keeper_rewards;
 
 #[cfg(test)]
 mod test_invariants;
@@ -588,6 +596,47 @@ impl LedgerLensScoreContract {
             }
         }
 
+        Self::finalize_score_submission(
+            &env,
+            &signers,
+            &wallet,
+            &asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+            commitment,
+        )
+    }
+
+    /// Shared submission finalization, extracted from `submit_score`'s tail
+    /// so the permissionless attested-relay path
+    /// (`relay_attested_score`, `rent_relay_credits.rs`) can reuse the exact
+    /// same finality-buffer / flash-protection / HLL-tracking / rate-limit
+    /// bookkeeping instead of duplicating and risking drift from it. Pure
+    /// refactor: behavior for `submit_score` callers is unchanged.
+    ///
+    /// `signers` is only consulted for `PendingScoreEntry::submitted_by`
+    /// when the finality buffer is active and the service set is non-empty;
+    /// callers with no meaningful signer list (e.g. the relay path, which is
+    /// always a single-key service attestation) may pass an empty `Vec` —
+    /// the existing fallback (`storage::get_service`) resolves it correctly.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_score_submission(
+        env: &Env,
+        signers: &Vec<Address>,
+        wallet: &Address,
+        asset_pair: &Symbol,
+        score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: u64,
+        confidence: u32,
+        model_version: u32,
+        commitment: Option<Bytes>,
+    ) -> Result<(), Error> {
         // ── issue #686: normalize first, validate second ───────────────────
         // All raw caller fields are collected into a `NormalizedSubmission`
         // before any range or model-version checks run.  This is the single
@@ -605,7 +654,7 @@ impl LedgerLensScoreContract {
             model_version,
             commitment.clone(),
         );
-        Self::validate_normalized_submission(&env, &ns)?;
+        Self::validate_normalized_submission(env, &ns)?;
 
         let risk_score = RiskScore {
             score: ns.score,
@@ -621,10 +670,10 @@ impl LedgerLensScoreContract {
         };
 
         // Flash-loan protection: check for same-ledger gate-read + submit (#300).
-        if let Some(gate_seq) = storage::get_gate_read_ledger(&env, &wallet, &asset_pair) {
+        if let Some(gate_seq) = storage::get_gate_read_ledger(env, wallet, asset_pair) {
             if gate_seq == env.ledger().sequence() {
-                events::suspicious_same_ledger_submission(&env, &wallet, &asset_pair, gate_seq);
-                if storage::get_flash_protection_mode(&env)
+                events::suspicious_same_ledger_submission(env, wallet, asset_pair, gate_seq);
+                if storage::get_flash_protection_mode(env)
                     == crate::types::FlashProtectionMode::Reject
                 {
                     return Err(Error::EpochClosed);
@@ -632,28 +681,28 @@ impl LedgerLensScoreContract {
             }
         }
 
-        let buffer = storage::get_finality_buffer_secs(&env);
+        let buffer = storage::get_finality_buffer_secs(env);
         // ── HLL first-time detection ──────────────────────────────────────────
-        if storage::get_score_count(&env, &wallet, &asset_pair) == 0 {
-            storage::hll_update(&env, &asset_pair, &wallet);
+        if storage::get_score_count(env, wallet, asset_pair) == 0 {
+            storage::hll_update(env, asset_pair, wallet);
         }
 
         if buffer == 0 {
             // Disabled — commit straight to live storage.
-            Self::write_score_with_rate_limit(&env, &wallet, &asset_pair, &risk_score)?;
-            Self::record_service_activity(&env);
+            Self::write_score_with_rate_limit(env, wallet, asset_pair, &risk_score)?;
+            Self::record_service_activity(env);
         } else {
             // Buffer active — validate but hold in pending storage.
             // Rate limit still applies so we can't be flooded with pending entries.
-            let last_submit = storage::get_last_submit_time(&env, &wallet, &asset_pair);
-            let base_cooldown = storage::get_pair_cooldown_secs(&env, &asset_pair);
-            let cooldown = Self::compute_effective_cooldown(&env, &asset_pair, base_cooldown);
+            let last_submit = storage::get_last_submit_time(env, wallet, asset_pair);
+            let base_cooldown = storage::get_pair_cooldown_secs(env, asset_pair);
+            let cooldown = Self::compute_effective_cooldown(env, asset_pair, base_cooldown);
             let now2 = env.ledger().timestamp();
             if last_submit != 0 && now2 < last_submit.saturating_add(cooldown) {
                 return Err(Error::RateLimitExceeded);
             }
-            storage::set_last_submit_time(&env, &wallet, &asset_pair, now2);
-            Self::record_service_activity(&env);
+            storage::set_last_submit_time(env, wallet, asset_pair, now2);
+            Self::record_service_activity(env);
 
             let commit_after = now2.saturating_add(buffer);
             let pending = PendingScoreEntry {
@@ -665,15 +714,15 @@ impl LedgerLensScoreContract {
                 model_version: ns.model_version,
                 timestamp: ns.timestamp,
                 commit_after,
-                submitted_by: if !storage::get_service_set(&env).is_empty() {
-                    signers.get(0).unwrap_or_else(|| storage::get_service(&env))
+                submitted_by: if !storage::get_service_set(env).is_empty() {
+                    signers.get(0).unwrap_or_else(|| storage::get_service(env))
                 } else {
-                    storage::get_service(&env)
+                    storage::get_service(env)
                 },
                 commitment: ns.commitment.clone(),
             };
-            storage::set_pending_score(&env, &wallet, &asset_pair, &pending);
-            events::score_pending(&env, &wallet, &asset_pair, commit_after);
+            storage::set_pending_score(env, wallet, asset_pair, &pending);
+            events::score_pending(env, wallet, asset_pair, commit_after);
         }
         Ok(())
     }

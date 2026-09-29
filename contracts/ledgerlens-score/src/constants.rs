@@ -169,6 +169,36 @@ pub const DEFAULT_QUORUM_FAILURE_WINDOW_SECS: u64 = 86_400; // 24 hours
 pub const MAX_TRACKED_SCORE_ENTRIES: u32 = 500;
 pub const MAX_EXPIRING_ENTRIES_PER_CALL: u32 = 100;
 
+// ── Permissionless keeper TTL-extension reward (rent-griefing follow-up) ────
+//
+// See `docs/rent-griefing-analysis.md`. Keepers batch-call
+// `keeper_extend_entry_ttls` to renew dormant score entries and are paid a
+// small, governance-configured reward per entry actually renewed, funded
+// from a dedicated pool (never user credits). Eligibility reuses the same
+// conservative TTL estimate as `get_expiring_entries`/`extend_entry_ttls`, so
+// a keeper can only be paid for entries genuinely close to expiry, and
+// renewing an entry resets its estimated remaining TTL back to
+// `SCORE_TTL_THRESHOLD` — far outside the reward window — which is what
+// makes repeat/split-work farming of the same entry unprofitable.
+
+/// Batch size cap for `keeper_extend_entry_ttls`. Reuses the existing
+/// `get_expiring_entries`/`extend_entry_ttls` cap so keeper tooling can feed
+/// `get_expiring_entries`'s output straight into the keeper call.
+pub const KEEPER_BATCH_MAX: u32 = MAX_EXPIRING_ENTRIES_PER_CALL;
+
+/// Default reward-eligibility window (ledgers of estimated remaining TTL at
+/// or below which an entry qualifies for a keeper reward). `0` means "only
+/// entries already at/past `SCORE_TTL_THRESHOLD`", matching
+/// `get_expiring_entries`'s existing "due" definition. Admin/governance may
+/// widen this via `set_keeper_reward_params` up to `SCORE_TTL_THRESHOLD` to
+/// pay keepers for renewing somewhat earlier.
+pub const DEFAULT_KEEPER_REWARD_WINDOW: u32 = 0;
+
+/// Hard ceiling on the per-entry keeper reward, regardless of what
+/// governance configures — bounds worst-case pool drain per call even if a
+/// governance parameter is mis-set.
+pub const MAX_KEEPER_REWARD_PER_ENTRY: i128 = 1_000_000_000;
+
 /// Maximum number of concurrently pending parameter-change proposals.
 pub const MAX_PENDING_PARAMETER_PROPOSALS: u32 = 10;
 
