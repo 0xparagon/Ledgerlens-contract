@@ -61,6 +61,8 @@ mod test_storage_contracts;
 mod test_ttl_rent_manager;
 #[cfg(test)]
 mod test_keeper_rewards;
+#[cfg(test)]
+mod test_relay_attestation;
 
 #[cfg(test)]
 mod test_invariants;
@@ -263,11 +265,11 @@ pub use types::{
     ModelVersionStatus, NormalizedSubmission, OperatorScoreExport, ParamChangeProposal, ParamValue,
     ParameterProposal, ParameterProposalRecord, ParameterProposalStatus, PendingConfigExportEntry,
     PendingScoreEntry, Policy, PolicyApproval, PolicyBundle, PolicyBundleProposal,
-    PublicScoreExport, RiskScore, ScoreAttestation, ScoreAttestationInput, ScoreDispute,
-    ScoreFloorPolicy, ScoreHistogram, ScoreQuery, ScoreSubmission, ScoreSubmissionWithProof,
-    ScoreTrend, ScoreVelocityCap, SignerAccuracyRecord, SignerState, SignerStateRecord,
-    SubmissionProvenance, ThresholdAttestation, TierBounds, TokenBucket, UpgradeProposal,
-    WelfordCorrState,
+    PublicScoreExport, RelayScoreAttestation, RiskScore, ScoreAttestation, ScoreAttestationInput,
+    ScoreDispute, ScoreFloorPolicy, ScoreHistogram, ScoreQuery, ScoreSubmission,
+    ScoreSubmissionWithProof, ScoreTrend, ScoreVelocityCap, SignerAccuracyRecord, SignerState,
+    SignerStateRecord, SubmissionProvenance, ThresholdAttestation, TierBounds, TokenBucket,
+    UpgradeProposal, WelfordCorrState,
 };
 /// The 32-byte all-zeros field element used as the value in non-membership proofs.
 pub use verkle::NON_MEMBER_SENTINEL;

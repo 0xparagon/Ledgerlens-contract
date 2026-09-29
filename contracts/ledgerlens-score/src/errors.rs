@@ -158,6 +158,9 @@ impl Error {
     /// the past, or the attestation's `contract_version` no longer matches —
     /// i.e. the attestation is no longer safe to relay.
     pub const StaleAttestation: Error = Error::InvalidAttestation;
+    /// Returned when the relayer-tip token has not been configured via
+    /// `set_relay_tip_token`.
+    pub const RelayTipTokenNotSet: Error = Error::FeeTokenNotSet;
 
     // ── Prepaid gate-query credits ──────────────────────────────────────────
     /// Returned when `deposit_gate_credits`/`withdraw_gate_credits_request`
