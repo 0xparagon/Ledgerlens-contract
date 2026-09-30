@@ -13,9 +13,9 @@ use crate::types::{
     HllSketch, InterpolationMethod, JumpStats, ModelVersionStats, ModelVersionStatus,
     PairVolatilityState, ParamChangeProposal, ParameterProposalRecord, ParameterProposalStatus,
     PendingScoreEntry, Policy, PolicyApproval, PolicyBundleProposal, RateLimitOverrideEntry,
-    RiskScore, ScoreDispute, ScoreFloorPolicy, ScoreHistogram, ScoreTrend, ScoreVelocityCap,
-    SignerAccuracyRecord, SignerStateRecord, SubscorePayload, TokenBucket, UpgradeProposal,
-    WelfordCorrState,
+    RiskScore, ScoreChangeHook, ScoreDispute, ScoreFloorPolicy, ScoreHistogram, ScoreHookDataKey,
+    ScoreTrend, ScoreVelocityCap, SignerAccuracyRecord, SignerStateRecord, SubscorePayload,
+    TokenBucket, UpgradeProposal, WelfordCorrState,
 };
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -3087,6 +3087,36 @@ pub fn set_gate_query_fee(env: &Env, amount: i128) {
 
 pub fn get_accumulated_fees(env: &Env) -> i128 {
     env.storage().instance().get(&GateDataKey::AccumulatedFees).unwrap_or(0)
+}
+
+pub fn get_score_change_hooks(env: &Env) -> Vec<ScoreChangeHook> {
+    env.storage()
+        .instance()
+        .get(&ScoreHookDataKey::Registry)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn set_score_change_hooks(env: &Env, hooks: &Vec<ScoreChangeHook>) {
+    env.storage().instance().set(&ScoreHookDataKey::Registry, hooks);
+}
+
+pub fn get_score_hook_failure_threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&ScoreHookDataKey::FailureThreshold)
+        .unwrap_or(crate::constants::DEFAULT_SCORE_HOOK_FAILURE_THRESHOLD)
+}
+
+pub fn set_score_hook_failure_threshold(env: &Env, threshold: u32) {
+    env.storage().instance().set(&ScoreHookDataKey::FailureThreshold, &threshold);
+}
+
+pub fn is_score_hook_dispatching(env: &Env) -> bool {
+    env.storage().instance().get(&ScoreHookDataKey::Dispatching).unwrap_or(false)
+}
+
+pub fn set_score_hook_dispatching(env: &Env, dispatching: bool) {
+    env.storage().instance().set(&ScoreHookDataKey::Dispatching, &dispatching);
 }
 
 pub fn set_arch_owner(env: &Env, owner: &Address) {

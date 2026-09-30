@@ -143,4 +143,10 @@ impl Error {
     /// `Policy::DataDeletion`, which is configured via
     /// `set_deletion_approval_policy` instead.
     pub const InvalidPolicy: Error = Error::InvalidThreshold;
+
+    // ── Consumer score hooks (#1129) ────────────────────────────────────────
+    pub const ScoreHookLimitReached: Error = Error::ServiceSetFull;
+    pub const ScoreHookAlreadyRegistered: Error = Error::AlreadyInitialized;
+    pub const ScoreHookNotRegistered: Error = Error::ScoreNotFound;
+    pub const ScoreHookDispatchInProgress: Error = Error::ContractPaused;
 }
