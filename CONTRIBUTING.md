@@ -67,7 +67,97 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --target wasm32-unknown-unknown --release
+cargo vet
 ```
+
+## Dependency Audits (cargo-vet)
+
+We use [`cargo-vet`](https://mozilla.github.io/cargo-vet/) to record which dependencies a human
+has actually read, and to import trusted third-party audit sets so we only review what nobody
+else has. The configuration lives in [`supply-chain/`](supply-chain/) and the `cargo-vet` CI job
+fails the build when a new, unaudited dependency is added to a contract crate.
+
+### Criteria
+
+We use two criteria, and the distinction matters:
+
+- **`safe-to-deploy`** — required for every crate linked into the WASM contract. These crates run
+  on-chain, so a bug is a deployed bug. This is the stricter bar.
+- **`safe-to-run`** — sufficient for dev-only and tooling crates (test helpers, `tools/replay`,
+  build scripts). These never ship in the WASM, so the bar is lower.
+
+### Trusted import sources
+
+Rather than auditing everything ourselves, we import audit sets from projects we trust. The
+sources are declared in `supply-chain/config.toml` under `[imports.*]`:
+
+- `mozilla` — Mozilla's audit set, broad coverage of the Rust ecosystem.
+- `bytecode-alliance` — audits from the Bytecode Alliance, which maintains the WASM toolchain
+  crates we depend on.
+- `google` — Google's audit set, covering common crates in the ecosystem.
+
+Imports are only trusted for the criteria they were written against; a `safe-to-run` import does
+not satisfy `safe-to-deploy` for a WASM-linked crate.
+
+### Adding or renewing an audit
+
+When `cargo vet` reports an unaudited crate, pick the option that matches the situation:
+
+1. **Import it.** If a trusted source already audits the crate, add the source to
+   `[imports.*]` in `supply-chain/config.toml` and re-run `cargo vet`. Prefer this — it costs us
+   nothing and keeps our own audit list small.
+2. **Audit it.** Read the crate and record the audit:
+   ```bash
+   cargo vet certify <crate> <version>
+   ```
+   This writes an entry to `supply-chain/audits.toml` with your name and the criteria you
+   certified. Only certify criteria you have actually verified.
+3. **Exempt it.** If the crate is low-risk and not worth a full audit, record a time-boxed
+   exemption:
+   ```bash
+   cargo vet add-exemption <crate> <version>
+   ```
+   Then edit the generated entry in `supply-chain/config.toml` to add a `notes` field with the
+   rationale and an owner, and set `suggested-date` to a review-by date no more than 12 months
+   out. Exemptions are a debt, not a solution — every entry needs a rationale and an owner, and
+   the list is reviewed when it comes due.
+
+### Example: adding a new dependency
+
+Say you add `hex = "0.4"` to `contracts/ledgerlens-score/Cargo.toml` and it is linked into the
+WASM. `cargo vet` will fail with an unaudited crate. Work through the options above:
+
+```bash
+# 1. See what is missing and whether an import already covers it.
+cargo vet
+
+# 2a. If a trusted source covers it, add the import to supply-chain/config.toml
+#     under [imports.<source>] and re-run:
+cargo vet
+
+# 2b. Otherwise audit it yourself (this records safe-to-deploy for hex 0.4.x):
+cargo vet certify hex 0.4.3
+
+# 3. Or, if it is genuinely low-risk, exempt it with a rationale and review-by date:
+cargo vet add-exemption hex 0.4.3
+#    then edit supply-chain/config.toml to add notes + suggested-date.
+```
+
+Commit the updated `supply-chain/` files with your change. The `cargo-vet` CI job re-runs on the
+PR and will pass once every crate in the tree is covered by an import, an audit, or a documented
+exemption.
+
+### Exemption report
+
+Every exemption in `supply-chain/config.toml` carries an owner and a review-by date in its
+`notes`/`suggested-date` fields. To list the current exemptions and their owners:
+
+```bash
+cargo vet --locked 2>/dev/null; grep -A4 '\[exemptions\]' supply-chain/config.toml
+```
+
+Keep this list as short as possible: prefer an import or a real audit over an exemption, and
+renew or remove each exemption before its review-by date.
 
 ## Guidelines
 

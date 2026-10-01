@@ -14,6 +14,28 @@ members = [
     "tests/composability",
 ]
 
+[workspace.metadata.vet]
+# cargo-vet configuration for the LedgerLens dependency tree.
+#
+# Criteria:
+#   safe-to-deploy  -> crates linked into the WASM contract artifacts
+#                      (contracts/* and their transitive dependencies).
+#   safe-to-run     -> dev-only, tooling and test crates that never ship
+#                      inside a contract (tools/*, tests/*, dev-dependencies).
+#
+# Trusted audit import sources (documented in supply-chain/README.md):
+#   - bytecodealliance (https://github.com/bytecodealliance/wasmtime)
+#   - google            (https://github.com/google/supply-chain)
+#   - mozilla           (https://github.com/mozilla/supply-chain)
+#   - embarkstudios     (https://github.com/embarkstudios/cargo-vet)
+#
+# Run `cargo vet` locally; CI enforces this via the supply-chain job.
+[workspace.metadata.vet.trusted]
+bytecodealliance = "https://github.com/bytecodealliance/wasmtime"
+google = "https://github.com/google/supply-chain"
+mozilla = "https://github.com/mozilla/supply-chain"
+embarkstudios = "https://github.com/embarkstudios/cargo-vet"
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
