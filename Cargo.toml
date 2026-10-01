@@ -10,6 +10,7 @@ members = [
     "tools/recovery",
     "tools/schema-gen",
     "tools/invocation-fuzzer",
+    "tools/wasm-allowlist",
     "tests/composability",
 ]
 
