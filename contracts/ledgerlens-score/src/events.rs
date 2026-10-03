@@ -1004,3 +1004,86 @@ pub fn reconciliation_verified(
         ),
     );
 }
+
+// ── Keeper TTL reward pool ───────────────────────────────────────────────────
+
+pub fn keeper_reward_pool_funded(env: &Env, funder: &Address, amount: i128, new_balance: i128) {
+    env.events()
+        .publish((symbol_short!("kp_fund"), EVENT_VERSION), (funder.clone(), amount, new_balance));
+}
+
+pub fn keeper_reward_params_set(env: &Env, per_entry: i128, window: u32, per_ledger_cap: i128) {
+    env.events()
+        .publish((symbol_short!("kp_parm"), EVENT_VERSION), (per_entry, window, per_ledger_cap));
+}
+
+pub fn keeper_reward_paid(env: &Env, keeper: &Address, renewed: u32, reward_paid: i128) {
+    env.events()
+        .publish((symbol_short!("kp_paid"), EVENT_VERSION), (keeper.clone(), renewed, reward_paid));
+}
+
+// ── Permissionless attested relay ────────────────────────────────────────────
+
+pub fn relay_accepted(env: &Env, relayer: &Address, wallet: &Address, asset_pair: &Symbol) {
+    env.events().publish(
+        (symbol_short!("rl_acpt"), EVENT_VERSION),
+        (relayer.clone(), wallet.clone(), asset_pair.clone()),
+    );
+}
+
+pub fn relay_duplicate_noop(env: &Env, relayer: &Address) {
+    env.events().publish((symbol_short!("rl_dup"), EVENT_VERSION), relayer.clone());
+}
+
+pub fn relay_tip_paid(env: &Env, relayer: &Address, amount: i128) {
+    env.events().publish((symbol_short!("rl_tip"), EVENT_VERSION), (relayer.clone(), amount));
+}
+
+// ── Prepaid gate-query credits ───────────────────────────────────────────────
+
+pub fn gate_credit_deposited(env: &Env, depositor: &Address, amount: i128, new_balance: i128) {
+    env.events().publish(
+        (symbol_short!("gc_dep"), EVENT_VERSION),
+        (depositor.clone(), amount, new_balance),
+    );
+}
+
+pub fn gate_credit_withdrawal_requested(
+    env: &Env,
+    depositor: &Address,
+    amount: i128,
+    unlock_at: u64,
+) {
+    env.events().publish(
+        (symbol_short!("gc_wreq"), EVENT_VERSION),
+        (depositor.clone(), amount, unlock_at),
+    );
+}
+
+pub fn gate_credit_withdrawn(env: &Env, depositor: &Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("gc_wdrw"), EVENT_VERSION), (depositor.clone(), amount));
+}
+
+pub fn gate_credit_revenue_withdrawn(env: &Env, recipient: &Address, amount: i128) {
+    env.events()
+        .publish((symbol_short!("gc_rev"), EVENT_VERSION), (recipient.clone(), amount));
+}
+
+// ── Tiered gate fee schedule ──────────────────────────────────────────────────
+
+pub fn fee_tier_schedule_set(env: &Env, tier_count: u32) {
+    env.events().publish((symbol_short!("ft_sched"), EVENT_VERSION), tier_count);
+}
+
+pub fn fee_exemption_set(env: &Env, consumer: &Address, expires_at: u64, reason_code: u32) {
+    env.events().publish(
+        (symbol_short!("ft_exempt"), EVENT_VERSION),
+        (consumer.clone(), expires_at, reason_code),
+    );
+}
+
+pub fn gate_query_metered(env: &Env, consumer: &Address, fee_charged: i128) {
+    env.events()
+        .publish((symbol_short!("gq_meter"), EVENT_VERSION), (consumer.clone(), fee_charged));
+}
