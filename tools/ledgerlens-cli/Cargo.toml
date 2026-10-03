@@ -1,0 +1,29 @@
+[package]
+name = "ledgerlens-cli"
+version = "0.1.0"
+ edition = "2021"
+description = "Unified operator CLI for LedgerLens: reads, governance, health, drift and exports"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "ledgerlens"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+
+# Shared crates: reuse types and codecs instead of duplicating them.
+ledgerlens-score = { path = "../../contracts/ledgerlens-score" }
+ledgerlens-shared = { path = "../../crates/ledgerlens-shared" }
+ledgerlens-signer = { path = "../../crates/ledgerlens-signer" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
