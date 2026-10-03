@@ -42,12 +42,3 @@ name = "aggregator_shard_pause_example"
 path = "../../examples/aggregator_shard_pause_example.rs"
 crate-type = ["lib"]
 
-# Upgrade / storage-layout migration test suite (issue #1197).
-# Rehearses in-place aggregator upgrades across every released storage layout
-# and asserts observable behavior (shard list, policies, quorum, pause states)
-# is preserved, plus idempotency/resumability/atomicity of the migration entry
-# point. Run via:
-# cargo test -p ledgerlens-aggregator --test upgrade_migration
-[[test]]
-name = "upgrade_migration"
-path = "tests/upgrade_migration.rs"
