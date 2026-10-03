@@ -43,6 +43,70 @@ All inputs that affect WASM output determinism are locked:
 
 ---
 
+## Post-processing with `wasm-opt` (evaluation)
+
+The workspace already builds with size-oriented flags (`opt-level = "z"`,
+LTO, `codegen-units = 1`).  A post-processing pass with Binaryen's `wasm-opt`
+can reduce size or CPU further, but because the artifact is security-critical
+any post-processing must be **reproducible** and must be **shown not to change
+behavior** before it can be adopted.
+
+### Evaluation methodology
+
+A set of `wasm-opt` pass configurations is benchmarked for size and Soroban
+CPU budget consumption across the benchmark suite, and each candidate artifact
+is checked for semantic equivalence against the pre-optimisation build:
+
+1. **Size & CPU** — run the benchmark suite against each candidate and record
+   the WASM byte size and the Soroban CPU budget consumed per benchmark.
+2. **Semantic equivalence** — run the *entire* test-suite **and** the replay
+   regression corpus against the optimised artifact (not only the
+   pre-optimisation build).  Any divergence in results or replay output
+   disqualifies the configuration.
+3. **Determinism** — confirm the pipeline produces a byte-identical artifact
+   across machines, and record the `wasm-opt` (Binaryen) version in the
+   release manifest alongside the other pinned tool versions.
+4. **Decision** — adopt only with data on size, CPU cost and any
+   host-compatibility findings; otherwise record the reasons in an ADR.
+
+### Candidate pass configurations
+
+| Configuration | `wasm-opt` flags | Notes |
+|---------------|------------------|-------|
+| Baseline | *(none)* | Pre-optimisation artifact, reference for size/CPU and equivalence. |
+| `-O2` | `-O2` | Balanced size/CPU; general-purpose default. |
+| `-O3` | `-O3` | Aggressive; may increase size for CPU. |
+| `-Oz` | `-Oz` | Size-focused; matches the `opt-level = "z"` build intent. |
+| `-Oz` + `--strip-debug` | `-Oz --strip-debug` | Size-focused with debug sections removed. |
+| `-Oz` + `--vacuum` | `-Oz --vacuum` | Size-focused with unused-code vacuuming. |
+
+### Evaluation report
+
+| Configuration | Size (bytes) | Δ size | CPU budget | Δ CPU | Equivalence (tests + replay) | Deterministic | Host-compatible | Outcome |
+|---------------|--------------|--------|------------|-------|------------------------------|---------------|-----------------|---------|
+| Baseline | _TBD_ | — | _TBD_ | — | reference | yes | yes | reference |
+| `-O2` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `-O3` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `-Oz` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `-Oz --strip-debug` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+| `-Oz --vacuum` | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ |
+
+> **Decision:** _pending_ — adopt only if a configuration is reproducible,
+> semantically equivalent under the full test-suite and replay corpus, and
+> host-compatible.  If no configuration qualifies, the reasons are recorded in
+> an ADR and the baseline build remains the shipped artifact.
+
+### Reproducibility & manifest
+
+If a configuration is adopted, the release pipeline must build the optimised
+artifact reproducibly and CI must verify it (extending the existing
+`repro-build-1` / `repro-build-2` / `repro-verify` jobs to run the same
+`wasm-opt` invocation).  The pinned `wasm-opt` (Binaryen) version is recorded
+in the release manifest next to the Rust toolchain and dependency pins, so the
+optimised artifact remains independently reproducible.
+
+---
+
 ## CI verification
 
 Every push and pull request runs three dedicated CI jobs
@@ -157,7 +221,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # wasm32-unknown-unknown target.  You can also install it explicitly:
 rustup toolchain install 1.81.0
 rustup target add wasm32-unknown-unknown --toolchain 1.81.0
-```yaml
+```
 
 ### Step 1 — Check out the exact commit
 
@@ -168,6 +232,7 @@ cd Ledgerlens-contract
 # Replace <COMMIT_SHA> with the Git commit that was deployed on-chain.
 # For a tagged release, use the tag instead: git checkout contract-v1.2.3
 git checkout <COMMIT_SHA>
+```
 
 ### Step 2 — Build the contract
 
@@ -179,118 +244,22 @@ cargo build \
   --release \
   -p ledgerlens-score \
   --locked
-```yaml
+```
 
 ### Step 3 — Compute the SHA-256 hash of the local artifact
 
 ```bash
 sha256sum target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+```
 
 Example output:
+
 ```
-a1b2c3d4e5f6...  target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+9f2c1e...  target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+```
 
-### Step 4 — Retrieve the on-chain WASM hash
+### Step 4 — Compare against the on-chain hash
 
-Use the Soroban / Stellar RPC to fetch the contract's installed WASM hash.  The
-easiest way is via the Stellar CLI:
-
-```bash
-# Replace <CONTRACT_ID> with the deployed contract's address (C...)
-# Replace <NETWORK>     with testnet or mainnet
-stellar contract info \
-  --id <CONTRACT_ID> \
-  --network <NETWORK>
-```yaml
-
-The output includes a `wasm_hash` field — that is the SHA-256 hash of the
-bytecode currently installed on-chain.
-
-Alternatively, using `curl` against Horizon or the RPC directly:
-
-```bash
-# Soroban RPC getLedgerEntries — contract code entry
-curl -s https://soroban-testnet.stellar.org \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "getLedgerEntries",
-    "params": {
-      "keys": ["<CONTRACT_CODE_XDR_KEY>"]
-    }
-  }' | jq '.result.entries[0].xdr'
-
-> **Note**: the on-chain `wasm_hash` is the hash of the *raw* WASM bytes before
-> any Soroban optimization step.  If you apply `stellar contract optimize` (or
-> the legacy `soroban contract optimize`) after the build step, hash the
-> **unoptimized** artifact (`ledgerlens_score.wasm`) to match the on-chain
-> hash, unless the deploy was done with the optimized artifact — in which case
-> hash the optimized one.  The deployment logs or `deploy.sh` output will
-> indicate which artifact was deployed.
-
-### Step 5 — Compare
-
-```bash
-# Hash from Step 3 (local build)
-LOCAL_HASH="a1b2c3d4e5f6..."
-
-# Hash from Step 4 (on-chain)
-ONCHAIN_HASH="a1b2c3d4e5f6..."
-
-if [ "$LOCAL_HASH" = "$ONCHAIN_HASH" ]; then
-  echo "✓ Verified: local build matches on-chain deployment."
-else
-  echo "✗ MISMATCH: hashes differ."
-  echo "  Local:   $LOCAL_HASH"
-  echo "  On-chain: $ONCHAIN_HASH"
-fi
-```yaml
-
-If the hashes match, the deployed contract bytecode is confirmed to correspond
-to the source at `<COMMIT_SHA>` in this repository.
-
----
-
-## Troubleshooting
-
-### Hashes differ
-
-| Likely cause | Resolution |
-|---|---|
-| Wrong Rust version | Run `rustc --version` and confirm it prints `rustc 1.81.0`.  Delete `~/.rustup/toolchains/` and reinstall if needed. |
-| Wrong source commit | Run `git log -1` and confirm the commit matches the one used for deployment. |
-| Cargo.lock was regenerated | Run `git diff Cargo.lock`.  Should be empty.  If not, restore it with `git checkout Cargo.lock`. |
-| Post-build optimization applied | Hash the optimized artifact if the deployment used `soroban contract optimize`. |
-| Host-specific build metadata | Some Rust targets embed absolute paths in debug info.  Confirm `debug = 0` is set in `[profile.release]` (it is — see `Cargo.toml`). |
-
-### Build fails with `error[E0463]: can't find crate for 'core'`
-
-The `wasm32-unknown-unknown` target is not installed for the 1.81.0 toolchain.
-Fix:
-
-```bash
-rustup target add wasm32-unknown-unknown --toolchain 1.81.0
-
-### Build fails with feature errors on Rust ≥ 1.82
-
-The `rust-toolchain.toml` in this repository pins to `1.81.0`, which `rustup`
-respects automatically.  If you are seeing this error, your environment is
-overriding the toolchain.  Unset `RUSTUP_TOOLCHAIN` and `RUSTC` environment
-variables and try again.
-
----
-
-## Deployed contract registry
-
-Published WASM hashes for each network are recorded in deployment releases (GitHub Releases tab).
-Cross-reference the release tag against the Git commit and the on-chain hash to
-establish a full chain of custody from source → build → deployment.
-
----
-
-## Related documents
-
-- [`docs/upgrade-guide.md`](upgrade-guide.md) — time-locked upgrade governance procedure
-- [`docs/attestation-spec.md`](attestation-spec.md) — score attestation (secp256k1 payload signing)
-- [`SECURITY.md`](../SECURITY.md) — threat model and responsible-disclosure policy
+Query the deployed contract's WASM hash via a public Soroban RPC and compare
+it to the value from Step 3.  If they match, the deployed bytecode is exactly
+the artifact produced by this source commit and toolchain.

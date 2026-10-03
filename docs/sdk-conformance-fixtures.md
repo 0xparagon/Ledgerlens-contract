@@ -58,6 +58,148 @@ increase `max_staleness_secs` only under an incident policy. For risk-policy
 rollback, switch from `fail_open` back to the default `fail_closed` once the
 oracle is healthy.
 
+## Generated TypeScript Client
+
+The first-party TypeScript client is generated from the same schema artifacts
+that drive the Rust and Python SDKs (`tools/schema-gen`), so all three SDKs
+share one source of truth for the observable contract. The generated package
+must satisfy the fixtures above before it is published.
+
+### Generation
+
+- Typed bindings are generated for every public function and type exposed by
+the schema artifacts, including event decoders and error mapping.
+- The generated output is checked in and regenerated in CI; a drift check fails
+the build if the committed bindings do not match the schema artifacts.
+- CI runs the generated client against `tests/composability/sdk_conformance_fixtures.json`
+  so the TypeScript SDK is verified against the same conformance fixtures as the
+  Rust and Python SDKs.
+
+### Read helpers
+
+- Score reads expose staleness helpers so callers can distinguish a fresh score
+  from a stale one without re-implementing the freshness math.
+- Gate helpers wrap the LedgerLens gate call and return the explicit fixture
+  outcomes (`allow`, `reject_high_risk`, `reject_low_confidence`,
+  `reject_stale`, `oracle_unavailable`, `unsupported_version`).
+- Pagination iterators are provided for list-style reads so integrators do not
+  hand-roll cursor handling.
+
+### Fail-closed decision helpers
+
+The TypeScript client mirrors the Rust consumer crate's fail-closed decision
+helpers. Transport failure is never reported as low risk: the default policy is
+`fail_closed`, and `fail_open` is only honored when configuration explicitly
+selects availability over risk freshness. Risk rejections remain distinct from
+operational failures, matching the outcome table above.
+
+### Publishing and provenance
+
+The package is published to npm from CI using provenance attestation, so the
+published package's provenance can be verified from the registry. The release
+process is tied to contract interface versions, and each release records the
+contract interface version it was generated from.
+
+### Version compatibility
+
+| Client | Contract interface | Behavior |
+| --- | --- | --- |
+| `required_oracle_version = 0` | Any | Compatibility mode; no version floor enforced. |
+| `required_oracle_version > 0` | `>= required_oracle_version` | Normal operation. |
+| `required_oracle_version > 0` | `< required_oracle_version` | Reject with `unsupported_version`. |
+
+New clients against old contracts must either run with the compatibility
+setting or reject with `unsupported_version`; they must not guess by treating a
+failed version probe as safe.
+
+### Quickstart
+
+1. Install the generated package from npm.
+2. Configure the LedgerLens contract ID, admin, and the desired failure policy
+   (`fail_closed` by default).
+3. Use the generated read helpers to fetch a score and check staleness, then
+   call the gate helper to obtain an explicit decision outcome.
+4. Run the conformance fixtures locally to confirm the client matches the
+   observable contract before deploying.
+
+## Generated Python Client
+
+The first-party Python client is generated from the same schema artifacts that
+drive the Rust and TypeScript SDKs (`tools/schema-gen`), so all three SDKs share
+one source of truth for the observable contract. The generated package must
+satisfy the fixtures above before it is published.
+
+### Generation
+
+- Dataclass-based models, error enums, and a client wrapper are generated for
+  every public function and type exposed by the schema artifacts, including
+  event decoders and error mapping.
+- The generated output ships full type stubs with a `py.typed` marker so the
+  package is usable under strict mypy, and it targets the supported Python
+  versions.
+- The generated output is checked in and regenerated in CI; a drift check fails
+  the build if the committed bindings do not match the schema artifacts.
+- CI runs the generated client against `tests/composability/sdk_conformance_fixtures.json`
+  so the Python SDK is verified against the same conformance fixtures as the
+  Rust and TypeScript SDKs.
+
+### Canonical encoding
+
+- Attestation payloads are encoded canonically so the off-chain service and the
+  chain agree byte-for-byte; the encoding is validated against the shared
+  cross-language fixtures, including negative vectors.
+- Cross-language attestation vectors verify identically in Rust, TypeScript and
+  Python.
+
+### Read helpers
+
+- Score reads expose staleness helpers so callers can distinguish a fresh score
+  from a stale one without re-implementing the freshness math.
+- Gate helpers wrap the LedgerLens gate call and return the explicit fixture
+  outcomes (`allow`, `reject_high_risk`, `reject_low_confidence`,
+  `reject_stale`, `oracle_unavailable`, `unsupported_version`).
+- Pagination iterators are provided for list-style reads so integrators do not
+  hand-roll cursor handling.
+
+### Fail-closed decision helpers
+
+The Python client mirrors the Rust consumer crate's fail-closed decision
+helpers. Transport failure is never reported as low risk: the default policy is
+`fail_closed`, and `fail_open` is only honored when configuration explicitly
+selects availability over risk freshness. Risk rejections remain distinct from
+operational failures, matching the outcome table above.
+
+### Publishing and provenance
+
+The package is published to PyPI from CI using trusted publishing, so the
+published package's provenance can be verified from the registry. The release
+workflow is validated in a dry run before publishing. The release process is
+tied to contract interface versions, and each release records the contract
+interface version it was generated from.
+
+### Version compatibility
+
+| Client | Contract interface | Behavior |
+| --- | --- | --- |
+| `required_oracle_version = 0` | Any | Compatibility mode; no version floor enforced. |
+| `required_oracle_version > 0` | `>= required_oracle_version` | Normal operation. |
+| `required_oracle_version > 0` | `< required_oracle_version` | Reject with `unsupported_version`. |
+
+New clients against old contracts must either run with the compatibility
+setting or reject with `unsupported_version`; they must not guess by treating a
+failed version probe as safe.
+
+### Quickstart
+
+1. Install the generated package from PyPI.
+2. Configure the LedgerLens contract ID, admin, and the desired failure policy
+   (`fail_closed` by default).
+3. Use the generated read helpers to fetch a score and check staleness, then
+   call the gate helper to obtain an explicit decision outcome.
+4. Sign and submit an attested score using the canonical encoding helpers, then
+   run the conformance fixtures locally to confirm the client matches the
+   observable contract before deploying.
+
 ## PR Design Notes
 
 Trust assumptions: consumers trust the configured LedgerLens contract ID and

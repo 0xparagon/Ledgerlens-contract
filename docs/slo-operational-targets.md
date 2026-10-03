@@ -33,7 +33,26 @@ alert on.
 | Gate enforcement mode | `gate_enf` (strict mode) consistency | 100% — strict mode must not silently toggle off | Page on any `gate_enf` event | `events.rs:561` |
 | Pair-level pauses | Count of individually paused pairs (`is_pair_paused`) | < 5% of active pairs paused at any time outside incident response | Warn at 5%, page at 10% | `pr_pause` event |
 
-## 3. What "fail closed" means for these SLOs
+## 3. Event indexer freshness (reference indexer, #1212)
+
+The reference event indexer ingests Soroban RPC contract events into Postgres
+with reorg-safe cursors and backfill. Its health is measured by the same
+freshness discipline as scores: an indexer that silently falls behind is an
+outage even when the gate is up.
+
+| Indicator (SLI) | Definition | Objective (SLO) | Alert threshold | Source |
+|---|---|---|---|---|
+| Ledger lag | `latest_ledger - last_processed_ledger` | ≤ 5 ledgers for 99.5% of minutes/month | Warn at 5, page at 25 | `indexer_health.ledger_lag` |
+| Last processed ledger | `indexer_health.last_processed_ledger` monotonicity | Must advance every retention window; never regress | Page on regression or no advance for 2× poll interval | `indexer_health.last_processed_ledger` |
+| Gap count | Number of detected missed-ledger ranges not yet backfilled | 0 sustained; any open gap is an incident | Warn on first gap, page if unresolved past one retention window | `indexer_health.gap_count` |
+
+Retention-window awareness: Soroban RPC keeps limited history, so a gap that
+ages past the retention window can no longer be filled from RPC and must be
+backfilled from the archive source. The gap-count SLO is therefore bounded by
+the retention window — an unresolved gap approaching that boundary escalates
+from warn to page.
+
+## 4. What "fail closed" means for these SLOs
 
 Breaching a freshness SLO **must not** be silently absorbed by the contract —
 `is_service_alive() == false` and stale scores are expected to surface as
@@ -42,7 +61,7 @@ SLOs measure how quickly operators detect and respond to that fail-closed
 state; they do not relax it. See [`docs/errors.md`](errors.md) for the
 authoritative error semantics.
 
-## 4. Alert routing
+## 5. Alert routing
 
 Alerts on the above thresholds feed the severity classification in
 [`docs/incident-severity-classification.md`](incident-severity-classification.md)
