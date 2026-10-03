@@ -8,15 +8,19 @@ use mock_lending::{MockLending, MockLendingClient};
 use serde::{Deserialize, Serialize};
 use soroban_sdk::{
     testutils::{Address as _, EnvTestConfig, Events as _, Ledger as _},
-    Address, Env, IntoVal, Symbol, Val, Vec as SorobanVec,
+    Address, Env, IntoVal, Map as SorobanMap, String as SorobanString, Symbol, Val,
+    Vec as SorobanVec,
 };
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_OPERATIONS: usize = 16;
 pub const MAX_RAW_ARGUMENTS: usize = 8;
+pub const MAX_COLLECTION_ITEMS: usize = 9;
 pub const MAX_SYMBOL_BYTES: usize = 32;
 pub const MAX_WIRE_STRING_BYTES: usize = 64;
 pub const MAX_ENCODED_CAMPAIGN_BYTES: usize = 16 * 1024;
@@ -105,6 +109,10 @@ pub enum WireValue {
     U64(u64),
     Bool(bool),
     Symbol(String),
+    String(String),
+    Vec(Vec<WireValue>),
+    Map(Vec<(WireValue, WireValue)>),
+    Null,
 }
 
 mod i128_decimal {
@@ -271,9 +279,7 @@ pub fn validate_campaign(campaign: &Campaign) -> Result<usize> {
                     );
                 }
                 for arg in args {
-                    if let WireValue::Symbol(value) = arg {
-                        validate_wire_string(value)?;
-                    }
+                    validate_wire_value(arg, 0)?;
                 }
             }
             _ => {}
@@ -296,6 +302,31 @@ fn validate_wire_string(value: &str) -> Result<()> {
         bail!("wire string is {} bytes; maximum is {}", value.len(), MAX_WIRE_STRING_BYTES);
     }
     Ok(())
+}
+
+fn validate_wire_value(value: &WireValue, depth: usize) -> Result<()> {
+    if depth > 8 {
+        bail!("nested wire value exceeds maximum depth 8");
+    }
+    match value {
+        WireValue::Symbol(value) | WireValue::String(value) => validate_wire_string(value),
+        WireValue::Vec(values) => {
+            if values.len() > MAX_COLLECTION_ITEMS {
+                bail!("wire vector exceeds maximum length {MAX_COLLECTION_ITEMS}");
+            }
+            values.iter().try_for_each(|value| validate_wire_value(value, depth + 1))
+        }
+        WireValue::Map(entries) => {
+            if entries.len() > MAX_COLLECTION_ITEMS {
+                bail!("wire map exceeds maximum length {MAX_COLLECTION_ITEMS}");
+            }
+            entries.iter().try_for_each(|(key, value)| {
+                validate_wire_value(key, depth + 1)?;
+                validate_wire_value(value, depth + 1)
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn symbol(env: &Env, value: &str) -> Result<Symbol> {
@@ -330,18 +361,39 @@ fn raw_target<'a>(fixture: &'a Fixture<'_>, target: InvocationTarget) -> &'a Add
     }
 }
 
+fn wire_value_to_val(fixture: &Fixture<'_>, value: &WireValue) -> Result<Val> {
+    let env = &fixture.env;
+    let val = match value {
+        WireValue::Wallet => fixture.wallet.clone().into_val(env),
+        WireValue::I128(value) => value.into_val(env),
+        WireValue::U32(value) => value.into_val(env),
+        WireValue::U64(value) => value.into_val(env),
+        WireValue::Bool(value) => value.into_val(env),
+        WireValue::Symbol(value) => symbol(env, value)?.into_val(env),
+        WireValue::String(value) => SorobanString::from_str(env, value).into_val(env),
+        WireValue::Vec(values) => {
+            let mut items = SorobanVec::<Val>::new(env);
+            for value in values {
+                items.push_back(wire_value_to_val(fixture, value)?);
+            }
+            items.into_val(env)
+        }
+        WireValue::Map(entries) => {
+            let mut items = SorobanMap::<Val, Val>::new(env);
+            for (key, value) in entries {
+                items.set(wire_value_to_val(fixture, key)?, wire_value_to_val(fixture, value)?);
+            }
+            items.into_val(env)
+        }
+        WireValue::Null => Option::<Val>::None.into_val(env),
+    };
+    Ok(val)
+}
+
 fn raw_args(fixture: &Fixture<'_>, values: &[WireValue]) -> Result<SorobanVec<Val>> {
     let mut args = SorobanVec::new(&fixture.env);
     for value in values {
-        let val = match value {
-            WireValue::Wallet => fixture.wallet.clone().into_val(&fixture.env),
-            WireValue::I128(value) => value.into_val(&fixture.env),
-            WireValue::U32(value) => value.into_val(&fixture.env),
-            WireValue::U64(value) => value.into_val(&fixture.env),
-            WireValue::Bool(value) => value.into_val(&fixture.env),
-            WireValue::Symbol(value) => symbol(&fixture.env, value)?.into_val(&fixture.env),
-        };
-        args.push_back(val);
+        args.push_back(wire_value_to_val(fixture, value)?);
     }
     Ok(args)
 }
@@ -423,10 +475,38 @@ pub fn execute_campaign(campaign: &Campaign) -> Result<CampaignReport> {
                 .ok_or_else(|| anyhow!("raw argument counter overflow"))?;
         }
 
-        let outcome = match invoke(&fixture, operation) {
-            Ok(outcome) => outcome,
-            Err(error) => format!("harness_rejected:{error}"),
+        let outcome = match catch_unwind(AssertUnwindSafe(|| invoke(&fixture, operation))) {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => format!("harness_rejected:{error}"),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("non-string panic payload");
+                if let Operation::RawInvoke { function, .. } = operation {
+                    if is_read_entry(function) {
+                        bail!("panic in read entry point `{function}`: {message}");
+                    }
+                }
+                format!("harness_panic:{message}")
+            }
         };
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            ledgerlens_score::check_invariants_for_fuzz(&fixture.env)
+        })) {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string invariant panic");
+            bail!("contract invariant registry failure after operation {index}: {message}");
+        }
+        if let Operation::RawInvoke { function, .. } = operation {
+            if is_read_entry(function) && outcome.to_ascii_lowercase().contains("panic") {
+                bail!("panic reported by read entry point `{function}`: {outcome}");
+            }
+        }
 
         let after_score = score_fingerprint(&fixture);
         let after_events = fixture.env.events().all().len();
@@ -556,7 +636,140 @@ fn random_pair(rng: &mut XorShift64) -> String {
     VALUES[rng.index(VALUES.len())].to_owned()
 }
 
-fn random_operation(rng: &mut XorShift64) -> Operation {
+fn is_read_entry(name: &str) -> bool {
+    ["get_", "query_", "supports_", "is_", "peek_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+fn schema_read_functions(schema: &Value) -> Vec<&Value> {
+    schema
+        .get("functions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|function| {
+            function
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_read_entry)
+        })
+        .collect()
+}
+
+fn random_schema_value(schema: &Value, rng: &mut XorShift64, depth: usize) -> WireValue {
+    if depth > 6 {
+        return WireValue::U32(0);
+    }
+    if let Some(options) = schema.get("anyOf").and_then(Value::as_array) {
+        if options.is_empty() {
+            return WireValue::Null;
+        }
+        return random_schema_value(&options[rng.index(options.len())], rng, depth + 1);
+    }
+
+    let soroban_type = schema.get("x-soroban-type").and_then(Value::as_str).unwrap_or("");
+    match soroban_type {
+        "address" => return WireValue::Wallet,
+        "symbol" => return WireValue::Symbol(random_pair(rng)),
+        "string" => {
+            return match rng.index(5) {
+                0 => WireValue::String(String::new()),
+                1 => WireValue::String("x".to_owned()),
+                2 => WireValue::String("XLM_USDC".to_owned()),
+                3 => WireValue::String("duplicate".to_owned()),
+                _ => WireValue::String("x".repeat(MAX_WIRE_STRING_BYTES + 1)),
+            }
+        }
+        "u32" | "u64" | "i128" => {
+            let maximum = schema
+                .get("maximum")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(|| if soroban_type == "u32" { u32::MAX as u64 } else { u64::MAX });
+            let minimum = schema.get("minimum").and_then(Value::as_u64).unwrap_or(0);
+            let boundary = [0, minimum, maximum, maximum.saturating_add(1), u32::MAX as u64];
+            let value = boundary[rng.index(boundary.len())];
+            return match soroban_type {
+                "u32" if value <= u32::MAX as u64 => WireValue::U32(value as u32),
+                "i128" => WireValue::I128(value as i128),
+                "u64" if value == maximum && maximum == u64::MAX => {
+                    WireValue::I128((u64::MAX as i128) + 1)
+                }
+                _ if value <= u32::MAX as u64 => WireValue::U32(value as u32),
+                _ => WireValue::U64(value),
+            };
+        }
+        "vec" => {
+            let maximum = schema.get("maxItems").and_then(Value::as_u64).unwrap_or(8) as usize;
+            let size = [0, 1, maximum.saturating_add(1)][rng.index(3)];
+            let item_schema = schema.get("items").unwrap_or(&Value::Null);
+            let first = random_schema_value(item_schema, rng, depth + 1);
+            return WireValue::Vec((0..size).map(|_| first.clone()).collect());
+        }
+        "map" => {
+            let maximum = schema.get("maxProperties").and_then(Value::as_u64).unwrap_or(8) as usize;
+            let size = [0, 1, maximum.saturating_add(1)][rng.index(3)];
+            let value_schema = schema.get("additionalProperties").unwrap_or(&Value::Null);
+            let value = random_schema_value(value_schema, rng, depth + 1);
+            return WireValue::Map(
+                (0..size)
+                    .map(|_| (WireValue::Symbol("duplicate".to_owned()), value.clone()))
+                    .collect(),
+            );
+        }
+        _ => {}
+    }
+
+    match schema.get("type").and_then(Value::as_str).unwrap_or("") {
+        "null" => WireValue::Null,
+        "boolean" => WireValue::Bool(rng.index(2) == 1),
+        "integer" => {
+            let maximum = schema.get("maximum").and_then(Value::as_u64).unwrap_or(u32::MAX as u64);
+            let boundary = [0, maximum, maximum.saturating_add(1), u32::MAX as u64];
+            let value = boundary[rng.index(boundary.len())];
+            if value <= u32::MAX as u64 { WireValue::U32(value as u32) } else { WireValue::U64(value) }
+        }
+        "string" => WireValue::String("x".to_owned()),
+        "array" => {
+            let item_schema = schema.get("items").unwrap_or(&Value::Null);
+            if let Some(tuple_items) = item_schema.as_array() {
+                WireValue::Vec(
+                    tuple_items
+                        .iter()
+                        .map(|item| random_schema_value(item, rng, depth + 1))
+                        .collect(),
+                )
+            } else {
+                WireValue::Vec(vec![random_schema_value(item_schema, rng, depth + 1)])
+            }
+        }
+        _ => WireValue::U32(0),
+    }
+}
+
+fn random_schema_operation(schema: &Value, rng: &mut XorShift64) -> Option<Operation> {
+    let functions = schema_read_functions(schema);
+    if functions.is_empty() {
+        return None;
+    }
+    let function = functions[rng.index(functions.len())];
+    let name = function.get("name")?.as_str()?.to_owned();
+    let args = function
+        .get("inputs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|input| random_schema_value(input.get("schema").unwrap_or(&Value::Null), rng, 0))
+        .collect();
+    Some(Operation::RawInvoke { target: InvocationTarget::Score, function: name, args })
+}
+
+fn random_operation(rng: &mut XorShift64, abi_schema: Option<&Value>) -> Operation {
+    if rng.index(3) == 0 {
+        if let Some(operation) = abi_schema.and_then(|schema| random_schema_operation(schema, rng)) {
+            return operation;
+        }
+    }
     match rng.index(7) {
         0 => {
             const SCORES: [u32; 6] = [0, 74, 75, 100, 101, u32::MAX];
@@ -592,19 +805,24 @@ fn random_operation(rng: &mut XorShift64) -> Operation {
     }
 }
 
-fn mutate(parent: &Campaign, rng: &mut XorShift64, index: usize) -> Campaign {
+fn mutate(
+    parent: &Campaign,
+    rng: &mut XorShift64,
+    index: usize,
+    abi_schema: Option<&Value>,
+) -> Campaign {
     let mut child = parent.clone();
     child.name = format!("generated-{index}");
     child.seed = rng.next();
 
-    match rng.index(5) {
+    match rng.index(7) {
         0 if child.operations.len() < MAX_OPERATIONS => {
             let position = rng.index(child.operations.len() + 1);
-            child.operations.insert(position, random_operation(rng));
+            child.operations.insert(position, random_operation(rng, abi_schema));
         }
         1 if !child.operations.is_empty() => {
             let position = rng.index(child.operations.len());
-            child.operations[position] = random_operation(rng);
+            child.operations[position] = random_operation(rng, abi_schema);
         }
         2 if child.operations.len() > 1 => {
             let position = rng.index(child.operations.len());
@@ -615,14 +833,57 @@ fn mutate(parent: &Campaign, rng: &mut XorShift64, index: usize) -> Campaign {
             let second = rng.index(child.operations.len());
             child.operations.swap(first, second);
         }
+        4 if !child.operations.is_empty() => {
+            let position = rng.index(child.operations.len());
+            if let Operation::RawInvoke { function, args, .. } = &mut child.operations[position] {
+                if !args.is_empty() {
+                    let argument = rng.index(args.len());
+                    let replacement = abi_schema
+                        .and_then(|schema| {
+                            schema_read_functions(schema)
+                                .into_iter()
+                                .find(|candidate| {
+                                    candidate.get("name").and_then(Value::as_str)
+                                        == Some(function.as_str())
+                                })
+                        })
+                        .and_then(|candidate| candidate.get("inputs"))
+                        .and_then(Value::as_array)
+                        .and_then(|inputs| inputs.get(argument))
+                        .map(|input| {
+                            random_schema_value(
+                                input.get("schema").unwrap_or(&Value::Null),
+                                rng,
+                                0,
+                            )
+                        })
+                        .unwrap_or_else(|| random_wire_value(rng));
+                    args[argument] = replacement;
+                }
+            } else {
+                child.operations[position] = random_operation(rng, abi_schema);
+            }
+        }
         _ if !child.operations.is_empty() && child.operations.len() < MAX_OPERATIONS => {
             let position = rng.index(child.operations.len());
             let duplicate = child.operations[position].clone();
             child.operations.insert(position, duplicate);
         }
-        _ => child.operations.push(random_operation(rng)),
+        _ => child.operations.push(random_operation(rng, abi_schema)),
     }
     child
+}
+
+fn random_wire_value(rng: &mut XorShift64) -> WireValue {
+    match rng.index(6) {
+        0 => WireValue::Wallet,
+        1 => WireValue::U32(u32::MAX),
+        2 => WireValue::U64(u64::MAX),
+        3 => WireValue::I128(i128::MIN),
+        4 => WireValue::Bool(rng.index(2) == 1),
+        5 => WireValue::Symbol(random_pair(rng)),
+        _ => WireValue::String("XLM_USDC".to_owned()),
+    }
 }
 
 fn update_maximum(maximum: &mut ResourceReport, current: &ResourceReport) {
@@ -637,6 +898,26 @@ fn update_maximum(maximum: &mut ResourceReport, current: &ResourceReport) {
 }
 
 pub fn run_fuzz(corpus: Vec<Campaign>, seed: u64, cases: usize) -> Result<FuzzSummary> {
+    run_fuzz_with_abi(corpus, seed, cases, None)
+}
+
+pub fn run_fuzz_with_abi(
+    corpus: Vec<Campaign>,
+    seed: u64,
+    cases: usize,
+    abi_schema_path: Option<&Path>,
+) -> Result<FuzzSummary> {
+    let abi_schema = abi_schema_path
+        .map(|path| {
+            let bytes = fs::read(path).with_context(|| format!("reading ABI schema {}", path.display()))?;
+            let schema: Value = serde_json::from_slice(&bytes)
+                .with_context(|| format!("decoding ABI schema {}", path.display()))?;
+            if schema_read_functions(&schema).is_empty() {
+                bail!("ABI schema contains no supported read entry points");
+            }
+            Ok(schema)
+        })
+        .transpose()?;
     if cases == 0 || cases > MAX_CASES {
         bail!("cases must be within 1..={MAX_CASES}");
     }
@@ -668,7 +949,7 @@ pub fn run_fuzz(corpus: Vec<Campaign>, seed: u64, cases: usize) -> Result<FuzzSu
     let mut rng = XorShift64::new(seed);
     for index in 0..cases {
         let parent = queue[rng.index(queue.len())].clone();
-        let child = mutate(&parent, &mut rng, index);
+        let child = mutate(&parent, &mut rng, index, abi_schema.as_ref());
         let report = match replay_campaign(&child) {
             Ok(report) => report,
             Err(error) => {
@@ -685,8 +966,19 @@ pub fn run_fuzz(corpus: Vec<Campaign>, seed: u64, cases: usize) -> Result<FuzzSu
             }
         };
         update_maximum(&mut maximum, &report.resources);
-        let discovered = report.coverage().filter(|key| coverage.insert(key.clone())).count();
-        if discovered > 0 {
+        let discovered: Vec<Observation> = report
+            .coverage()
+            .filter(|key| coverage.insert(key.clone()))
+            .collect();
+        if !discovered.is_empty() {
+            for (signature_index, signature) in discovered.iter().enumerate() {
+                let minimized = shrink_campaign(child.clone(), |candidate| {
+                    replay_campaign(candidate).is_ok_and(|candidate_report| {
+                        candidate_report.coverage().any(|item| item == *signature)
+                    })
+                });
+                persist_regression_seed(&minimized, index, signature_index)?;
+            }
             queue.push(child);
         }
     }
@@ -699,6 +991,15 @@ pub fn run_fuzz(corpus: Vec<Campaign>, seed: u64, cases: usize) -> Result<FuzzSu
         behavior_signatures: coverage.len(),
         max_resources: maximum,
     })
+}
+
+fn persist_regression_seed(campaign: &Campaign, case: usize, signature: usize) -> Result<PathBuf> {
+    let directory = PathBuf::from("target/invocation-fuzzer/corpus");
+    fs::create_dir_all(&directory).with_context(|| format!("creating {}", directory.display()))?;
+    let path = directory.join(format!("coverage-{case:04}-{signature:02}.json"));
+    let bytes = serde_json::to_vec_pretty(campaign).context("encoding minimized corpus seed")?;
+    fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 pub fn shrink_campaign<F>(mut campaign: Campaign, mut still_fails: F) -> Campaign

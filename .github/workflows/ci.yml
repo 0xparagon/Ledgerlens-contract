@@ -633,6 +633,31 @@ jobs:
       - name: Replay bounded TLC behaviors against the Rust contract
         run: python3 tools/validate_tla_trace_replay.py --jar /tmp/tla2tools.jar
 
+  environment-smoke:
+    name: Development environment smoke check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
+      - name: Build devcontainer image
+        run: docker build -f .devcontainer/Dockerfile -t ledgerlens-dev .
+      - name: Check pinned tools inside the image
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace ledgerlens-dev bash -lc '
+            rustc --version | grep -F "${{ steps.tool-versions.outputs.contract-rust }}"
+            rustc +${{ steps.tool-versions.outputs.audit-rust }} --version
+            rustup target list --installed | grep -qx wasm32-unknown-unknown
+            stellar --version | grep -F "${{ steps.tool-versions.outputs.stellar-cli }}"
+            cargo-mutants --version | grep -F "${{ steps.tool-versions.outputs.cargo-mutants }}"
+            cargo-audit --version | grep -F "${{ steps.tool-versions.outputs.cargo-audit }}"
+            cargo-deny --version | grep -F "${{ steps.tool-versions.outputs.cargo-deny }}"
+            cargo-cyclonedx --version | grep -F "${{ steps.tool-versions.outputs.cargo-cyclonedx }}"
+            shellcheck --version | grep -F "${{ steps.tool-versions.outputs.shellcheck }}"
+            java -version 2>&1 | grep -F "${{ steps.tool-versions.outputs.java }}"
+            test -f "$TLA_TOOLS_JAR"
+          '
+
   # ── Required-check aggregator ───────────────────────────────────────────────
   # The ONLY status check branch protection should require. Skipped jobs
   # (path-filtered or event-conditional) count as success; any failure or
@@ -658,6 +683,7 @@ jobs:
       - repro-build-2
       - repro-verify
       - spec-model-check
+      - environment-smoke
     runs-on: ubuntu-latest
     steps:
       - name: Summarise job results

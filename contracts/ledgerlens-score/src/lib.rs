@@ -19,6 +19,12 @@ mod events;
 mod governance_actions;
 #[cfg(any(test, feature = "testutils"))]
 mod invariants;
+
+#[cfg(feature = "testutils")]
+pub fn check_invariants_for_fuzz(env: &soroban_sdk::Env) {
+    invariants::invariant_check(env);
+}
+
 /// Pure fee-tier computation for the tiered gate fee schedule; see
 /// `rent_relay_credits.rs` for where it's wired into `query_risk_gate_metered`.
 mod fee_schedule;
