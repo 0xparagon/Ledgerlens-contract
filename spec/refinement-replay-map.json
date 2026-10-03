@@ -1,0 +1,31 @@
+{
+  "model_constants": {
+    "COOLDOWN": 1,
+    "Actions": 1,
+    "RISK_THRESHOLD": 50
+  },
+  "abstract_state": {
+    "score": "storage::get_score",
+    "hwm": "storage::get_historical_max_score",
+    "breach_count": "storage::get_breach_count",
+    "last_submit_time": "storage::get_last_submit_time",
+    "tb_capacity": "storage::get_burst_capacity",
+    "RefillCount": "storage::get_token_bucket/storage::get_last_submit_time/storage::get_pair_cooldown_secs",
+    "now": "Env::ledger::timestamp",
+    "replay_paused": "storage::is_paused",
+    "GovProposalOpen": "storage::get_pending_upgrade",
+    "gov_proposed_at": "storage::get_pending_upgrade",
+    "gov_executed": "execute_upgrade",
+    "upg_live_signers": "storage::get_admin_set"
+  },
+  "actions": {
+    "TickTime": {"rust_entrypoint": "Env::ledger::timestamp"},
+    "Next": {"rust_entrypoint": "stutter"},
+    "SubmitScore": {"rust_entrypoint": "submit_score"},
+    "PauseContract": {"rust_entrypoint": "pause"},
+    "UnpauseContract": {"rust_entrypoint": "unpause"},
+    "MutateAdminSet": {"rust_entrypoint": "add_admin_signer/remove_admin_signer"},
+    "ProposeGov": {"rust_entrypoint": "propose_upgrade"},
+    "ExecuteGov": {"rust_entrypoint": "execute_upgrade"}
+  }
+}

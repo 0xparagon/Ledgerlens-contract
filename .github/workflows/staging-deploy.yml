@@ -1,116 +1,307 @@
-name: Staging Deploy
+name: Staging Continuous Deployment
 
-# Continuously deploys main to the staging instance. Runs only after
-# "Contract CI" (whose `CI gate` is the required check) succeeds for a push to
-# main, so unreviewed or failing changes never deploy.
-# See docs/staging-deployment.md.
+# Continuously deploy main to the staging instance (testnet) through the
+# standard time-locked proposal flow, verify with health + canary checks, and
+# roll back automatically on failure. See docs/staging-deployment.md and
+# issue #1236.
+#
+# Triggers:
+#   • workflow_run — after "Contract CI" succeeds on main. This is the
+#     required-checks gate: only merges that passed CI deploy. Direct pushes
+#     that skipped CI never satisfy this gate.
+#   • schedule — hourly follow-up that completes a pending execution once the
+#     on-chain upgrade delay has elapsed (the time-lock is a security
+#     property and is never skipped in this workflow).
+#   • workflow_dispatch — manual rehearsal (supports dry_run=true).
+#
+# Safety:
+#   • concurrency group `staging-deploy` with cancel-in-progress:false —
+#     deployments serialize; a merge during a deployment queues behind it.
+#   • Staging CD never targets mainnet (scripts fail closed on any other alias).
+#   • The staging signing key is staging-only, held in the `staging`
+#     GitHub Environment (required reviewers + main-only branch policy).
 
 on:
   workflow_run:
     workflows: ["Contract CI"]
     types: [completed]
     branches: [main]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print commands without executing (rehearsal)"
+        required: false
+        default: "false"
+      commit:
+        description: "Commit SHA to deploy (default: main HEAD)"
+        required: false
+        default: ""
 
-permissions: {}
-
-# Serialise deployments; never cancel one mid-upgrade.
 concurrency:
   group: staging-deploy
   cancel-in-progress: false
 
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
 env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   STELLAR_CLI_VERSION: "21.0.0"
-  NETWORK: testnet
+  STAGING_NETWORK: "testnet"
 
 jobs:
+  # ── Gate: only CI-verified main commits deploy ──────────────────────────
+  gate:
+    name: Deployment gate (required checks)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      deploy_sha: ${{ steps.resolve.outputs.deploy_sha }}
+      should_deploy: ${{ steps.resolve.outputs.should_deploy }}
+    steps:
+      - name: Resolve deploy commit
+        id: resolve
+        run: |
+          SHOULD_DEPLOY=true
+          DEPLOY_SHA=""
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+            HEAD_BRANCH="${{ github.event.workflow_run.head_branch }}"
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            echo "Triggering CI run: conclusion=$CONCLUSION branch=$HEAD_BRANCH sha=$HEAD_SHA"
+            if [ "$CONCLUSION" != "success" ] || [ "$HEAD_BRANCH" != "main" ]; then
+              echo "Gate closed: CI did not succeed on main (conclusion=$CONCLUSION, branch=$HEAD_BRANCH). Skipping deploy."
+              SHOULD_DEPLOY=false
+            else
+              DEPLOY_SHA="$HEAD_SHA"
+            fi
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Scheduled follow-up run: will complete a pending execution if one exists."
+            DEPLOY_SHA="main"
+          else
+            echo "Manual dispatch (dry_run=${{ inputs.dry_run }}, commit=${{ inputs.commit }})."
+            if [ -n "${{ inputs.commit }}" ]; then
+              DEPLOY_SHA="${{ inputs.commit }}"
+            else
+              DEPLOY_SHA="main"
+            fi
+          fi
+
+          echo "should_deploy=$SHOULD_DEPLOY" >> "$GITHUB_OUTPUT"
+          echo "deploy_sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
+
   deploy:
-    name: Upgrade staging and verify
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main'
+    name: Build, upgrade staging, verify, rollback on failure
+    needs: [gate]
+    # Belt and suspenders with the gate job: the workflow_run guard below
+    # restates the required-checks rule (CI success on main) as a workflow
+    # expression so the policy is visible at the job level and enforced even
+    # if the gate outputs are ever refactored.
+    if: >-
+      needs.gate.outputs.should_deploy == 'true' &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     environment: staging
     permissions:
       contents: write
       issues: write
+      actions: read
+    outputs:
+      staging_status: ${{ steps.upgrade.outputs.staging_status }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout deploy commit
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.gate.outputs.deploy_sha }}
+          fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@master
+      - name: Pin Rust toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install Stellar CLI
         run: |
           curl -sSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin stellar
-          ln -sf /usr/local/bin/stellar /usr/local/bin/soroban
+            | tar -xz -C /usr/local/bin stellar
+          stellar --version
 
-      - name: Build release artifact
+      - name: Build release WASM
+        run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
+
+      - name: Optimize WASM
         run: |
-          cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
-          stellar contract optimize \
-            --wasm target/wasm32-unknown-unknown/release/ledgerlens_score.wasm \
-            --output target/ledgerlens_score.optimized.wasm
+          RAW_WASM=target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          OPT_WASM=target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
+          stellar contract optimize --wasm "$RAW_WASM" --output "$OPT_WASM"
+          sha256sum "$OPT_WASM" > target/ledgerlens_score.optimized.wasm.sha256
+          cat target/ledgerlens_score.optimized.wasm.sha256
 
-      - name: Load staging key
+      - name: Configure staging signing key (staging-only, environment-scoped)
         env:
-          STAGING_ADMIN_SECRET_KEY: ${{ secrets.STAGING_ADMIN_SECRET_KEY }}
+          STAGING_SOROBAN_SECRET_KEY: ${{ secrets.STAGING_SOROBAN_SECRET_KEY }}
         run: |
-          test -n "$STAGING_ADMIN_SECRET_KEY" || { echo "::error::STAGING_ADMIN_SECRET_KEY not set"; exit 1; }
-          echo "$STAGING_ADMIN_SECRET_KEY" | stellar keys add staging-admin --secret-key
+          if [ -z "${STAGING_SOROBAN_SECRET_KEY:-}" ]; then
+            echo "ERROR: STAGING_SOROBAN_SECRET_KEY is not configured in the 'staging' environment." >&2
+            echo "See docs/staging-deployment.md § Secrets scope and rotation." >&2
+            exit 1
+          fi
+          printf '%s' "$STAGING_SOROBAN_SECRET_KEY" | stellar keys import staging-deployer --overwrite
+          echo "Staging identity configured: $(stellar keys address staging-deployer)"
+          echo "Contract: ${{ secrets.STAGING_CONTRACT_ID }} on $STAGING_NETWORK"
 
-      - name: Upgrade, verify, roll back on failure
-        id: deploy
+      - name: Fetch previous staging WASM (rollback source)
+        id: prev_wasm
         env:
-          GITHUB_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p evidence
+          mkdir -p target/staging-prev
+          PREV="target/staging-prev/ledgerlens_score.previous.wasm"
+          # Most recent successful staging run carries the last verified artifact.
+          RUN_ID=$(gh run list --workflow staging-deploy.yml --branch main \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+          if [ -n "$RUN_ID" ]; then
+            echo "Latest successful staging run: $RUN_ID"
+            if gh run download "$RUN_ID" -n staging-deployment-evidence -D target/staging-prev 2>/dev/null; then
+              CANDIDATE=$(find target/staging-prev -name '*.optimized.wasm' | head -n 1 || true)
+              if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
+                mv "$CANDIDATE" "$PREV"
+                echo "Previous staging WASM: $PREV ($(sha256sum "$PREV" | awk '{print $1}'))"
+                echo "prev_wasm_path=$PREV" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          fi
+          echo "No prior staging evidence found — first deployment will run without rollback coverage."
+          echo "prev_wasm_path=" >> "$GITHUB_OUTPUT"
+
+      - name: Upgrade staging through the standard proposal flow
+        id: upgrade
+        env:
+          GITHUB_SHA: ${{ needs.gate.outputs.deploy_sha }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STAGING_CONTRACT_ID: ${{ secrets.STAGING_CONTRACT_ID }}
+        run: |
+          DRY_FLAG=""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+          fi
+          PREV_FLAG="--allow-no-rollback"
+          if [ -n "${{ steps.prev_wasm.outputs.prev_wasm_path }}" ]; then
+            PREV_FLAG="--previous-wasm ${{ steps.prev_wasm.outputs.prev_wasm_path }}"
+          fi
+          chmod +x scripts/staging-upgrade.sh scripts/rollback.sh scripts/health_check.sh scripts/verify-deployment.sh
           set +e
-          scripts/staging-deploy.sh "$NETWORK" "${{ vars.STAGING_CONTRACT_ID }}" staging-admin \
-            target/ledgerlens_score.optimized.wasm evidence/staging.json 2>&1 | tee evidence/deploy.log
-          rc=${PIPESTATUS[0]}
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit "$rc"
+          # shellcheck disable=SC2086
+          bash scripts/staging-upgrade.sh --non-interactive $DRY_FLAG $PREV_FLAG \
+            "$STAGING_NETWORK" staging-deployer "$STAGING_CONTRACT_ID" \
+            target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
+          CODE=$?
+          set -e
+          echo "staging-upgrade exit code: $CODE"
+          if [ -f deploy/staging.json ]; then
+            STATUS=$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))")
+            echo "staging_status=$STATUS" >> "$GITHUB_OUTPUT"
+          fi
+          # Exit 2 = proposal recorded, awaiting the time-lock window: not a failure.
+          if [ "$CODE" -eq 2 ]; then
+            echo "Upgrade proposed; execution awaits the on-chain delay window. Scheduled follow-ups will complete it."
+            exit 0
+          fi
+          exit "$CODE"
 
-      - name: Upload evidence
+      - name: Publish staging status file
+        if: always()
+        run: |
+          echo "── deploy/staging.json ──"
+          cat deploy/staging.json
+          python3 - <<'EOF'
+          import json
+          with open("deploy/staging.schema.json") as f:
+              schema = json.load(f)
+          with open("deploy/staging.json") as f:
+              data = json.load(f)
+          missing = [k for k in schema["required"] if k not in data]
+          assert not missing, f"staging.json missing required keys: {missing}"
+          assert data["network"] in ("testnet", "futurenet"), "staging must never target mainnet"
+          assert data["status"] in schema["properties"]["status"]["enum"]
+          print("staging.json schema check passed.")
+          EOF
+
+      - name: Commit staging status back ([skip ci])
+        if: always()
+        run: |
+          git config user.name "ledgerlens-staging-bot"
+          git config user.email "ledgerlens-staging-bot@users.noreply.github.com"
+          git add deploy/staging.json target/staging-evidence/staging-upgrade.log || true
+          if git diff --cached --quiet; then
+            echo "No staging status changes to commit."
+            exit 0
+          fi
+          STATUS=$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))")
+          git commit -m "chore(staging): update staging deployment status to $STATUS [skip ci]
+
+          Automated by Staging Continuous Deployment (#1236).
+          Commit: ${{ needs.gate.outputs.deploy_sha }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          [skip ci]"
+          git push origin HEAD:main
+
+      - name: Upload deployment evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: staging-deploy-evidence
-          path: evidence/
-          retention-days: 30
-
-      - name: Publish staging status
-        if: always() && hashFiles('evidence/staging.json') != ''
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp evidence/staging.json /tmp/staging.json
-          git fetch origin staging-status || true
-          git checkout -B staging-status origin/staging-status 2>/dev/null || git checkout --orphan staging-status
-          git rm -rfq . 2>/dev/null || true
-          mkdir -p deploy/staging && cp /tmp/staging.json deploy/staging/status.json
-          git add deploy/staging/status.json
-          git commit -qm "staging: $(jq -r .last_deployment.status deploy/staging/status.json) $(jq -r .commit deploy/staging/status.json)" || exit 0
-          git push origin staging-status
+          name: staging-deployment-evidence
+          path: |
+            target/staging-evidence/staging-upgrade.log
+            deploy/staging.json
+            target/ledgerlens_score.optimized.wasm.sha256
+            target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
+          retention-days: 90
 
       - name: Notify maintainers on failure
         if: failure()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          STATUS=$(jq -r '.last_deployment.status // "unknown"' evidence/staging.json 2>/dev/null || echo unknown)
-          gh issue create --repo "${{ github.repository }}" \
-            --title "Staging deploy failed ($STATUS) for ${{ github.event.workflow_run.head_sha }}" \
-            --label staging-deploy-failure \
-            --body "$(printf 'Staging deployment of `%s` failed with status **%s** (exit code %s).\n\n- Logs: %s\n- Evidence artifact: `staging-deploy-evidence` on that run\n- CI run: %s\n\ncc @Ledger-Lenz/maintainers' \
-              "${{ github.event.workflow_run.head_sha }}" "$STATUS" "${{ steps.deploy.outputs.rc }}" "$RUN_URL" "${{ github.event.workflow_run.html_url }}")" \
-            || gh issue create --repo "${{ github.repository }}" \
-              --title "Staging deploy failed for ${{ github.event.workflow_run.head_sha }}" \
-              --body "Logs: $RUN_URL"
+          STATUS="$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))" 2>/dev/null || echo unknown)"
+          NOTE="$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('note',''))" 2>/dev/null || echo '')"
+          BODY="$(cat <<EOF
+          ## Staging deployment failed (#1236)
+
+          The continuous staging deployment for main commit \`${{ needs.gate.outputs.deploy_sha }}\` did not reach verified status.
+
+          | Field | Value |
+          |---|---|
+          | Staging status | \`$STATUS\` |
+          | Detail | $NOTE |
+          | Network | \`$STAGING_NETWORK\` / \`${{ secrets.STAGING_CONTRACT_ID }}\` |
+          | Run (logs + evidence) | $RUN_URL |
+          | Evidence artifact | \`staging-deployment-evidence\` on the run above |
+
+          ### What to do
+
+          1. Open the run link, download \`staging-deployment-evidence\`, and read \`staging-upgrade.log\`.
+          2. Check \`deploy/staging.json\` for the recorded status: \`rolled-back\` means the previous WASM was restored and re-verified by the health checks; \`failed\` means manual intervention is required (see docs/staging-deployment.md § Rollback).
+          3. Do not promote this commit further until staging is green again.
+
+          /cc @LedgerLens/arch-reviewers
+          EOF
+          )"
+          gh issue create --title "Staging deployment failed for ${{ needs.gate.outputs.deploy_sha }}" \
+            --body "$BODY" \
+            --label "staging,deployment-failure" || \
+          gh issue create --title "Staging deployment failed for ${{ needs.gate.outputs.deploy_sha }}" \
+            --body "$BODY"

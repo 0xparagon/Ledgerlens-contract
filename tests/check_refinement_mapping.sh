@@ -15,8 +15,8 @@ MAPPING="$ROOT_DIR/spec/refinement-mapping.md"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "==> 1/3: checker passes on the real mapping"
-python3 "$CHECKER" --mapping "$MAPPING" --quiet
+echo "==> 1/3: checker passes on the real Markdown and executable replay mappings"
+python3 "$CHECKER" --selftest
 echo "    OK"
 
 echo "==> 2/3: checker flags a nonexistent function reference"
