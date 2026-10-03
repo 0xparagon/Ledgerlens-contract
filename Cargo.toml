@@ -11,8 +11,6 @@ members = [
     "tools/recovery",
     "tools/schema-gen",
     "tools/invocation-fuzzer",
-    "tools/signer",
-    "tools/frost-ceremony",
     "tests/composability",
     "tests/conformance",
 ]

@@ -5,6 +5,7 @@
 //! `submit_score`'s legacy attestation), so these exercise
 //! `compute_relay_commitment` / `verify_signature` end-to-end.
 
+use soroban_sdk::xdr::ToXdr;
 use k256::ecdsa::SigningKey;
 use soroban_sdk::{
     symbol_short, testutils::Address as _, Address, Bytes, BytesN, Env, Symbol, Vec,
@@ -39,7 +40,7 @@ fn get_contract_id_bytes(env: &Env, contract_address: &Address) -> BytesN<32> {
     let xdr = contract_address.to_xdr(env);
     let mut bytes = [0u8; 32];
     if xdr.len() >= 32 {
-        bytes.copy_from_slice(&xdr.as_ref()[..32]);
+        xdr.slice(0..32).copy_into_slice(&mut bytes);
     }
     BytesN::from_array(env, &bytes)
 }
