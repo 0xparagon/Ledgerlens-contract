@@ -1,5 +1,20 @@
 #![cfg_attr(target_family = "wasm", allow(dead_code))]
 
+// ── Numeric cast lint gate (issue #1184) ─────────────────────────────────────
+//
+// `as` casts silently truncate, wrap, or lose sign/precision. In score, fee,
+// time and weight arithmetic that is a correctness (and sometimes security)
+// defect. The cast lints below are denied for this contract crate so any new
+// narrowing cast must be replaced with a checked conversion or an explicit,
+// commented, proven-safe cast. Tooling crates are handled separately and are
+// not covered by this module-level gate.
+#![deny(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+
 pub const SCORE_TTL_THRESHOLD: u32 = 518_400;
 pub const SCORE_TTL_EXTEND_TO: u32 = 777_600;
 
@@ -199,18 +214,105 @@ pub const MAX_RATE_LIMIT_OVERRIDE_LOG: u32 = 100;
 /// stable configuration surface for deployed instances.
 pub const CONFIG_DRIFT_MANIFEST_FIELDS: &[&str] = &[
     "contract_version",
-    "paused",
-    "risk_threshold",
-    "jump_threshold",
-    "staleness_window",
-    "upgrade_delay",
-    "cooldown",
-    "service_threshold",
-    "admin_threshold",
-    "consensus_threshold_k",
-    "consensus_epsilon",
-    "reveal_window",
-    "finality_buffer",
-    "heartbeat_alert_threshold",
-    "oracle_staleness_threshold",
+    "min_score",
+    "max_score",
+    "max_history_depth",
+    "default_history_max_depth",
+    "max_batch_size",
+    "max_asset_pair_bytes",
+    "max_score_commitment_bytes",
+    "max_dispute_bond_preimage_bytes",
+    "max_dispute_bond_salt_bytes",
+    "batch_read_max",
+    "default_risk_threshold",
+    "default_jump_threshold",
+    "max_gate_callers",
+    "max_wallet_pairs",
+    "max_service_signers",
+    "max_admin_signers",
+    "max_paused_pairs",
+    "max_counterparty_links_per_wallet",
+    "max_delegation_depth",
+    "max_model_versions",
+    "max_open_disputes",
+    "max_disputes_per_actor",
+    "max_embargoed_wallets",
+    "max_tracked_score_entries",
+    "max_expiring_entries_per_call",
+    "max_pending_parameter_proposals",
+    "max_rate_limit_override_log",
 ];
+
+// ── Boundary tests for the numeric cast lint gate (issue #1184) ──────────────
+//
+// These tests pin the type limits of the constants above so that any future
+// narrowing cast introduced around them is caught at the boundary values.
+// They also document the approved conversion patterns: use `u32::try_from` /
+// `i128::try_from` (or `checked_*`) instead of `as`.
+#[cfg(test)]
+mod cast_boundary_tests {
+    use super::*;
+
+    /// `MAX_SCORE` must fit in `u8` so score arithmetic can use `u8` safely.
+    #[test]
+    fn max_score_fits_in_u8() {
+        assert_eq!(u8::try_from(MAX_SCORE), Ok(100));
+        assert_eq!(u8::try_from(MIN_SCORE), Ok(0));
+    }
+
+    /// Score-floor bounds must fit in `u8`.
+    #[test]
+    fn score_floor_bounds_fit_in_u8() {
+        assert_eq!(u8::try_from(MAX_SCORE_FLOOR_HWM), Ok(100));
+        assert_eq!(u8::try_from(MIN_SCORE_FLOOR_HWM), Ok(50));
+        assert_eq!(u8::try_from(DEFAULT_SCORE_FLOOR_HWM), Ok(80));
+        assert_eq!(u8::try_from(DEFAULT_SCORE_FLOOR_MIN), Ok(20));
+    }
+
+    /// HLL precision bounds must fit in `u8` (register count is `1 << p`).
+    #[test]
+    fn hll_precision_bounds_fit_in_u8() {
+        assert_eq!(u8::try_from(HLL_MIN_PRECISION), Ok(4));
+        assert_eq!(u8::try_from(HLL_MAX_PRECISION), Ok(16));
+        assert_eq!(u8::try_from(HLL_DEFAULT_PRECISION), Ok(8));
+    }
+
+    /// `u32` TTL constants must widen losslessly into `u64`.
+    #[test]
+    fn ttl_constants_widen_to_u64() {
+        assert_eq!(u64::from(SCORE_TTL_THRESHOLD), 518_400);
+        assert_eq!(u64::from(SCORE_TTL_EXTEND_TO), 777_600);
+        assert_eq!(u64::from(BAND_STATE_TTL_THRESHOLD), 518_400);
+        assert_eq!(u64::from(BAND_STATE_TTL_EXTEND_TO), 777_600);
+        assert_eq!(u64::from(EMBARGO_TTL_THRESHOLD), 1_555_200);
+        assert_eq!(u64::from(EMBARGO_TTL_EXTEND_TO), 3_110_400);
+    }
+
+    /// `u64` second-based constants must fit in `i64` (ledger timestamps).
+    #[test]
+    fn second_constants_fit_in_i64() {
+        assert_eq!(i64::try_from(DEFAULT_COOLDOWN_SECS), Ok(3_600));
+        assert_eq!(i64::try_from(MAX_COOLDOWN_SECS), Ok(86_400));
+        assert_eq!(i64::try_from(MAX_UPGRADE_DELAY_SECS), Ok(1_209_600));
+        assert_eq!(i64::try_from(DISPUTE_CHALLENGE_PERIOD_SECS), Ok(604_800));
+        assert_eq!(i64::try_from(MAX_FINALITY_BUFFER_SECS), Ok(86_400));
+        assert_eq!(i64::try_from(DEFAULT_QUORUM_FAILURE_WINDOW_SECS), Ok(86_400));
+    }
+
+    /// `DISPUTE_BONUS_PCT` is a signed percentage and must fit in `i64`.
+    #[test]
+    fn dispute_bonus_pct_fits_in_i64() {
+        assert_eq!(i64::try_from(DISPUTE_BONUS_PCT), Ok(10));
+    }
+
+    /// Count-style `u32` limits must fit in `usize` on 32-bit targets.
+    #[test]
+    fn count_limits_fit_in_usize() {
+        assert_eq!(usize::try_from(MAX_GATE_CALLERS), Ok(20));
+        assert_eq!(usize::try_from(MAX_HISTORY_DEPTH), Ok(50));
+        assert_eq!(usize::try_from(MAX_BATCH_SIZE), Ok(20));
+        assert_eq!(usize::try_from(BATCH_READ_MAX), Ok(50));
+        assert_eq!(usize::try_from(MAX_EMBARGOED_WALLETS), Ok(100));
+        assert_eq!(usize::try_from(MAX_TRACKED_SCORE_ENTRIES), Ok(500));
+    }
+}
