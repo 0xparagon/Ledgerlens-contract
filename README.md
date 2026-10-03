@@ -861,6 +861,9 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 ## Handsoff notes
 
+<!-- handsoff-issue-1214 -->
+- #1214: Grafana dashboards as code with provenance and drift checks
+
 <!-- handsoff-issue-1210 -->
 - #1210: Replay tool: interactive debugger with invariant breakpoints and state diffs
 
