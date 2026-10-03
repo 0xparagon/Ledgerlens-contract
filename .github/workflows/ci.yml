@@ -9,9 +9,50 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Cancel superseded runs on pull requests only. Pushes to main (and any tag)
+# get a unique group per commit, so they are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # ── Change detection ────────────────────────────────────────────────────────
+  # Heavy jobs gate on these outputs so docs-only PRs skip them. Pushes to main
+  # always run the full pipeline. See docs/ci-gate.md.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+      spec: ${{ github.event_name != 'pull_request' || steps.filter.outputs.spec == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'contracts/**'
+              - 'tools/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - 'deploy/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'deny.toml'
+              - '.github/workflows/ci.yml'
+            spec:
+              - 'spec/**'
+              - '.github/workflows/ci.yml'
+
   fmt:
     name: Format check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +65,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +79,8 @@ jobs:
 
   contract-build-lints:
     name: Contract-only dead-code check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -173,6 +218,8 @@ jobs:
 
   production-acceptance:
     name: Production acceptance report
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -207,6 +254,8 @@ jobs:
 
   build:
     name: WASM build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -244,6 +293,8 @@ jobs:
 
   audit:
     name: Security audit
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -284,6 +335,8 @@ jobs:
 
   dependency-license:
     name: Dependency license & policy gate
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -318,6 +371,8 @@ jobs:
 
   supply-chain:
     name: Supply-chain integrity
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -455,6 +510,8 @@ jobs:
 
   repro-build-1:
     name: Reproducible build (run 1)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -481,6 +538,8 @@ jobs:
 
   repro-build-2:
     name: Reproducible build (run 2)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -536,6 +595,8 @@ jobs:
 
   spec-model-check:
     name: TLA+ spec TLC model checking
+    needs: changes
+    if: needs.changes.outputs.spec == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -572,3 +633,41 @@ jobs:
       - name: Replay bounded TLC behaviors against the Rust contract
         run: python3 tools/validate_tla_trace_replay.py --jar /tmp/tla2tools.jar
 
+  # ── Required-check aggregator ───────────────────────────────────────────────
+  # The ONLY status check branch protection should require. Skipped jobs
+  # (path-filtered or event-conditional) count as success; any failure or
+  # cancellation fails the gate. Every new job MUST be added to `needs`.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs:
+      - changes
+      - fmt
+      - clippy
+      - contract-build-lints
+      - test-tiers-manifest
+      - test-tiers-fast
+      - test-tiers-standard
+      - production-acceptance
+      - error-discriminants
+      - build
+      - audit
+      - dependency-license
+      - supply-chain
+      - repro-build-1
+      - repro-build-2
+      - repro-verify
+      - spec-model-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise job results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$RESULTS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "::error::Failed or cancelled jobs: $bad"
+            exit 1
+          fi
+          echo "All required jobs succeeded or were intentionally skipped."

@@ -26,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     steps:
       # ── Checkout ──────────────────────────────────────────────────────────────
       - uses: actions/checkout@v4
@@ -86,6 +88,40 @@ jobs:
           MANIFEST=target/ledgerlens_score.optimized.wasm.sha256
           sha256sum --check "$MANIFEST"
           echo "OK: Optimized WASM artifact integrity verified."
+
+      # ── Build manifest + GitHub artifact attestation (SEP-55) ─────────────────
+      # Binds the WASM hashes to repository, commit, workflow and builder
+      # identity via a Sigstore-signed SLSA provenance attestation.
+      - name: Write build manifest
+        run: |
+          RAW=target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          OPT=target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" --arg commit "$GITHUB_SHA" \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg workflow "$GITHUB_WORKFLOW_REF" \
+            --arg rustc "$(rustc --version)" --arg stellar "$STELLAR_CLI_VERSION" \
+            --arg raw "$(sha256sum "$RAW" | awk '{print $1}')" \
+            --arg opt "$(sha256sum "$OPT" | awk '{print $1}')" \
+            '{repository:$repo, commit:$commit, tag:$tag, workflow:$workflow,
+              toolchain:{rustc:$rustc, stellar_cli:$stellar},
+              build_command:"cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked && stellar contract optimize",
+              wasm:{raw_sha256:$raw, optimized_sha256:$opt}}' > target/build-manifest.json
+          cat target/build-manifest.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
+            target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledgerlens-build-manifest
+          path: target/build-manifest.json
+          retention-days: 90
 
       # ── Upload artifacts for publish-release job ──────────────────────────────
       - name: Upload optimized WASM
@@ -224,6 +260,12 @@ jobs:
           name: ledgerlens-score-optimized-wasm-sha256
           path: release-artifacts
 
+      - name: Download build manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: ledgerlens-build-manifest
+          path: release-artifacts
+
       # ── Extract release notes from CHANGELOG.md ───────────────────────────────
       # CHANGELOG.md follows Keep a Changelog format. We extract the [Unreleased]
       # section (or the section matching the tag) as release notes.
@@ -327,6 +369,12 @@ jobs:
           # Compare with raw SHA-256 above
           \`\`\`
 
+          To verify a deployed contract against this release's attestation:
+
+          \`\`\`bash
+          scripts/verify-build.sh <network> <contract-id> $TAG
+          \`\`\`
+
           ### Toolchain
 
           - Rust: \`1.81.0\` (pinned in \`rust-toolchain.toml\`)
@@ -340,12 +388,19 @@ jobs:
 
           EOF
 
+          # Pre-release tags (e.g. contract-v1.2.0-rc.1) exercise the full
+          # pipeline, attestation included, without being marked latest.
+          PRERELEASE=()
+          case "$TAG" in *-*) PRERELEASE=(--prerelease) ;; esac
+
           # Create the release
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file release-body.md \
+            "${PRERELEASE[@]}" \
             "$OPT_WASM" \
-            "$MANIFEST"
+            "$MANIFEST" \
+            release-artifacts/build-manifest.json
 
       # ── SBOM Hook (commented — pending separate issue) ────────────────────────
       # When SBOM generation is implemented (tracking issue: #SBOM_ISSUE),
