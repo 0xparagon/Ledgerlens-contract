@@ -9,17 +9,50 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Cancel superseded runs on pull requests only. Pushes to main (and any tag)
+# get a unique group per commit, so they are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  deploy-script:
-    name: Deployment script checks
+  # ── Change detection ────────────────────────────────────────────────────────
+  # Heavy jobs gate on these outputs so docs-only PRs skip them. Pushes to main
+  # always run the full pipeline. See docs/ci-gate.md.
+  changes:
+    name: Detect changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+      spec: ${{ github.event_name != 'pull_request' || steps.filter.outputs.spec == 'true' }}
     steps:
       - uses: actions/checkout@v4
-      - name: Run deploy.sh manifest and drift tests
-        run: bash tests/deploy/test_deploy.sh
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36  # v3.0.2
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'contracts/**'
+              - 'tools/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - 'deploy/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'deny.toml'
+              - '.github/workflows/ci.yml'
+            spec:
+              - 'spec/**'
+              - '.github/workflows/ci.yml'
 
   fmt:
     name: Format check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +65,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +79,8 @@ jobs:
 
   contract-build-lints:
     name: Contract-only dead-code check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,19 +91,135 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: tools/check_contract_build_lints.sh
 
-  test:
-    name: Unit tests
+  # ── Test tiers (#1244) ──────────────────────────────────────────────────────
+  #
+  # test-tiers.toml is the machine-readable inventory of every test unit and the
+  # tier that runs it. `test-tiers-manifest` is the cheap gate: it fails in
+  # seconds if a test exists that no tier runs, if a newly wired module was not
+  # classified, or if a tier or budget changed without a `reviewed` annotation.
+  # The two execution jobs then run the fast and standard tiers with their own
+  # wall-clock budgets, each unit timed separately so a slow suite is
+  # attributable.
+  #
+  # This replaces the old undifferentiated `cargo test --workspace` job: fast +
+  # standard covers every wired unit except the five nightly ones, which
+  # `.github/workflows/nightly-tests.yml` runs on a schedule and on demand.
+  #
+  # `--base` is the PR base SHA (or the pre-push SHA on main) so the review gate
+  # can diff this revision's manifest against the one it is replacing. The
+  # all-zero `before` SHA on a branch's first push means "no base", in which
+  # case the review diff is skipped rather than faked.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  test-tiers-manifest:
+    name: Test tier manifest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve base revision for the tier-move review
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sha="${{ github.event.pull_request.base.sha }}"
+          else
+            sha="${{ github.event.before }}"
+          fi
+          case "$sha" in
+            ""|0000000000000000000000000000000000000000) sha="" ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Check every test is classified and no tier moved unreviewed
+        run: |
+          if [ -n "${{ steps.base.outputs.sha }}" ]; then
+            python3 tools/test-tiering.py check --base "${{ steps.base.outputs.sha }}"
+          else
+            python3 tools/test-tiering.py check
+          fi
+      - name: Prove the gate still detects a bad manifest
+        run: python3 tools/test-tiering.py selftest
+
+  test-tiers-fast:
+    name: "Test tier: fast"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.81.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - name: Resolve base revision for the tier-move review
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sha="${{ github.event.pull_request.base.sha }}"
+          else
+            sha="${{ github.event.before }}"
+          fi
+          case "$sha" in
+            ""|0000000000000000000000000000000000000000) sha="" ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Run the fast tier (3-minute execution budget)
+        run: |
+          if [ -n "${{ steps.base.outputs.sha }}" ]; then
+            scripts/test-tier.sh fast --base "${{ steps.base.outputs.sha }}"
+          else
+            scripts/test-tier.sh fast
+          fi
+      - name: Upload the fast tier report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-tier-fast-report
+          path: target/test-tiers/
+          retention-days: 14
+
+  test-tiers-standard:
+    name: "Test tier: standard"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve base revision for the tier-move review
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            sha="${{ github.event.pull_request.base.sha }}"
+          else
+            sha="${{ github.event.before }}"
+          fi
+          case "$sha" in
+            ""|0000000000000000000000000000000000000000) sha="" ;;
+          esac
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Run the standard tier (30-minute execution budget)
+        run: |
+          if [ -n "${{ steps.base.outputs.sha }}" ]; then
+            scripts/test-tier.sh standard --base "${{ steps.base.outputs.sha }}"
+          else
+            scripts/test-tier.sh standard
+          fi
+      - name: Upload the standard tier report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-tier-standard-report
+          path: target/test-tiers/
+          retention-days: 14
 
   production-acceptance:
     name: Production acceptance report
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,26 +246,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Test the checker itself
-        run: tests/check_error_discriminants.test.sh
+      # The checker's own test suite (tests/check_error_discriminants.test.sh) is
+      # a unit in the fast tier; this job keeps the base-vs-HEAD comparison,
+      # which needs the PR base SHA and is therefore not a tier unit.
       - name: Check Error enum discriminants are append-only
         run: tools/check_error_discriminants.sh "${{ github.event.pull_request.base.sha }}" HEAD
 
-  refinement-mapping:
-    name: Refinement mapping consistency
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Issue #928: spec/refinement-mapping.md must only reference Rust symbols
-      # that actually exist in the contract sources. The mapping drifted once
-      # (it documented a nonexistent `finalize_consensus`); this job makes that
-      # class of drift fail CI loudly. Always-on: cheap (<1s) and catches drift
-      # introduced from either side (doc change or code rename).
-      - name: Verify mapping references only real symbols (and test the checker)
-        run: bash tests/check_refinement_mapping.sh
-
   build:
     name: WASM build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,15 +291,10 @@ jobs:
         run: ./scripts/check-wasm-size.sh
 
 
-  deploy-script-tests:
-    name: Deploy script failure-mode tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: tests/deploy_script_rpc_failures.sh
-
   audit:
     name: Security audit
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -197,6 +335,8 @@ jobs:
 
   dependency-license:
     name: Dependency license & policy gate
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -231,6 +371,8 @@ jobs:
 
   supply-chain:
     name: Supply-chain integrity
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -368,6 +510,8 @@ jobs:
 
   repro-build-1:
     name: Reproducible build (run 1)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -394,6 +538,8 @@ jobs:
 
   repro-build-2:
     name: Reproducible build (run 2)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -449,6 +595,8 @@ jobs:
 
   spec-model-check:
     name: TLA+ spec TLC model checking
+    needs: changes
+    if: needs.changes.outputs.spec == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -476,3 +624,76 @@ jobs:
           cd spec
           java -XX:+UseParallelGC -jar /tmp/tla2tools.jar -simulate num=20000 -depth 30 -config LedgerLens.cfg LedgerLens.tla
 
+      - name: Set up Rust for model-to-contract replay
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Replay bounded TLC behaviors against the Rust contract
+        run: python3 tools/validate_tla_trace_replay.py --jar /tmp/tla2tools.jar
+
+  environment-smoke:
+    name: Development environment smoke check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
+      - name: Build devcontainer image
+        run: docker build -f .devcontainer/Dockerfile -t ledgerlens-dev .
+      - name: Check pinned tools inside the image
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace ledgerlens-dev bash -lc '
+            rustc --version | grep -F "${{ steps.tool-versions.outputs.contract-rust }}"
+            rustc +${{ steps.tool-versions.outputs.audit-rust }} --version
+            rustup target list --installed | grep -qx wasm32-unknown-unknown
+            stellar --version | grep -F "${{ steps.tool-versions.outputs.stellar-cli }}"
+            cargo-mutants --version | grep -F "${{ steps.tool-versions.outputs.cargo-mutants }}"
+            cargo-audit --version | grep -F "${{ steps.tool-versions.outputs.cargo-audit }}"
+            cargo-deny --version | grep -F "${{ steps.tool-versions.outputs.cargo-deny }}"
+            cargo-cyclonedx --version | grep -F "${{ steps.tool-versions.outputs.cargo-cyclonedx }}"
+            shellcheck --version | grep -F "${{ steps.tool-versions.outputs.shellcheck }}"
+            java -version 2>&1 | grep -F "${{ steps.tool-versions.outputs.java }}"
+            test -f "$TLA_TOOLS_JAR"
+          '
+
+  # ── Required-check aggregator ───────────────────────────────────────────────
+  # The ONLY status check branch protection should require. Skipped jobs
+  # (path-filtered or event-conditional) count as success; any failure or
+  # cancellation fails the gate. Every new job MUST be added to `needs`.
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs:
+      - changes
+      - fmt
+      - clippy
+      - contract-build-lints
+      - test-tiers-manifest
+      - test-tiers-fast
+      - test-tiers-standard
+      - production-acceptance
+      - error-discriminants
+      - build
+      - audit
+      - dependency-license
+      - supply-chain
+      - repro-build-1
+      - repro-build-2
+      - repro-verify
+      - spec-model-check
+      - environment-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise job results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$RESULTS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "::error::Failed or cancelled jobs: $bad"
+            exit 1
+          fi
+          echo "All required jobs succeeded or were intentionally skipped."

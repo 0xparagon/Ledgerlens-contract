@@ -1,0 +1,39 @@
+name: Load pinned tool versions
+description: Exposes tool versions from toolchain-versions.json as step outputs.
+outputs:
+  contract-rust:
+    description: Contract Rust toolchain
+    value: ${{ steps.versions.outputs.contract_rust }}
+  audit-rust:
+    description: Audit Rust toolchain
+    value: ${{ steps.versions.outputs.audit_rust }}
+  stellar-cli:
+    description: Stellar CLI version
+    value: ${{ steps.versions.outputs.stellar_cli }}
+  tla-tools:
+    description: TLA+ tools version
+    value: ${{ steps.versions.outputs.tla_tools }}
+  java:
+    description: Java major version
+    value: ${{ steps.versions.outputs.java }}
+  cargo-mutants:
+    description: cargo-mutants version
+    value: ${{ steps.versions.outputs.cargo_mutants }}
+  shellcheck:
+    description: ShellCheck version
+    value: ${{ steps.versions.outputs.shellcheck }}
+  cargo-audit:
+    description: cargo-audit version
+    value: ${{ steps.versions.outputs.cargo_audit }}
+  cargo-deny:
+    description: cargo-deny version
+    value: ${{ steps.versions.outputs.cargo_deny }}
+  cargo-cyclonedx:
+    description: cargo-cyclonedx version
+    value: ${{ steps.versions.outputs.cargo_cyclonedx }}
+runs:
+  using: composite
+  steps:
+    - id: versions
+      shell: bash
+      run: python3 scripts/export-tool-versions.py >> "$GITHUB_OUTPUT"

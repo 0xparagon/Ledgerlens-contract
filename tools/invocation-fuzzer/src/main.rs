@@ -1,13 +1,15 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use invocation_fuzzer::{
-    load_campaign, load_corpus, replay_campaign, run_fuzz, DEFAULT_CASES, MAX_CASES,
+    load_campaign, load_corpus, replay_campaign, run_fuzz_with_abi, DEFAULT_CASES, MAX_CASES,
 };
 use std::env;
 use std::path::{Path, PathBuf};
 
 fn usage() -> &'static str {
     "Usage:
-  cargo run -p invocation-fuzzer --locked -- smoke [--seed N] [--cases N] [--corpus-dir PATH]
+    cargo run -p invocation-fuzzer --locked -- smoke [--seed N] [--cases N] [--corpus-dir PATH] [--abi-schema PATH]
   cargo run -p invocation-fuzzer --locked -- replay PATH
 
 smoke replays every regression fixture before running a bounded deterministic
@@ -30,6 +32,7 @@ fn smoke(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut seed = 0x6390_c0de_u64;
     let mut cases = DEFAULT_CASES;
     let mut corpus_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let mut abi_schema_path = None;
 
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -37,6 +40,11 @@ fn smoke(mut args: impl Iterator<Item = String>) -> Result<()> {
             "--cases" => cases = parse_number(args.next(), "--cases")?,
             "--corpus-dir" => {
                 corpus_dir = PathBuf::from(args.next().context("missing value for --corpus-dir")?)
+            }
+            "--abi-schema" => {
+                abi_schema_path = Some(PathBuf::from(
+                    args.next().context("missing value for --abi-schema")?,
+                ))
             }
             _ => bail!("unknown smoke option {flag}\n\n{}", usage()),
         }
@@ -46,7 +54,7 @@ fn smoke(mut args: impl Iterator<Item = String>) -> Result<()> {
     }
 
     let corpus = load_corpus(&corpus_dir)?;
-    let summary = run_fuzz(corpus, seed, cases)?;
+    let summary = run_fuzz_with_abi(corpus, seed, cases, abi_schema_path.as_deref())?;
     println!(
         "PASS seed={} regression_cases={} generated_cases={} retained_cases={} behavior_signatures={}",
         summary.seed,

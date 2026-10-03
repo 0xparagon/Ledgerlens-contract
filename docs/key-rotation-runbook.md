@@ -6,7 +6,7 @@
 
 ---
 
-## 0. Air-Gapped Governance Signing Workflow
+## 0A. Air-Gapped Governance Signing Workflow
 
 High-value governance keys (admin multisig, service signers) must never touch an
 online machine. Governance transactions are **built online** (they need ledger
@@ -85,6 +85,173 @@ Before signing, the offline operator MUST confirm each item:
 - [ ] After signing, the signature file is transferred back via the approved channel and the offline device is wiped of the bundle.
 
 If any check fails, **stop** and escalate per `docs/incident-response-runbook.md`.
+
+
+## 0. Threshold Attestation Key Ceremony (FROST)
+
+This section covers the distributed key generation (DKG) ceremony used to produce the
+threshold attestation aggregate public key. The ceremony is implemented by the
+`frost-ceremony` CLI (see `docs/threshold-attestation-spec.md` for the construction
+mapping and curve/encoding constraints). No single participant ever holds the full
+private key; the contract only ever sees the aggregate public key and a public
+transcript.
+
+### 0.1 Participant Selection
+
+| Role | Count | Responsibility |
+|------|-------|----------------|
+| **Ceremony coordinator** | 1 | Runs the CLI, relays round messages, publishes the transcript. Never a share holder. |
+| **Participants (share holders)** | N (e.g. 5) | Each runs the CLI locally, holds exactly one key share. |
+| **Witnesses** | ≥ 2 | Independent observers that verify the transcript hash and sign the attestation report. Hold no shares. |
+
+Selection rules:
+
+- Participants must be distinct individuals on distinct administrative domains.
+- Threshold `t` must satisfy `t > N/2` and `t ≤ N`; recommended `t = ceil(2N/3)`.
+- At least one witness must be from a different team than the coordinator.
+- Record each participant's identity, machine fingerprint, and CLI version in the report.
+
+### 0.2 Network Isolation
+
+- Run the ceremony on an isolated network segment (no inbound internet).
+- Round messages are exchanged out-of-band (signed files on removable media or a
+  dedicated point-to-point channel); the CLI never opens a listening socket.
+- Each participant verifies the transcript hash of the previous round before
+  contributing to the next round.
+- Disable screen sharing, remote shells, and clipboard sync for the duration.
+
+### 0.3 Ceremony Procedure
+
+```bash
+# 0. Coordinator: initialise the ceremony and publish the parameters
+frost-ceremony init \
+  --participants 5 \
+  --threshold 4 \
+  --curve ed25519 \
+  --out ceremony/
+
+# 1. Each participant: round 1 — commit to a random polynomial
+frost-ceremony round1 \
+  --participant <ID> \
+  --ceremony ceremony/ \
+  --out ceremony/round1-<ID>.json
+
+# 2. Coordinator: collect round-1 commitments, verify each, then distribute
+frost-ceremony verify-round1 --ceremony ceremony/ --round1 ceremony/round1-*.json
+
+# 3. Each participant: round 2 — send encrypted shares to every other participant
+frost-ceremony round2 \
+  --participant <ID> \
+  --ceremony ceremony/ \
+  --out ceremony/round2-<ID>.json
+
+# 4. Each participant: verify received shares against round-1 commitments
+frost-ceremony verify-shares \
+  --participant <ID> \
+  --ceremony ceremony/ \
+  --shares ceremony/round2-*.json
+
+# 5. Coordinator: finalise, emit aggregate pubkey + public transcript + proof
+frost-ceremony finalize \
+  --ceremony ceremony/ \
+  --out ceremony/transcript.json \
+  --proof ceremony/proof-of-correct-generation.json
+```
+
+### 0.4 Transcript Hashing & Participant Verification
+
+- Every round message is hashed (SHA-256 over the canonical JSON encoding) and the
+  hash is included in the next round's message, forming a hash chain.
+- `verify-round1` and `verify-shares` abort the ceremony on any mismatch, invalid
+  share, or missing participant.
+- The final `transcript.json` contains: ceremony parameters, all round messages,
+  the hash chain, the aggregate public key, and each participant's verification
+  signature over the transcript hash.
+- The `proof-of-correct-generation.json` is the artifact referenced by the
+  contract-side registration flow (`rotate_service_pubkey` / threshold registration).
+
+### 0.5 Abort Handling
+
+| Condition | Action |
+|-----------|--------|
+| Invalid share from a participant | Abort; exclude the participant; restart with a fresh ceremony ID. |
+| Participant dropout before round 2 | Abort; restart with `N-1` participants and recomputed `t`. |
+| Transcript hash mismatch | Abort; treat as tampering; investigate before restarting. |
+| Fewer than `t` valid shares at finalise | Abort; no aggregate key is produced. |
+
+A ceremony that aborts MUST NOT be resumed — always start a new ceremony with a new
+ceremony ID so that no partial secret material is reused.
+
+### 0.6 Registration & Rotation
+
+1. Publish `transcript.json` and `proof-of-correct-generation.json` to the ceremony
+   archive (immutable storage).
+2. Register the aggregate public key via the contract-side registration flow
+   (see §3 for `rotate_service_pubkey`).
+3. For rotation, run a fresh ceremony (§0.3) and register the new aggregate key with
+   an overlap window (§3) so in-flight attestations complete.
+
+### 0.7 Ceremony Checklist
+
+- [ ] Participants, witnesses, and coordinator identified and recorded.
+- [ ] Network isolation verified; out-of-band channel tested.
+- [ ] CLI version pinned and hashes recorded for all participants.
+- [ ] `init` parameters reviewed (`N`, `t`, curve, encoding).
+- [ ] Round 1 commitments verified by every participant.
+- [ ] Round 2 shares verified against commitments; no invalid shares.
+- [ ] Transcript hash chain verified end-to-end.
+- [ ] `transcript.json` and `proof-of-correct-generation.json` archived.
+- [ ] Aggregate public key registered on-chain; registration tx hash recorded.
+- [ ] Attestation report (§0.8) signed by all witnesses.
+
+### 0.8 Attestation Report Template
+
+```markdown
+# Threshold Attestation Ceremony Report
+
+- Ceremony ID: <uuid>
+- Date (UTC): <YYYY-MM-DDThh:mm:ssZ>
+- CLI version: <version> (sha256: <hash>)
+- Curve / encoding: ed25519 / <encoding>
+- Participants (N): <N>
+- Threshold (t): <t>
+
+## Participants
+| ID | Name | Domain | Machine fingerprint | Round1 hash | Round2 hash |
+|----|------|--------|---------------------|-------------|-------------|
+| P1 |      |        |                     |             |             |
+
+## Witnesses
+| Name | Team | Transcript hash verified | Signature |
+|------|------|--------------------------|-----------|
+|      |      |                          |           |
+
+## Artifacts
+- Aggregate public key: <hex>
+- Transcript: <path / sha256>
+- Proof of correct generation: <path / sha256>
+- Registration tx: <tx hash>
+
+## Deviations / Aborts
+- <none, or describe>
+
+## Sign-off
+- Coordinator: <name, signature>
+- Witness 1: <name, signature>
+- Witness 2: <name, signature>
+```
+
+### 0.9 Recovery
+
+- **Lost share:** the participant is excluded; run a fresh ceremony with `N-1`
+  participants and recomputed `t`. Never attempt to reconstruct a lost share from
+  others outside a ceremony.
+- **Compromised participant:** treat the aggregate key as compromised; run a fresh
+  ceremony and rotate the aggregate public key (§3) with a short overlap window.
+- **Lost transcript:** the ceremony cannot be re-verified; re-run the ceremony. The
+  on-chain aggregate key remains valid until rotated.
+- **Coordinator failure:** any participant may take over coordination using the
+  published round messages; the transcript hash chain guarantees integrity.
 
 ---
 
@@ -360,5 +527,9 @@ After every key-rotation operation (production or rehearsal), a post-action repo
 - Action log with stable action IDs (T0001, T0002, etc.)
 - Pre-rotation signer set and thresholds
 - Post-rotation signer set and thresholds
-- The `bundle_hash` of each air-gapped governance bundle used (see §0)
+- The `bundle_hash` of each air-gapped governance bundle used (see §0A)
 - Operator identities for each offline signature collected
+
+- For threshold attestation ceremonies: the ceremony ID, transcript hash, aggregate
+  public key, and the signed attestation report (§0.8)
+- Any deviations, aborts, or manual interventions
