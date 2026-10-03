@@ -458,7 +458,7 @@ impl LedgerLensScoreContract {
     /// `submit_score`) there is no accompanying `require_auth` to fall back
     /// on.
     #[allow(clippy::too_many_arguments)]
-    fn compute_relay_commitment(
+    pub(crate) fn compute_relay_commitment(
         env: &Env,
         wallet: &Address,
         asset_pair: &Symbol,

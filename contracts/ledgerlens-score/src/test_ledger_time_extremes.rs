@@ -196,7 +196,7 @@ fn a_huge_ledger_sequence_jump_does_not_abort_the_submission_path() {
     // leaves that headroom intact.
     env.ledger().with_mut(|l| {
         l.timestamp = START_TS;
-        l.sequence = 1_000_000_000_000;
+        l.sequence_number = 4_000_000_000;
     });
 
     submit_at(&env, &client, &wallet, &pair, 55, 70, START_TS);
