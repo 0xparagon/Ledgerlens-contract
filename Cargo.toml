@@ -10,8 +10,13 @@ members = [
     "tools/recovery",
     "tools/schema-gen",
     "tools/invocation-fuzzer",
+    "tools/signer",
+    "tools/frost-ceremony",
     "tests/composability",
 ]
+
+[workspace.dependencies]
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [profile.release]
 opt-level = "z"
