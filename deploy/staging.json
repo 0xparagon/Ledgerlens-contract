@@ -1,0 +1,16 @@
+{
+  "$schema": "./staging.schema.json",
+  "network": "testnet",
+  "contract_id": "REPLACE_WITH_STAGING_CONTRACT_ID",
+  "wasm_sha256": "REPLACE_WITH_DEPLOYED_WASM_SHA256",
+  "previous_wasm_sha256": "",
+  "version": "unknown",
+  "schema_version": 4,
+  "status": "pending",
+  "health": "unknown",
+  "canary": "unknown",
+  "note": "Initial placeholder. The staging-deploy workflow rewrites this file on every promotion; do not edit by hand.",
+  "commit_sha": "unknown",
+  "workflow_run_url": "unknown",
+  "last_deploy_utc": "1970-01-01T00:00:00Z"
+}

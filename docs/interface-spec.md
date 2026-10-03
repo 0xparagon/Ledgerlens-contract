@@ -53,8 +53,14 @@ path:
   `try_query_risk_gate` to handle.
 - **Never panics.** It cannot trap the calling transaction, so it cannot be
   used to grief your protocol's gas or disable your guard clause.
-- **Side-effect free.** It is a pure read and does not even extend storage
-  TTL — calling it does not mutate LedgerLens state.
+- **No durable side effects.** It writes no persistent or instance entry, and
+  it never extends the TTL of a score. It does record a **temporary** per-`(wallet,
+  asset_pair)` gate-read marker and extends only *that* marker's TTL; the marker
+  is anti-abuse bookkeeping for flash-loan protection, it is not read by the
+  decision path, and it expires with the entry it describes. A read path may also
+  emit a single liveness alert when the heartbeat threshold has been exceeded
+  (see `check_service_silence`), so "a gate read never emits an event" is not a
+  guarantee this contract makes.
 - **Conservative on the unknown.** A wallet with no score returns `false`
   (treated as risky). See [§5](#5-security-considerations).
 
@@ -132,8 +138,37 @@ capabilities (all `symbol_short!`):
 | `cons`          | `commit_consensus` / `reveal_consensus` / `set_consensus_config`     |
 | `pr_rd`         | `is_pair_paused`                                                     |
 | `meta`          | `get_interface_metadata`                                             |
+| `hpag`          | **unmapped** — no backing function is documented for this symbol; see the note below |
+| `var`           | `get_portfolio_var`                                                 |
+| `histogram`     | `get_score_histogram`                                               |
+| `rgate`         | `query_risk_gate_relative` (fallible; see the note below)          |
+| `dprv`          | **unmapped** — no backing function is documented for this symbol; see the note below |
+| `reconcile`     | `reconcile_state`                                                   |
+| `checksum`      | `compute_state_checksum` / `verify_state_checksum`                 |
+| `snapshot`      | reconciliation snapshot history                                     |
+| `export_score`  | `export_score` / `export_all_scores_paginated`                      |
+| `freeze`        | `freeze_contract` / `unfreeze_contract`                            |
+| `arch`          | architecture owner and mandatory-reviewer reads                     |
 
-Unrecognised capabilities return `false`.
+Unrecognised capabilities return `false`, including the empty symbol: the
+function is total and never traps.
+
+> **`hpag` and `dprv` are live but unmapped.** Both are answered `true` by
+> `supports_interface` and neither is listed in
+> `get_interface_metadata`, yet no document states what they gate. This gap was
+> found and recorded in [`docs/invariants.md`](invariants.md) §4c; it is repeated
+> here because a capability you cannot look up is not usable for feature
+> detection. Resolving it requires establishing the intent of each symbol, so it
+> is a focused follow-up rather than a documentation edit.
+
+> **Metadata under-advertisement.** `get_interface_metadata` currently lists 17
+> capabilities and omits six that `supports_interface` answers `true` for:
+> `hpag`, `var`, `histogram`, `rgate`, `dprv`, `arch`. A consumer that reads the
+> metadata list rather than probing symbols will not discover them. The draft
+> standard requires only the safe direction — every symbol in the metadata list
+> MUST be answered `true` by `supports_interface` — and lists
+> under-advertisement as a SHOULD. Tracked in
+> [`docs/standards/ledgerlens-alignment.md`](standards/ledgerlens-alignment.md) §5.
 
 ### 1.4 `get_interface_metadata` — versioned metadata discovery
 
@@ -158,12 +193,26 @@ pub struct InterfaceMetadata {
 
 The metadata currently advertises the following capabilities and constraints:
 
-- Capabilities: `score`, `history`, `batch`, `gate`, `aggr`, `count`, `cgate`, `meta`
+- Capabilities: `score`, `history`, `batch`, `gate`, `aggr`, `count`, `cgate`,
+  `batch_attested`, `emb`, `cons`, `pr_rd`, `meta`, `reconcile`, `checksum`,
+  `snapshot`, `export_score`, `freeze`
 - Semantic constraints: `fail_closed`, `side_effect_free`, `bounded_score_range`
+
+This list is **not** the same as the set `supports_interface` answers `true` for:
+`hpag`, `var`, `histogram`, `rgate`, `dprv`, and `arch` are implemented but not
+listed here. Treat the metadata as a convenience for the common path and use
+`supports_interface` as the authority. See the note in §1.3.
 
 The `meta` capability is reserved for this metadata surface itself; callers can
 use it to detect whether the deployment exports `get_interface_metadata` before
 trying to read it.
+
+The three `semantic_constraints` symbols are **diagnostics, not switches**: read
+them, log them, do not branch on them. `fail_closed` means indeterminate
+conditions resolve to "not safe to proceed"; `bounded_score_range` means
+`score`/`confidence` stay in `0..=100`; `side_effect_free` means the read paths
+mutate no durable state — see [§1.1](#11-query_risk_gate--the-integration-primitive)
+for the temporary gate-read marker that "durable" deliberately excludes.
 
 > Note: `batch_attested` is a 14-character symbol, longer than
 > `symbol_short!`'s 9-character ceiling, so it is constructed via
@@ -172,19 +221,23 @@ trying to read it.
 > check `capability == Symbol::new(&env, "batch_attested")` works
 > regardless of how the caller constructed the symbol.
 
-### 1.3 Direct read functions
+### 1.5 Direct read functions
 
 | Signature | Returns | Notes |
 |-----------|---------|-------|
 | `get_score(env, wallet, asset_pair) -> Result<RiskScore, Error>` | latest score | `Err(ScoreNotFound)` if absent |
+| `get_score_opt(env, wallet, asset_pair) -> Option<RiskScore>` | latest score | `None` if absent; cannot distinguish *why* |
 | `get_score_history(env, wallet, asset_pair) -> Vec<RiskScore>` | up to 10 entries, oldest first | empty `Vec` if none |
 | `get_aggregate_score(env, wallet) -> Result<AggregateRiskScore, Error>` | cross-asset weighted view | `Err(ScoreNotFound)` if the wallet has no scores |
-| `get_version(env) -> u32` | contract build version | currently `5` (reflecting the current contract build) |
+| `get_version(env) -> u32` | contract build version | currently `5` (reflecting the current contract build); `get_contract_version` is an alias |
+| `get_interface_metadata(env) -> InterfaceMetadata` | versioned discovery | see §1.4 |
 
 `get_score` is the right call when you need the full struct (confidence, model
 version, flags) rather than a yes/no gate decision. Prefer `query_risk_gate`
 for guard clauses precisely because `get_score` *can* return an error you would
-then have to handle.
+then have to handle. `get_score_opt` is convenient but lossy: it collapses
+"absent", "paused", and "uninitialised" into a single `None`, so a consumer that
+needs to tell those apart must use `get_score`.
 
 ---
 
@@ -197,13 +250,30 @@ any field** without a breaking-change release.
 ```rust
 #[contracttype]
 pub struct RiskScore {
-    pub score: u32,         // overall risk, 0–100 (higher = riskier)
-    pub benford_flag: bool, // Benford's-Law engine flagged this entity
-    pub ml_flag: bool,      // ML ensemble flagged this entity
-    pub timestamp: u64,     // ledger time the score was computed off-chain
-    pub confidence: u32,    // model confidence, 0–100
-    pub model_version: u32, // detection-pipeline model version
+    pub score: u32,             // overall risk, 0–100 (higher = riskier)
+    pub benford_flag: bool,     // Benford's-Law engine flagged this entity
+    pub ml_flag: bool,          // ML ensemble flagged this entity
+    pub timestamp: u64,         // ledger time the score was computed off-chain
+    pub confidence: u32,        // model confidence, 0–100
+    pub model_version: u32,     // detection-pipeline model version
+    pub benford_score: u32,     // sub-score from the Benford's-Law engine
+    pub ml_score: u32,          // sub-score from the ML ensemble
+    pub network_score: u32,     // sub-score from network/graph analysis
+    pub commitment: Option<Bytes>, // optional on-chain commitment over the payload
 }
+```
+
+> **Provider-neutral subset.** The draft standard in
+> [`docs/standards/sep-risk-score-registry-interface.md`](standards/sep-risk-score-registry-interface.md)
+> §4.1 defines a four-field portable subset — `score`, `confidence`, `timestamp`,
+> `model_version` — requires a provider to keep those names and types, and lets a
+> provider define further fields beside them, which a consumer ignores. This struct
+> already satisfies that: all four are present and correctly typed, and the six
+> provider-specific fields around them are exactly the "further fields" the clause
+> permits. Decoding is by field name, not position, so the interleaving is
+> immaterial. The clause-by-clause comparison, including every divergence and its
+> reason, is in
+> [`docs/standards/ledgerlens-alignment.md`](standards/ledgerlens-alignment.md).
 
 `AggregateRiskScore` (returned by `get_aggregate_score`) has the following
 stable layout:
@@ -317,9 +387,12 @@ below are stable** — integrators may match on the numeric code:
   bound, re-check their own pause state, and fail closed when the score is too
   old or the oracle is silent.
 - **`query_risk_gate` and `query_risk_gate_with_confidence` cannot be
-  weaponised against you.** Both are infallible and side-effect free by design,
-  so an attacker cannot craft inputs that make them panic, consume unexpected
-  gas, or mutate state to disable your guard.
+  weaponised against you.** Both are infallible and write no durable state by
+  design, so an attacker cannot craft inputs that make them panic, consume
+  unexpected gas, or mutate your guard's state to disable it. The only state a
+  gate read touches is a bounded temporary marker owned by LedgerLens (see
+  [§1.1](#11-query_risk_gate--the-integration-primitive)), and a single liveness
+  alert may be emitted while a read is served.
 - **Decide your own threshold.** `gate_threshold` is a caller parameter, not a
   protocol constant. Higher-value actions warrant a lower (stricter) threshold.
   LedgerLens's own default risk threshold is `75`; it is a reasonable starting

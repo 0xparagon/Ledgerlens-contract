@@ -13,6 +13,8 @@
 //! * `report` — Generate a post-action verification report from a snapshot
 //!   and an export.
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -57,6 +59,22 @@ struct ReconciliationReport {
     entry_counts_match: bool,
     all_match: bool,
     details: Vec<String>,
+}
+
+/// Mirrors the `(Address, Symbol)` tuple `get_expiring_entries` returns,
+/// plus the estimated remaining TTL an off-chain caller reads separately
+/// via `get_entry_ttl` — used to prioritize the most urgent entries first
+/// for `keeper_extend_entry_ttls` (see docs/rent-griefing-analysis.md).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KeeperCandidate {
+    wallet: String,
+    asset_pair: String,
+    estimated_ttl_remaining: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KeeperBatch {
+    entries: Vec<KeeperCandidate>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +176,25 @@ enum Commands {
         #[arg(short, long, default_value = "post-action-report.json")]
         output: PathBuf,
     },
+
+    /// Selects the most urgent entries from a candidate list for a keeper
+    /// to renew via `keeper_extend_entry_ttls` (see
+    /// docs/rent-griefing-analysis.md). Sorts by lowest estimated remaining
+    /// TTL first, dedupes by (wallet, asset_pair), and caps the output at
+    /// the contract's KEEPER_BATCH_MAX (100) so the result can be fed
+    /// straight into a single call.
+    Keeper {
+        /// Path to a JSON array of KeeperCandidate entries — e.g. collected
+        /// off-chain by calling `get_expiring_entries` /`get_entry_ttl`.
+        #[arg(short = 'i', long)]
+        input: PathBuf,
+        /// Path to save the prioritized batch.
+        #[arg(short, long, default_value = "keeper-batch.json")]
+        output: PathBuf,
+        /// Maximum entries to include (capped at KEEPER_BATCH_MAX).
+        #[arg(short = 'n', long, default_value_t = 100)]
+        max_entries: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -188,8 +225,16 @@ fn main() -> Result<()> {
         Commands::Report { snapshot, action, description, output } => {
             cmd_report(&snapshot, &action, &description, &output)
         }
+        Commands::Keeper { input, output, max_entries } => {
+            cmd_keeper(&input, &output, max_entries)
+        }
     }
 }
+
+/// Contract-side hard cap (`KEEPER_BATCH_MAX`, mirrors
+/// `MAX_EXPIRING_ENTRIES_PER_CALL`) — kept in sync manually since this CLI
+/// doesn't depend on the contract crate.
+const KEEPER_BATCH_MAX: usize = 100;
 
 // ── Command handlers ───────────────────────────────────────────────────────
 
@@ -396,6 +441,39 @@ fn cmd_report(
     fs::write(output, &json)
         .with_context(|| format!("Failed to write report to {}", output.display()))?;
     eprintln!("Post-action report saved to {}", output.display());
+    Ok(())
+}
+
+fn cmd_keeper(input: &Path, output: &PathBuf, max_entries: usize) -> Result<()> {
+    let content = fs::read_to_string(input)
+        .with_context(|| format!("Failed to read {}", input.display()))?;
+    let mut candidates: Vec<KeeperCandidate> = serde_json::from_str(&content)
+        .context("Input is not a valid JSON array of KeeperCandidate entries")?;
+
+    // Most urgent (lowest estimated remaining TTL) first.
+    candidates.sort_by_key(|c| c.estimated_ttl_remaining);
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert((c.wallet.clone(), c.asset_pair.clone())));
+
+    let cap = max_entries.min(KEEPER_BATCH_MAX);
+    if candidates.len() > cap {
+        candidates.truncate(cap);
+    }
+
+    let batch = KeeperBatch { entries: candidates };
+    let json = serde_json::to_string_pretty(&batch)?;
+    fs::write(output, &json)
+        .with_context(|| format!("Failed to write keeper batch to {}", output.display()))?;
+    eprintln!(
+        "Keeper batch saved to {} ({} entries, most urgent first)",
+        output.display(),
+        batch.entries.len()
+    );
+    eprintln!(
+        "Feed batch.entries (wallet, asset_pair) pairs into \
+         keeper_extend_entry_ttls(keeper, entries) on-chain."
+    );
     Ok(())
 }
 
