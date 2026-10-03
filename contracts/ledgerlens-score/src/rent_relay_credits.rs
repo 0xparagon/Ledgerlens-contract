@@ -26,7 +26,7 @@ use subtle::ConstantTimeEq;
 use crate::errors::Error;
 use crate::fee_schedule::compute_gate_fee;
 use crate::types::{FeeTier, RelayScoreAttestation};
-use crate::{events, storage, LedgerLensScoreContract};
+use crate::{events, storage, LedgerLensScoreContract, LedgerLensScoreContractClient};
 
 #[contractimpl]
 impl LedgerLensScoreContract {
