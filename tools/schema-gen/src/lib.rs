@@ -14,6 +14,8 @@
 //! [`ledgerlens_score::constants`] range constants so the emitted schema
 //! cannot drift from what `submit_score` actually enforces.
 
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 use soroban_sdk::xdr::{

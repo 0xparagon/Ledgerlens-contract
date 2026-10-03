@@ -26,3 +26,57 @@ jobs:
       - name: Run replay binary
         run: |
           cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet
+      - name: Verify parallel replay matches sequential (1 worker)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --verify-sequential --workers 1
+      - name: Verify parallel replay matches sequential (4 workers)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --verify-sequential --workers 4
+      - name: Verify parallel replay matches sequential (16 workers)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --verify-sequential --workers 16
+      - name: Profile replay (golden corpus)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --profile --profile-out target/replay-profile.json \
+            --profile-report target/replay-profile.txt
+      - name: Verify golden profile is deterministic
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --profile --profile-out target/replay-profile-2.json \
+            --profile-report target/replay-profile-2.txt
+          diff -u target/replay-profile.json target/replay-profile-2.json
+          diff -u target/replay-profile.txt target/replay-profile-2.txt
+      - name: Compare profile against baseline (regression gate)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --profile-compare target/replay-profile.json \
+            --profile-baseline tools/replay/baselines/profile.json \
+            --profile-threshold 0.10
+      - name: Generate synthetic scenarios (golden seed)
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios
+      - name: Verify synthetic scenario generation is deterministic
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios-2
+          diff -ru target/scenarios target/scenarios-2
+      - name: Verify synthetic scenario golden hashes
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios \
+            --scenario-hashes tools/replay/baselines/scenario-hashes.json \
+            --verify-scenario-hashes
+      - name: Self-test Benford conformance of generated scenarios
+        run: |
+          cargo run -p replay --manifest-path tools/replay/Cargo.toml --quiet -- \
+            --generate-scenarios --scenario-seed 42 \
+            --scenario-out target/scenarios \
+            --scenario-benford-check

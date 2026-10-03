@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use ledgerlens_aggregator::{LedgerLensAggregator, LedgerLensAggregatorClient};
 use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
@@ -491,7 +493,7 @@ pub fn execute_campaign(campaign: &Campaign) -> Result<CampaignReport> {
             }
         };
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-            LedgerLensScoreContract::check_invariants_for_fuzz(&fixture.env)
+            ledgerlens_score::check_invariants_for_fuzz(&fixture.env)
         })) {
             let message = payload
                 .downcast_ref::<&str>()

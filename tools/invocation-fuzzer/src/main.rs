@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use invocation_fuzzer::{
     load_campaign, load_corpus, replay_campaign, run_fuzz_with_abi, DEFAULT_CASES, MAX_CASES,

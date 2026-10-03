@@ -121,8 +121,76 @@ Follow-up note:
   - keep `score_floor_policy` enabled
   - keep cooldown and adaptive rate-limit settings conservative
 
+## Agent-based adversarial simulation of gate-threshold gaming
+
+Threat models argue about incentives; the simulator in `tools/` quantifies them.
+It runs an agent-based simulation where wash traders adapt to the published gate
+thresholds, staleness windows and cooldowns, and measures how much manipulation
+the system tolerates before the score reacts. The simulation drives a simplified
+detection pipeline whose output is fed into the real contract test environment
+(the Soroban contract test harness), so results reflect the actual gate logic
+rather than a re-implementation.
+
+### Agents
+
+- **Honest traders** — organic volume, no attempt to game the gate.
+- **Wash cycles** — self-dealing round trips that inflate apparent activity.
+- **Threshold-hugging** — agents that keep each wallet's score just under the
+  published gate threshold, exploiting the gap between the threshold and the
+  detection boundary.
+- **Splitting** — the same economic actor spread across many wallets and pairs
+  to stay below per-wallet and per-pair limits.
+
+### Parameterisation by contract configuration
+
+The simulation is parameterised directly by contract configuration — gate
+thresholds, `staleness_window`, `cooldown`, `finality_buffer`,
+`score_floor_policy` and `adaptive_rate_limit` — so governance can evaluate a
+proposed change before adoption. A proposed parameter change is expressed as a
+config diff and run against the same seeded workload as the baseline.
+
+### Reproducible reports
+
+Runs are seeded and deterministic. Each report records the seed and emits:
+
+- **time-to-detection** — ticks until the pipeline reacts to an attack.
+- **exposure window** — ticks during which the attacker can act before reaction.
+- **false-block rate** — honest traders incorrectly blocked by the gate.
+- **attacker gains** — value extracted before detection.
+
+### Canned scenarios
+
+At least three canned attack scenarios ship with the tooling, plus one defence
+comparison:
+
+1. **Wash-cycle inflation** — sustained self-dealing to lift apparent volume.
+2. **Threshold-hugging** — agents pinned just under the gate threshold.
+3. **Wallet/pair splitting** — one actor fragmented across wallets and pairs.
+
+Defence comparison: the same seeded workload is run with the baseline config
+and with a hardened config (tighter `staleness_window`, non-zero
+`finality_buffer`, enabled `score_floor_policy`) to show the delta in
+time-to-detection, exposure window, false-block rate and attacker gains.
+
+### Acceptance criteria
+
+- Deterministic runs with recorded seeds and a golden report test.
+- A documented example evaluating a real parameter change.
+- Findings that reveal weaknesses are filed as separate issues with references.
+
+### Documented example: evaluating a real parameter change
+
+To evaluate a proposed change, run the simulator twice with the same seed —
+once with the current config and once with the proposed config — and diff the
+reports. For example, tightening `staleness_window` and enabling a non-zero
+`finality_buffer` should reduce the exposure window for the stale-safe-score
+carry trade (scenario 4 above) at the cost of a higher false-block rate for
+honest traders. The golden report test pins the baseline output so any drift in
+the detection pipeline or gate logic is caught in CI.
+
 ## Compatibility impact
 
 - No existing gate ABI changed
 - The new tests only document and lock in fail-closed timing semantics
-
+- The simulator is tooling only and does not alter the public ABI, storage
+  layout, events or error enum

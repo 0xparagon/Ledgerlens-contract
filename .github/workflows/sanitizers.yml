@@ -1,0 +1,95 @@
+name: Miri & Sanitizers
+
+# Nightly UB / memory-error coverage for the off-chain tool crates.
+# Also runs on demand for pull requests labelled `security`.
+# See docs/security/unsafe-code-and-sanitizers.md.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sanitizers-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY: nightly-2026-09-01
+
+jobs:
+  miri:
+    name: Miri (pure-Rust crates)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [replay, schema-gen]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: miri, rust-src
+      - run: cargo miri setup
+      - name: cargo miri test (${{ matrix.crate }})
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test -p ${{ matrix.crate }} --lib
+
+  asan:
+    name: AddressSanitizer (${{ matrix.crate }})
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [replay, recovery, schema-gen, invocation-fuzzer]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: rust-src
+      - name: cargo test under ASan + LSan with UB checks
+        env:
+          RUSTFLAGS: -Zsanitizer=address -Cdebug-assertions=yes -Zub-checks=yes
+          RUSTDOCFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1
+        run: >
+          cargo +${{ env.NIGHTLY }} test -Zbuild-std
+          --target x86_64-unknown-linux-gnu -p ${{ matrix.crate }}
+
+  sanitizer-self-test:
+    name: Sanitizer self-test (seeded out-of-bounds)
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'security')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - name: ASan must detect a seeded heap out-of-bounds read
+        run: |
+          cat > oob.rs <<'RS'
+          fn main() {
+              let v = vec![1u8, 2, 3, 4];
+              let i = std::hint::black_box(4usize);
+              // Deliberate bug: one past the end.
+              let x = unsafe { *v.as_ptr().add(i) };
+              println!("{x}");
+          }
+          RS
+          rustc +${{ env.NIGHTLY }} -Zsanitizer=address -Copt-level=0 \
+            --target x86_64-unknown-linux-gnu oob.rs -o oob
+          if ./oob 2> asan.log; then
+            echo "::error::ASan failed to detect the seeded out-of-bounds read"
+            exit 1
+          fi
+          grep -q "heap-buffer-overflow" asan.log
+          echo "OK: seeded out-of-bounds read detected by ASan."

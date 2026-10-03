@@ -9,6 +9,8 @@
 //! cargo run -p schema-gen -- --check     # exit non-zero if committed artifacts are stale
 //! ```
 
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use schema_gen::{
     native_risk_score_struct, struct_to_json_schema, struct_to_python, struct_to_typescript,

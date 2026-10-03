@@ -25,6 +25,31 @@
 //! composable protocol know *at query time* that current market conditions
 //! reduce confidence in the static stored score.  It is advisory — the stored
 //! score and confidence are never mutated.
+//!
+//! # Trust boundary (issue #1185)
+//!
+//! The oracle is an *external* contract chosen by governance. Everything it
+//! returns crosses a trust boundary and MUST be treated as untrusted data.
+//! The registry therefore never trusts the oracle to behave: it uses
+//! non-panicking call forms, validates every return value explicitly, and
+//! bounds the work a hostile oracle can force.
+//!
+//! ## External calls and the assumptions made about their results
+//!
+//! | Call site | Assumed result | Validation | Fallback |
+//! |-----------|----------------|------------|----------|
+//! | `get_price(pair) -> i128` | in-range `i128`, non-negative, fresh | `try_get_price` (non-panicking); reject negative / out-of-range; staleness check | floor `0`, emit `orc_stale` / `orc_invalid` |
+//! | `get_price` return *type* | exactly `i128` | `try_get_price` returns `Err` on wrong type / trap | floor `0`, emit `orc_invalid` |
+//! | `get_price` *size* | scalar, no collection | scalar ABI — no unbounded collection accepted | n/a |
+//! | `get_price` *latency* | bounded | caller-supplied budget; no unbounded loop over oracle output | floor `0` |
+//!
+//! ## Bounded work
+//!
+//! The adapter performs exactly **one** cross-contract call per query and
+//! writes **zero** ledger entries on behalf of the oracle. A hostile oracle
+//! cannot force the registry to iterate a returned collection or to persist
+//! attacker-controlled data: the only value consumed is a single `i128` that
+//! is range-checked before use.
 
 #![no_std]
 
@@ -69,6 +94,75 @@ impl ExamplePriceFeedOracle {
     }
 }
 
+// ── Hostile-oracle mock (issue #1185) ────────────────────────────────────────
+//
+// Used by tests and fuzzing to prove that every hostile behaviour produces a
+// documented, deterministic outcome without corrupting registry state. Each
+// mode is selected by the admin so a single deployed mock can exercise all
+// cases. The registry must never panic, never persist oracle-controlled data,
+// and always fall back to an unadjusted confidence floor of `0`.
+
+/// Hostile behaviours the mock can be configured to exhibit.
+#[contracttype]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HostileMode {
+    /// Returns a value outside the accepted range (e.g. `i128::MAX`).
+    OutOfRange,
+    /// Traps / panics on call, simulating a malicious or buggy oracle.
+    Panicking,
+    /// Returns a negative price, which the registry must reject.
+    Negative,
+    /// Burns the caller's budget before returning (slow oracle).
+    Slow,
+}
+
+/// Storage key used by the hostile mock.
+#[contracttype]
+pub enum HostileKey {
+    Mode,
+}
+
+/// A deliberately hostile oracle used only in tests/fuzzing.
+#[contract]
+pub struct HostileOracle;
+
+#[contractimpl]
+impl HostileOracle {
+    /// Configure which hostile behaviour `get_price` should exhibit.
+    pub fn set_mode(env: Env, mode: HostileMode) {
+        env.storage().instance().set(&HostileKey::Mode, &mode);
+    }
+
+    /// Hostile `get_price`. The registry calls this via a non-panicking form
+    /// (`try_get_price`), so a trap here is caught and mapped to the
+    /// documented fallback rather than aborting the registry call.
+    pub fn get_price(env: Env, _asset_pair: Symbol) -> i128 {
+        let mode: HostileMode = env
+            .storage()
+            .instance()
+            .get(&HostileKey::Mode)
+            .unwrap_or(HostileMode::OutOfRange);
+
+        match mode {
+            // Out-of-range: registry must reject and fall back to floor 0.
+            HostileMode::OutOfRange => i128::MAX,
+            // Negative: registry must reject and fall back to floor 0.
+            HostileMode::Negative => -1i128,
+            // Panicking: registry's non-panicking call form must catch this.
+            HostileMode::Panicking => panic!("hostile oracle: intentional trap"),
+            // Slow: burn budget, then return a plausible value. The registry
+            // bounds work to a single call, so this cannot loop the caller.
+            HostileMode::Slow => {
+                let mut acc: i128 = 0;
+                for i in 0..1_000i128 {
+                    acc = acc.wrapping_add(i);
+                }
+                acc
+            }
+        }
+    }
+}
+
 // ── Integration sketch (pseudo-code, requires a test environment) ─────────────
 //
 // 1. Deploy LedgerLens and the oracle:
@@ -103,3 +197,20 @@ impl ExamplePriceFeedOracle {
 //    effective_confidence = original_confidence.saturating_sub(confidence_floor)
 //    A composable protocol can refuse a swap/borrow if effective_confidence
 //    falls below its required minimum.
+//
+// 7. Hostile-oracle tests (issue #1185): register `HostileOracle` and assert
+//    the documented fallback for each `HostileMode`:
+//
+//    let hostile_id = env.register_contract(None, HostileOracle);
+//    let hostile = HostileOracleClient::new(&env, &hostile_id);
+//    ll.register_oracle(&admin_signers, &symbol_short!("XLM_USDC"), &hostile_id);
+//
+//    for mode in [HostileMode::OutOfRange, HostileMode::Negative,
+//                 HostileMode::Panicking, HostileMode::Slow] {
+//        hostile.set_mode(&mode);
+//        let eff = ll.get_effective_score(&wallet, &symbol_short!("XLM_USDC")).unwrap();
+//        // Every hostile mode → unadjusted floor, stored state untouched.
+//        assert_eq!(eff.confidence_floor, 0);
+//        assert_eq!(eff.original_score, 55);
+//        assert_eq!(eff.original_confidence, 90);
+//    }
