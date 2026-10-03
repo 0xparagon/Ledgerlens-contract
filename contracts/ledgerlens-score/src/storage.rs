@@ -2124,7 +2124,11 @@ pub fn set_consensus_commitment(
     commitment: &soroban_sdk::BytesN<32>,
 ) {
     let key = DataKeyC::ConsensusCommitment(model.clone(), wallet.clone(), asset_pair.clone());
-    let ttl = get_reveal_window_secs(env) as u32;
+    // `ledgers_to_live` is a u32 on the host side, and the reveal window is an
+    // unvalidated admin u64. `as u32` would truncate (a 2^32 window becomes 0,
+    // collapsing the entry's life to the 12-ledger floor and making the reveal
+    // permanently impossible), so saturate at the top of the range instead.
+    let ttl = u32::try_from(get_reveal_window_secs(env)).unwrap_or(u32::MAX);
     let ledgers_to_live = (ttl / 5).max(12);
     env.storage().temporary().set(&key, commitment);
     env.storage().temporary().extend_ttl(&key, ledgers_to_live, ledgers_to_live);
@@ -2281,7 +2285,16 @@ pub fn check_signer_expired(env: &Env, signer: &Address) -> Result<(), crate::er
     }
     if let Some(age) = get_signer_age(env, signer) {
         let grace = get_signer_grace_period(env);
-        if age > ttl + grace {
+        // `age > ttl + grace`, written without the addition. `ttl` and `grace`
+        // are independent admin-supplied u64s, so `ttl + grace` can exceed
+        // u64::MAX; with `overflow-checks = true` and `panic = "abort"` in the
+        // release profile that is a panic, not a wrap, and this function is on
+        // the score-submission path — so an admin configuration of
+        // (u64::MAX, 1) would abort every future submission. Saturating the
+        // subtraction gives the same answer for every non-overflowing pair:
+        // when `age <= ttl` the difference is 0 and `0 > grace` is false unless
+        // grace is 0, in which case `age > ttl + 0` is false too.
+        if age.saturating_sub(ttl) > grace {
             crate::events::signer_expired(env, signer);
             return Err(crate::errors::Error::UnauthorizedSigner);
         }
