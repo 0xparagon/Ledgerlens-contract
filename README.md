@@ -861,6 +861,9 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 ## Handsoff notes
 
+<!-- handsoff-issue-1186 -->
+- #1186: Failure semantics of non-reverting cross-contract calls
+
 <!-- handsoff-issue-1198 -->
 - #1198: Proof-carrying shard reads in the aggregator
 
