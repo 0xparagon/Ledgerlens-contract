@@ -20,7 +20,7 @@ blockchain usage.
 - **On-Chain Risk Score Registry**: Stores the latest LedgerLens risk score, flags, confidence, and timestamp per wallet/asset-pair
 - **Replay Forensics**: The replay harness can emit a deterministic incident evidence bundle that packages transactions, events, configuration snapshots, issue references, and hashes for audits and incident response.
 - **Authorized Score Submission**: Only the authorised LedgerLens off-chain service account can write scores
-- **Composable Read Access**: Any Soroban contract can query risk scores to gate suspicious activity via `query_risk_gate` (score-only) or `query_risk_gate_with_confidence` (score + confidence floor) — both infallible, side-effect free, and safe to call directly inside another protocol's guard clause
+- **Composable Read Access**: Any Soroban contract can query risk scores to gate suspicious activity via `query_risk_gate` (score-only) or `query_risk_gate_with_confidence` (score + confidence floor) — both infallible, free of durable side effects, and safe to call directly inside another protocol's guard clause
 - **Benford & ML Flags**: Distinguishes between statistical anomaly flags and ML classifier flags
 - **Confidence Scoring**: Each risk score carries a model confidence value (0-100)
 - **Open and Auditable**: Methodology, scores, and contract logic are fully transparent
@@ -498,13 +498,27 @@ LedgerLens is only useful if other protocols can actually *act* on its scores. A
 
 The problem with composing on a raw getter is fragility. If every integrator reverse-engineers `get_score` and decodes the `RiskScore` struct by hand, then the day we add a field or change an error code, every downstream protocol breaks silently. So LedgerLens exposes a **stable, versioned composability interface** — `ILedgerLensScore` — as the canonical integration point. It is fully specified in [`docs/interface-spec.md`](docs/interface-spec.md); the headline function is `query_risk_gate`.
 
+### Standards and conformance
+
+`ILedgerLensScore` is a LedgerLens-specific interface. To let integrators switch providers without rewriting their guard clauses, the same surface has been generalised into a provider-neutral standard:
+
+| Artefact | Purpose |
+|---|---|
+| [`docs/standards/sep-risk-score-registry-interface.md`](docs/standards/sep-risk-score-registry-interface.md) | Draft standard for a risk-score registry interface any provider can implement (SEP format) |
+| [`docs/standards/ledgerlens-alignment.md`](docs/standards/ledgerlens-alignment.md) | Clause-by-clause mapping of `ILedgerLensScore` onto the draft, with every divergence and its rationale |
+| [`contracts/reference-provider/`](contracts/reference-provider/) | Minimal provider written against the draft, and the worked example for it |
+| [`tests/conformance/`](tests/conformance/) | 33-vector conformance suite, plus instructions for running it against a provider in another language |
+| [`docs/standards/submission-and-discussion.md`](docs/standards/submission-and-discussion.md) | Ecosystem review status, announcement text, and the feedback log |
+
+`contracts/ledgerlens-score` already satisfies every `must`-level vector without an ABI change, and its single `should`-level deviation (it does not advertise the `risk` root capability) is asserted in a test so the divergence list cannot drift silently.
+
 ### Why a dedicated gate function?
 
 A guard clause inside someone else's contract has hard requirements that a normal getter doesn't meet:
 
 - **It must never panic.** A panic in a cross-contract call traps the *caller's* transaction. If LedgerLens could panic, an attacker could craft inputs that disable the AMM's risk guard — or simply burn its gas. So `query_risk_gate` returns a plain `bool` and is engineered to be infallible.
 - **It must fail closed.** Because the answer is a single `bool`, the "we have no score for this wallet" case has to collapse to one value — and that value is `false`. Unknown wallets are treated as *potentially risky*, not waved through.
-- **It must be cheap and side-effect free.** It is a pure read that doesn't even extend storage TTL, so calling it from a hot path is safe.
+- **It must be cheap and free of durable side effects.** It never extends a score's TTL and never writes a durable entry, so calling it from a hot path is safe. The one write on the path is a bounded *temporary* gate-read marker used by the flash-loan protection feature (#300), which the decision logic does not read; a single liveness alert may also be emitted while a read is served.
 
 ### The AMM pattern
 
@@ -577,11 +591,20 @@ These are backed by a set of non-negotiable implementation invariants — fail-c
 
 ## Testing
 
-Run the test suite with:
+Every test in this repository is classified in [`test-tiers.toml`](test-tiers.toml) — a
+machine-readable inventory that says what each test is for and which run executes it. Three
+tiers exist, each with a wall-clock execution budget:
 
 ```bash
-cargo test
+scripts/test-tier.sh fast        # 3-minute budget; what CI runs on every PR
+scripts/test-tier.sh standard    # 30-minute budget; the rest of the per-PR coverage
+scripts/test-tier.sh nightly     # 60-minute budget; scheduled, not on every PR
 ```
+
+Use `--no-budget` locally (the budgets are ceilings for a GitHub-hosted 2-vCPU runner) and
+`--list` / `--dry-run` to see what a tier would run. `cargo test` still works for debugging a
+single suite. The model, the taxonomy, and the rules for adding or moving a test are in
+[`docs/test-tiers.md`](docs/test-tiers.md).
 
 ## Quick Start
 
@@ -650,24 +673,32 @@ soroban contract invoke \
 ├── deploy/manifests/                   ← Reviewed environment deployment manifests
 ├── docs/
 │   ├── deployment-manifests.md         ← Manifest schema and toolchain drift checks
-│   └── interface-spec.md               ← ILedgerLensScore composability spec
-│   └── contract-build-lints.md         ← WASM-only dead-code detection policy
-│   └── ledgerlens-score-module-ownership.md ← Score module ownership map
+│   ├── interface-spec.md               ← ILedgerLensScore composability spec
+│   ├── contract-build-lints.md         ← WASM-only dead-code detection policy
+│   ├── ledgerlens-score-module-ownership.md ← Score module ownership map
+│   └── standards/
+│       ├── sep-risk-score-registry-interface.md ← Provider-neutral interface standard (SEP draft)
+│       ├── ledgerlens-alignment.md      ← Clause-by-clause alignment and every divergence
+│       └── submission-and-discussion.md ← Ecosystem review status and feedback log
 ├── examples/
 │   └── amm_gate.rs                     ← Reference AMM integration (query_risk_gate)
 ├── contracts/
-│   └── ledgerlens-score/
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs                  ← Contract entrypoints
-│           ├── types.rs                ← RiskScore, DataKey
-│           ├── storage.rs              ← Persistent/instance storage helpers
-│           ├── errors.rs               ← Contract error codes
-│           ├── events.rs               ← Event emission helpers
-│           ├── test.rs                 ← Implementation unit tests
-│           ├── test_interface.rs       ← Interface stability tests
-│           ├── test_upgrade.rs         ← Upgrade-governance tests
-│           └── test_rate_limit.rs      ← Submission rate-limiting tests
+│   ├── ledgerlens-score/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                  ← Contract entrypoints
+│   │       ├── types.rs                ← RiskScore, DataKey
+│   │       ├── storage.rs              ← Persistent/instance storage helpers
+│   │       ├── errors.rs               ← Contract error codes
+│   │       ├── events.rs               ← Event emission helpers
+│   │       ├── test.rs                 ← Implementation unit tests
+│   │       ├── test_interface.rs       ← Interface stability tests
+│   │       ├── test_upgrade.rs         ← Upgrade-governance tests
+│   │       └── test_rate_limit.rs      ← Submission rate-limiting tests
+│   └── reference-provider/             ← Minimal provider implementing the SEP draft
+├── tests/
+│   ├── composability/                  ← Cross-contract integration tests
+│   └── conformance/                    ← Provider-neutral conformance suite (SEP §11)
 ├── LICENSE
 ├── CONTRIBUTING.md
 └── README.md                            ← This file
@@ -779,7 +810,7 @@ pub struct RiskScore {
 
 - **Networks**: `testnet` for development, `mainnet` for production. Contract IDs per network are recorded in this repo's deployment docs and must be mirrored into `api`'s environment configuration (`CONTRACT_ID`, `RPC_URL`, `NETWORK`).
 - **Secrets**: the "service" keypair that calls `submit_score` lives in `api`'s secret store — never in `core`, `data`, or `dashboard`. This repo only ever stores the **public address** of that account on-chain.
-- **CI**: workflow templates live in `.github`; this repo's contract CI builds with `cargo build --target wasm32-unknown-unknown --release`, runs `cargo test`, checks contract-only wasm lints via `tools/check_contract_build_lints.sh`, and exercises `deploy.sh` RPC failure handling with a shell harness.
+- **CI**: workflow templates live in `.github`; this repo's contract CI builds with `cargo build --target wasm32-unknown-unknown --release`, runs the `fast` and `standard` test tiers under their own budgets (`scripts/test-tier.sh`, see [`docs/test-tiers.md`](docs/test-tiers.md)) plus the `nightly` tier on a schedule, checks contract-only wasm lints via `tools/check_contract_build_lints.sh`, and exercises `deploy.sh` RPC failure handling with a shell harness.
 - **Versioning**: tag contract releases as `contract-vX.Y.Z`. `api` should pin against a specific deployed `CONTRACT_ID` + ABI version, not "latest".
 
 ### Deployment safety notes
@@ -832,3 +863,12 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 <!-- handsoff-issue-1198 -->
 - #1198: Proof-carrying shard reads in the aggregator
+
+<!-- handsoff-issue-1214 -->
+- #1214: Grafana dashboards as code with provenance and drift checks
+
+<!-- handsoff-issue-1210 -->
+- #1210: Replay tool: interactive debugger with invariant breakpoints and state diffs
+
+<!-- handsoff-issue-1213 -->
+- #1213: Prometheus exporter and alert rules as code

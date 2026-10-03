@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use ledgerlens_aggregator::{LedgerLensAggregator, LedgerLensAggregatorClient};
 use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
