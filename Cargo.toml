@@ -4,6 +4,7 @@ members = [
     "contracts/ledgerlens-score",
     "contracts/ledgerlens-aggregator",
     "contracts/ledgerlens-test-support",
+    "contracts/reference-provider",
     "contracts/mock-amm",
     "contracts/mock-lending",
     "tools/replay",
@@ -11,6 +12,7 @@ members = [
     "tools/schema-gen",
     "tools/invocation-fuzzer",
     "tests/composability",
+    "tests/conformance",
 ]
 
 [workspace.dependencies]

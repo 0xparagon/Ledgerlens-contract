@@ -4774,11 +4774,16 @@ impl LedgerLensScoreContract {
     /// information about as potentially risky rather than waving them through.
     ///
     /// This function is **infallible** (returns `bool`, never `Result`) and
-    /// **side-effect free** — it performs a pure read that does not even
-    /// extend storage TTL. It is designed to be called directly from inside
-    /// another contract's authorization / guard logic: it can never panic and
-    /// can never propagate an `Error` back into the caller, so it cannot be
-    /// used to grief the calling protocol's gas or disable its security guard.
+    /// writes **no durable state** — it reads scores without extending their
+    /// TTL. The one write on this path is a bounded *temporary* per-`(wallet,
+    /// asset_pair)` gate-read marker used by the flash-loan protection path
+    /// (#300); it is not consulted by the decision, and it expires with the
+    /// entry it describes. A liveness alert may also be emitted while a read is
+    /// served, if the heartbeat threshold has been exceeded. It is designed to
+    /// be called directly from inside another contract's authorization / guard
+    /// logic: it can never panic and can never propagate an `Error` back into
+    /// the caller, so it cannot be used to grief the calling protocol's gas or
+    /// disable its security guard.
     ///
     /// This function delegates to [`query_risk_gate_with_confidence`] with
     /// `min_confidence = 0`, meaning no confidence floor is applied. All
@@ -5142,8 +5147,9 @@ impl LedgerLensScoreContract {
     /// embargoed, inside the hysteresis risk band, or the confidence floor
     /// is not met.
     ///
-    /// This function is infallible (returns `bool`, never `Result`) and
-    /// side-effect free — it performs pure reads that do not extend TTL.
+    /// This function is infallible (returns `bool`, never `Result`) and reads
+    /// scores without extending their TTL. See [`query_risk_gate`] for the exact
+    /// scope of the temporary gate-read marker and the liveness-alert caveat.
     ///
     /// # Examples
     ///
