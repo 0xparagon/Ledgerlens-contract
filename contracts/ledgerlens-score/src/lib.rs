@@ -228,6 +228,9 @@ mod test_signer_governance;
 mod test_storage_key_collisions;
 
 #[cfg(test)]
+mod test_tla_trace_validation;
+
+#[cfg(test)]
 mod test_schema_version_probes;
 
 #[cfg(test)]
