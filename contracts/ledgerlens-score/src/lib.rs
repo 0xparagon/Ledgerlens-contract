@@ -5147,13 +5147,9 @@ impl LedgerLensScoreContract {
     /// embargoed, inside the hysteresis risk band, or the confidence floor
     /// is not met.
     ///
-<<<<<<< HEAD
     /// This function is infallible (returns `bool`, never `Result`) and reads
     /// scores without extending their TTL. See [`query_risk_gate`] for the exact
     /// scope of the temporary gate-read marker and the liveness-alert caveat.
-=======
-    /// This function is infallible (returns `bool`, never `Result`) and
-    /// side-effect free — it performs pure reads that do not extend TTL.
     ///
     /// # Examples
     ///
@@ -5183,7 +5179,6 @@ impl LedgerLensScoreContract {
     /// // A floor of 0 is the plain `query_risk_gate` path, which delegates here.
     /// assert!(client.query_risk_gate_with_confidence(&wallet, &pair, &75, &0));
     /// ```
->>>>>>> origin/main
     pub fn query_risk_gate_with_confidence(
         env: Env,
         wallet: Address,
