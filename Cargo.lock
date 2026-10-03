@@ -957,6 +957,8 @@ dependencies = [
  "k256",
  "ledgerlens-test-support",
  "libm",
+ "serde",
+ "serde_json",
  "soroban-sdk",
  "subtle",
 ]
