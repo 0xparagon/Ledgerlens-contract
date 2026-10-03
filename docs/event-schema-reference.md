@@ -6,6 +6,36 @@ This document provides the complete event schema for all LedgerLens contract eve
 
 All events include a `EVENT_VERSION` (currently `1`) in their topic array to enable schema evolution without breaking off-chain systems. Any breaking changes (field reordering, type changes, field removal) will bump the version.
 
+### Versioning Policy for Off-Chain Consumers
+
+The typed decoding crate (`ledgerlens-events`) is generated from the machine-readable event schema in CI, so it cannot drift from the contract. Consumers must follow this policy:
+
+- **Known versions** are decoded into strongly typed Rust structs/enums.
+- **Unknown versions** are **not** an error. Decoders return an opaque value (`OpaqueEvent`) that preserves the raw topics and data so callers can log, forward, or handle them without panicking.
+- **Adding a new event or bumping `EVENT_VERSION`** requires updating the schema; CI fails if the contract emits an event the schema or crate does not describe.
+- **Breaking changes** (field reordering, type changes, field removal) bump `EVENT_VERSION`. Non-breaking additions keep the current version.
+
+### Decoding Example
+
+```rust
+use ledgerlens_events::{decode_rpc_event, decode_replay_event, DecodedEvent};
+
+// From a Soroban RPC `getEvents` response entry:
+let decoded = decode_rpc_event(&rpc_event)?;
+match decoded {
+    DecodedEvent::Score(e) => println!("score={} confidence={}", e.score, e.confidence),
+    DecodedEvent::Breach(e) => println!("breach on {} score={}", e.asset_pair, e.score),
+    // Unknown schema versions are surfaced as opaque, never an error:
+    DecodedEvent::Opaque(o) => println!("unknown event version {}: {:?}", o.version, o.topics),
+    _ => {}
+}
+
+// From replay tool output (same typed surface):
+let decoded = decode_replay_event(&replay_record)?;
+```
+
+Golden fixtures for every event topic live under `tools/schema-gen/fixtures/`, and a compatibility test decodes each fixture across supported schema versions.
+
 ## Event Categories
 
 ### 1. Operational/Governance Events
@@ -234,156 +264,3 @@ All events include a `EVENT_VERSION` (currently `1`) in their topic array to ena
 - **Topic**: `("svc_res",)`
 - **Data**: `ServiceResumedEvent { last_active_at, gap_secs }`
 - **Use Case**: Track service recovery and gap duration
-- **Example**: Service returned online after 18-minute gap
-
-#### `hb_upd`
-- **Topic**: `("hb_upd",)`
-- **Data**: `u64` (heartbeat threshold in seconds)
-- **Use Case**: Track heartbeat configuration changes
-- **Example**: Heartbeat threshold changed to 1800 seconds
-
-### 9. Admin & Authorization Events
-
-#### `adm_init`
-- **Topic**: `("adm_init", EVENT_VERSION)`
-- **Data**: `(from: Address, to: Address)`
-- **Use Case**: Log admin transfer initiations
-- **Example**: Admin transfer initiated from 0xabc... to 0xdef...
-
-#### `adm_done`
-- **Topic**: `("adm_done", EVENT_VERSION)`
-- **Data**: `Address` (new admin)
-- **Use Case**: Confirm new admin is active
-- **Example**: New admin 0xdef... accepted transfer
-
-#### `adm_canc`
-- **Topic**: `("adm_canc", EVENT_VERSION)`
-- **Data**: `Address` (admin)
-- **Use Case**: Track cancelled admin transfers
-- **Example**: Admin transfer cancelled by current admin
-
-### 10. Model Version Events
-
-#### `mv_prop`
-- **Topic**: `("mv_prop",)`
-- **Data**: `(version: u32, executable_after: u64)`
-- **Use Case**: Log model version proposals
-- **Example**: Model v4 proposed; active after timestamp 1700086400
-
-#### `mv_act`
-- **Topic**: `("mv_act",)`
-- **Data**: `u32` (active model version)
-- **Use Case**: Confirm model version activation
-- **Example**: Model v4 now active
-
-#### `mv_depr`
-- **Topic**: `("mv_depr",)`
-- **Data**: `u32` (deprecated version)
-- **Use Case**: Alert when model versions are retired
-- **Example**: Model v2 deprecated; no longer accepted
-
-#### `mv_reg`
-- **Topic**: `("mv_reg",)`
-- **Data**: `u32` (registered version)
-- **Use Case**: Track new model registrations
-- **Example**: Model v5 registered (available for proposal/activation)
-
-### 11. Dispute Events
-
-#### `disp_open`
-- **Topic**: `("disp_open", challenger)`
-- **Data**: `(asset_pair, bond: i128, deadline: u64)`
-- **Use Case**: Alert when disputes are initiated
-- **Example**: Dispute opened; resolution deadline in 7 days
-
-#### `disp_res`
-- **Topic**: `("disp_res", challenger)`
-- **Data**: `(asset_pair, corrected_score: u32, bond_returned: i128)`
-- **Use Case**: Confirm dispute resolution
-- **Example**: Dispute resolved; score corrected to 65; bond returned
-
-#### `disp_to`
-- **Topic**: `("disp_to", challenger)`
-- **Data**: `(asset_pair, bond: i128, bonus: i128)`
-- **Use Case**: Track dispute timeout resolutions
-- **Example**: Dispute timed out; bond + bonus forfeited
-
-### 12. Data Integrity Events
-
-#### `scr_dlt`
-- **Topic**: `("scr_dlt", EVENT_VERSION, wallet, asset_pair)`
-- **Data**: `(prev_score, new_score, delta_abs, trend, consecutive_trend)`
-- **Use Case**: Monitor score changes for anomalies
-- **Example**: Score jumped 25 points; trend=+1, consecutive=3
-
-#### `jump`
-- **Topic**: `("jump", wallet, asset_pair)`
-- **Data**: `(prev_score, new_score, delta, model_version, timestamp)`
-- **Use Case**: Alert on anomalous score jumps
-- **Example**: Score jumped 35 points; model v3
-
-#### `clr_hist`
-- **Topic**: `("clr_hist", EVENT_VERSION, wallet)`
-- **Data**: `Symbol` (asset_pair)
-- **Use Case**: Audit score history deletions
-- **Example**: History cleared for XLM/USD
-
-#### `clr_scr`
-- **Topic**: `("clr_scr", EVENT_VERSION, wallet)`
-- **Data**: `Symbol` (asset_pair)
-- **Use Case**: Audit score deletions
-- **Example**: Score cleared for BTC/USDT
-
-## Event Indexer Implementation Tips
-
-### 1. Handle Optional Versions
-Some events omit EVENT_VERSION (legacy events). Always check topic array length.
-
-```python
-def parse_topic(topic):
-    if len(topic) >= 2 and isinstance(topic[1], int):
-        version = topic[1]
-    else:
-        version = 1  # default
-    return version
-```yaml
-
-### 2. Aggregate by Category
-Create tables indexed by event category for fast queries:
-
-```sql
-CREATE TABLE event_streams (
-    event_type TEXT,         -- e.g., "bat_summ", "upg_exec"
-    category TEXT,           -- "data_quality", "governance", etc.
-    timestamp INT64,
-    data JSON,
-    PRIMARY KEY (category, timestamp)
-);
-
-### 3. Alert on Anomalies
-Baseline normal event frequencies, then alert on deviations:
-
-```python
-# Normal: ~100-200 score submissions per 5-minute window
-# Alert if < 50 or > 500
-def check_submission_rate(window_5min):
-    submissions = count_events("score", window_5min)
-    if submissions < 50 or submissions > 500:
-        alert("Anomalous submission rate: " + submissions)
-```yaml
-
-### 4. Cross-Reference Events
-Link related events for context:
-
-```python
-# When bat_summ shows high rejections, find associated events:
-# - bat_rej_* (specific rejection types)
-# - thresh (recent threshold changes?)
-# - paused (contract paused?)
-# - model_version_* (model update?)
-
-## See Also
-
-- [Operator Alerts Guide](./operator-alerts.md)
-- [Event Emission Code](../contracts/ledgerlens-score/src/events.rs)
-- [Event Tests](../contracts/ledgerlens-score/src/test_batch_error_events.rs)

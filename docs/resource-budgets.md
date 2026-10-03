@@ -97,6 +97,68 @@ and issue #757.
 
 ---
 
+## Per-Event Replay Profiling (Issue #1208)
+
+The replay profiler (`tools/replay/`) records the host budget consumed by each
+replayed event and ranks the most expensive event shapes. It complements the
+aggregate benchmarks above: benchmarks give the *average* cost of an entry
+point, while the profiler surfaces the *real* events that are
+disproportionately expensive.
+
+### Metrics
+
+Each replayed event is measured against the host budget interface and reported
+with the following metrics:
+
+| Metric | Source | Meaning |
+|---|---|---|
+| `cpu_instructions` | `env.budget().cpu_instruction_cost()` | Abstract instruction count consumed by the event. Higher means more host CPU work; the dominant cost for compute-heavy paths (batch loops, weighted averages). |
+| `memory_bytes` | `env.budget().memory_bytes_cost()` | Host heap bytes allocated while executing the event. Spikes indicate large deserialization (long history rings, wide batches). |
+| `storage_reads` | host storage read counter | Number of ledger entries read. Grows with index scans and per-pair lookups. |
+| `storage_writes` | host storage write counter | Number of ledger entries written. The primary driver of on-chain fees for write paths. |
+
+### Shape features
+
+Costs are aggregated both by entry point and by the shape features that
+predict cost, so hot spots can be attributed to a concrete trigger:
+
+| Feature | Definition |
+|---|---|
+| `history_depth` | Number of entries in the wallet's score history ring at replay time. |
+| `batch_size` | Number of wallets in a `submit_scores_batch` call. |
+| `signer_count` | Number of signers/attestations attached to the event. |
+
+### Outputs
+
+- **Machine-readable profile** — a deterministic JSON file (stable key order,
+sorted rankings) suitable for diffing and CI consumption.
+- **Human-readable report** — a ranked table of the most expensive entry
+  points and shapes, with the metrics above.
+
+Both outputs are deterministic across runs: identical replay input produces
+byte-identical profiles.
+
+### Comparison mode
+
+`--compare <baseline> <candidate>` diffs two profiles and flags any entry
+point or shape whose cost regresses past a configurable threshold. This is
+wired into CI (`.github/workflows/replay-regression.yml`) to flag regressions
+between commits. Use the same tolerances as the aggregate policy above
+(**10%** read-only, **20%** write) unless the workflow overrides them.
+
+### Interpreting the report
+
+- Compare a shape's cost against the entry-point average: a shape far above
+  the average is a hot spot worth optimizing.
+- A `storage_writes` regression is the most expensive kind — it directly
+  increases fees; treat it as high priority.
+- A `memory_bytes` spike with flat `cpu_instructions` usually means a larger
+  deserialization payload rather than more computation.
+- Rankings are stable across runs, so a shape moving up the ranking between
+  two commits is a reliable regression signal.
+
+---
+
 ## ABI / Compatibility Notes
 
 - Adding a new persistent write inside an existing entry point increases its
