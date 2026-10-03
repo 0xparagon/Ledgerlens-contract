@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
-Proof-of-Concept: Soroban RPC Event Exporter for Replay & Forensics
+DEPRECATED: Soroban RPC Event Exporter for Replay & Forensics
+
+.. deprecated::
+    This script is superseded by the native forked-state loader in the
+    ``tools/replay`` crate (see issue #1207). The native loader implements
+    RPC-based ledger entry fetching with paging, retry and rate-limit
+    behavior, verifies each fetched entry against the shared types, and
+    records the ledger sequence and hash so snapshots are reproducible and
+    attributable.
+
+    This Python script is kept only until the parity tests between the old
+    and new paths pass against the recorded RPC fixture server. Once parity
+    is demonstrated it will be removed. New work should target the native
+    loader instead.
 
 Fetches contract events/transactions directly from a Soroban RPC endpoint
 (e.g., testnet) and outputs them as a frozen NDJSON snapshot for tools/replay.
@@ -14,6 +27,12 @@ import urllib.error
 import urllib.request
 
 DEFAULT_RPC_URL = "https://soroban-testnet.stellar.org/"
+
+DEPRECATION_NOTICE = (
+    "warning: scripts/fetch_testnet_snapshot.py is deprecated and will be "
+    "removed once the native forked-state loader in tools/replay reaches "
+    "parity (see issue #1207). Prefer the native loader for new snapshots."
+)
 
 def fetch_events(rpc_url, contract_id, start_ledger, limit=100):
     events = []
@@ -83,6 +102,7 @@ def main():
 
     args = parser.parse_args()
 
+    print(DEPRECATION_NOTICE, file=sys.stderr)
     print(f"Fetching events from {args.rpc_url} starting at ledger {args.start_ledger}...")
     raw_events = fetch_events(args.rpc_url, args.contract_id, args.start_ledger)
     print(f"Fetched {len(raw_events)} events.")
