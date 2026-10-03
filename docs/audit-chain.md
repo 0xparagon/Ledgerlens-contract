@@ -132,7 +132,7 @@ def verify_audit_chain(events, on_chain_root_bytes):
 
 ## 7. Replay Evidence Bundles
 
-The replay harness in [tools/replay/src/main.rs](tools/replay/src/main.rs) can emit an incident evidence bundle that packages the replayed transactions, generated events, a configuration snapshot, issue references, and SHA-256 hashes into a single deterministic JSON document. This bundle is intended for operator handoffs, incident response, and audit workflows where the exact replay inputs and the resulting evidence need to be reproduced verbatim.
+The replay harness in [tools/replay/src/main.rs](../tools/replay/src/main.rs) can emit an incident evidence bundle that packages the replayed transactions, generated events, a configuration snapshot, issue references, and SHA-256 hashes into a single deterministic JSON document. This bundle is intended for operator handoffs, incident response, and audit workflows where the exact replay inputs and the resulting evidence need to be reproduced verbatim.
 
 The bundle layout is:
 

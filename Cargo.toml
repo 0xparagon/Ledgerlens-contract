@@ -11,6 +11,7 @@ members = [
     "tools/recovery",
     "tools/schema-gen",
     "tools/invocation-fuzzer",
+    "tools/reference-model/driver",
     "tools/score-submitter",
     "tests/composability",
     "tests/conformance",
