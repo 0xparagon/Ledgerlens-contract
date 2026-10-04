@@ -4,9 +4,16 @@
 //!
 //! Batch sizes above [`MAX_BATCH`] are submitted as multiple contract calls
 //! (ceil(n / MAX_BATCH)) because on-chain `MAX_BATCH_SIZE` is 20.
+//!
+//! Issue #1160 adds selectable atomicity modes. This bench measures the cost of
+//! the cheap pre-validation pass that all-or-nothing mode performs before any
+//! write, by running identical inputs through best-effort and all-or-nothing
+//! modes side by side.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient, ScoreSubmission};
+use ledgerlens_score::{
+    AtomicityMode, LedgerLensScoreContract, LedgerLensScoreContractClient, ScoreSubmission,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     Address, Env, Symbol, Vec,
@@ -57,6 +64,7 @@ fn submit_n_entries(
     client: &LedgerLensScoreContractClient,
     asset_pair: &Symbol,
     total: u32,
+    mode: AtomicityMode,
 ) -> (u64, u64) {
     // Benchmark large, multi-call batches without treating the host's
     // single-transaction default ceiling as a harness-wide limit.
@@ -68,7 +76,7 @@ fn submit_n_entries(
     while remaining > 0 {
         let chunk = remaining.min(MAX_BATCH);
         let batch = build_entries(env, asset_pair, chunk, batch_index);
-        black_box(client.submit_scores_batch(&batch));
+        black_box(client.submit_scores_batch_with_mode(&batch, &mode));
         remaining -= chunk;
         batch_index += 1;
         env.ledger().with_mut(|l| l.timestamp += 3_601);
@@ -86,7 +94,13 @@ fn bench_batch_submit(c: &mut Criterion) {
             b.iter(|| {
                 let env = Env::default();
                 let (client, asset_pair) = setup(&env);
-                black_box(submit_n_entries(&env, &client, &asset_pair, size))
+                black_box(submit_n_entries(
+                    &env,
+                    &client,
+                    &asset_pair,
+                    size,
+                    AtomicityMode::BestEffort,
+                ))
             });
         });
     }
@@ -94,5 +108,30 @@ fn bench_batch_submit(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch_submit);
+/// Measures the extra cost of the all-or-nothing pre-validation pass relative
+/// to best-effort on identical inputs (issue #1160 acceptance criteria).
+fn bench_atomicity_modes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("submit_scores_batch_atomicity");
+    group.sample_size(10);
+
+    for size in [1u32, 10, 50, 100] {
+        for mode in [AtomicityMode::BestEffort, AtomicityMode::AllOrNothing] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("{:?}", mode), size),
+                &size,
+                |b, &size| {
+                    b.iter(|| {
+                        let env = Env::default();
+                        let (client, asset_pair) = setup(&env);
+                        black_box(submit_n_entries(&env, &client, &asset_pair, size, mode))
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_batch_submit, bench_atomicity_modes);
 criterion_main!(benches);
