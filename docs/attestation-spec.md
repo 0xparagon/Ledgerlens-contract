@@ -61,6 +61,65 @@ surfaces as `InvalidAttestation` via an explicit equality check, rather than
 as a confusing signature-recovery failure against a digest the caller never
 intended to sign.
 
+## 2a. Bounded evidence digest (issue #1133)
+
+A submission may optionally anchor a **bounded evidence digest** — a compact
+commitment to the off-chain evidence that produced the score — so disputes and
+audits can tie an on-chain score back to the evidence without storing the
+evidence itself on-chain.
+
+```rust
+pub struct EvidenceDigest {
+    /// Algorithm tag for the digest. Only `1` (SHA-256) is currently
+    /// accepted; any other value is rejected with `Error::InvalidAttestation`.
+    pub algorithm: u32,
+    /// The 32-byte digest produced by `algorithm` over the canonical
+    /// evidence encoding (§2b).
+    pub digest: BytesN<32>,
+    /// Optional short locator scheme id (e.g. which off-chain store the
+    /// evidence lives in). `0` means "no locator scheme". Bounded to a
+    /// single byte; values above `255` are rejected.
+    pub locator_scheme: u32,
+}
+```
+
+Strict size limits are enforced on every field: `algorithm` must be a known
+tag, `digest` is exactly 32 bytes by type, and `locator_scheme` must fit in a
+single byte (`0..=255`). Unknown algorithm tags and out-of-range locator
+schemes are rejected with `Error::InvalidAttestation` before any signature
+work is done.
+
+### 2b. What the digest commits to
+
+The digest is computed **off-chain** by the detection pipeline over the
+canonical evidence encoding, which is the concatenation, in order, of:
+
+| Field | Width | Encoding |
+|---|---|---|
+| `evidence_schema_version` | 4 bytes | `u32`, little-endian |
+| `wallet` | 56 bytes | G... StrKey encoding, ASCII |
+| `asset_pair` | 9 bytes | ASCII bytes of the `Symbol`, zero-padded right |
+| `score` | 4 bytes | `u32`, little-endian |
+| `timestamp` | 8 bytes | `u64`, little-endian |
+| `evidence_blob` | variable | raw bytes of the off-chain evidence record |
+
+`digest = SHA-256(canonical_evidence_encoding)`. The digest therefore commits
+to the exact evidence record and the score/timestamp it produced, but not to
+the evidence bytes themselves — an auditor who holds the evidence can
+recompute the digest and compare it against the on-chain value.
+
+### 2c. How an auditor recomputes it
+
+1. Fetch the evidence record referenced by `locator_scheme` (or from the
+   auditor's own archive if `locator_scheme == 0`).
+2. Rebuild the canonical evidence encoding from §2b using the on-chain
+   `wallet`, `asset_pair`, `score`, and `timestamp` from the provenance
+   snapshot.
+3. Compute `SHA-256` over that encoding.
+4. Compare the result against the `digest` returned by the provenance query
+   (§7). A mismatch means the evidence does not correspond to the on-chain
+   score.
+
 ## 3. Commitment preimage layout
 
 `compute_commitment` builds a single byte buffer and hashes it with SHA-256.
@@ -87,6 +146,31 @@ Total preimage length: 211 bytes (56 + 9 + 4 + 1 + 1 + 8 + 4 + 4 + 56 + 32 +
 locked down by the golden-vector and domain-separation tests in
 `test_attestation_domain_compat.rs` (issue #696): any field that is omitted,
 resized, or reordered changes the pinned digest and fails the suite.
+
+### 3a. Versioned, domain-separated extension for the evidence digest
+
+The evidence digest is folded into the signed payload in a **versioned,
+domain-separated** way so that submissions which omit it keep the exact
+211-byte preimage above and continue to verify unchanged:
+
+- When `evidence_digest` is `None`, the preimage is byte-for-byte identical to
+the v2 layout in the table above (211 bytes). No existing payload bytes
+change.
+- When `evidence_digest` is `Some`, the preimage is the 211-byte v2 layout
+  followed by a domain-separation tag and the digest fields:
+
+| Field | Width | Encoding |
+|---|---|---|
+| `domain_tag` | 8 bytes | ASCII `"EVIDENCE"` — separates the extended payload from the base payload |
+| `algorithm` | 4 bytes | `u32`, little-endian |
+| `digest` | 32 bytes | raw digest bytes |
+| `locator_scheme` | 1 byte | `u8` (validated `0..=255`) |
+
+Extended preimage length: 211 + 8 + 4 + 32 + 1 = 256 bytes. Because the base
+payload is a fixed 211 bytes and the extension is appended after a fixed
+domain tag, the two layouts cannot collide: a v2 payload can never be
+reinterpreted as an extended payload or vice versa. The `domain_tag` is what
+makes this domain-separated rather than a bare concatenation.
 
 Rationale for the StrKey (`to_string()`) encoding of `wallet` and the
 contract address: these are the only stable, deterministic byte
@@ -124,6 +208,11 @@ instance) cannot be replayed against another.
      arithmetic is needed since the recovered point's coordinates are already
      known.
 5. Any mismatch at any step is `Error::InvalidAttestation`.
+
+Because the evidence digest is part of the recomputed commitment (§3a), any
+tampering with `algorithm`, `digest`, or `locator_scheme` changes the
+commitment and therefore invalidates the signature — the digest is
+authenticated by the same signature that covers the rest of the payload.
 
 ## 5. Key format and canonicalization
 
