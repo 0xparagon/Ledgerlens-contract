@@ -216,6 +216,72 @@ jobs:
           path: target/test-tiers/
           retention-days: 14
 
+  # ── Feature-tier profile matrix (issue #1193) ───────────────────────────────
+  #
+  # Builds and tests each documented Cargo feature profile so operators can
+  # pick a core / standard / full deployment. Each profile is compiled with
+  # `--no-default-features` plus its explicit feature set, so a feature that
+  # is off is genuinely absent from the ABI (not present-and-failing).
+  #
+  #   core     — minimal ledger surface only.
+  #   standard — core + governance + privacy + proofs.
+  #   full     — standard + oracle + dispute (the default release profile).
+  #
+  # The per-profile WASM size budget is enforced by scripts/check-wasm-size.sh
+  # (which reads the profile name from WASM_PROFILE) and the ABI/schema
+  # snapshot for each profile is produced by scripts/abi-snapshot.sh so the
+  # diff gate compares like-for-like snapshots.
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  feature-profiles:
+    name: Feature profile (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: core
+            features: ""
+          - profile: standard
+            features: "governance,privacy,proofs"
+          - profile: full
+            features: "governance,privacy,proofs,oracle,dispute"
+    env:
+      WASM_PROFILE: ${{ matrix.profile }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build profile WASM
+        run: |
+          cargo build \
+            --target wasm32-unknown-unknown \
+            --release \
+            -p ledgerlens-score \
+            --no-default-features \
+            --features "${{ matrix.features }}" \
+            --locked
+      - name: Test profile subset
+        run: |
+          cargo test \
+            -p ledgerlens-score \
+            --no-default-features \
+            --features "${{ matrix.features }}" \
+            --locked
+      - name: Enforce per-profile WASM size budget
+        run: ./scripts/check-wasm-size.sh
+      - name: Generate per-profile ABI/schema snapshot
+        run: ./scripts/abi-snapshot.sh "${{ matrix.profile }}"
+      - name: Upload profile ABI snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: abi-snapshot-${{ matrix.profile }}
+          path: target/abi-snapshot-${{ matrix.profile }}.json
+          retention-days: 7
+
   production-acceptance:
     name: Production acceptance report
     needs: changes

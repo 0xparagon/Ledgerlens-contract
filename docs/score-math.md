@@ -1,34 +1,27 @@
-# Score Aggregation Mathematics
+# Score Math (`ledgerlens-math`)
 
-This document describes the mathematical formulas, fixed-point representation, and integer arithmetic used in LedgerLens score aggregation. Off-chain simulators must use identical integer arithmetic and truncation behavior to match on-chain results.
+This document describes the shared, `no_std` fixed-point and statistics crate
+`ledgerlens-math` that backs all score arithmetic in LedgerLens.
 
----
+## Motivation
 
-## Fixed-Point Representation
+Score arithmetic (weighted aggregation, decay, interpolation, variance,
+percentiles, fee computation) previously lived inside the contract crate and
+could not be reused by the aggregator, the replay tool, the simulator, or
+formal verification without pulling in contract dependencies. The math is now
+extracted into a single audited implementation used everywhere.
 
-### Scale Factor
-
-All fractional values in LedgerLens are represented as integers scaled by a fixed multiplier:
+## Crate layout
 
 ```
-SCALE = 1,000,000  (10^6)
-
-A value represented in fixed-point is scaled by multiplying by `SCALE`. For example:
-- 1.0 is represented as `1_000_000`
-- 0.5 is represented as `500_000`
-- 0.000001 is represented as `1`
-
-### Why Fixed-Point?
-
-Soroban (Stellar's smart contract platform) has no floating-point arithmetic. Fixed-point integer arithmetic is used to approximate decimal values while maintaining determinism across all environments (on-chain Rust, off-chain simulators, indexers).
-
-### Conversion Formulas
-
-**From floating-point to fixed-point:**
-```
-fixed = float_value * SCALE
-
-**From fixed-point to floating-point:**
+crates/ledgerlens-math/
+  Cargo.toml        # no_std, no Soroban SDK dependency
+  CHANGELOG.md
+  src/
+    lib.rs          # public API + crate docs
+    fixed.rs        # fixed-point primitives
+    stats.rs        # aggregation, variance, percentiles
+    fee.rs          # fee computation
 ```
 float_value = fixed / SCALE
 
@@ -591,67 +584,71 @@ against a configurable drift threshold (the "jump threshold").  A score change
 whose absolute delta exceeds the threshold is classified as a suspicious jump
 and triggers an on-chain event.
 
-### Jump Threshold
+The crate is `#![no_std]` and depends only on `core`. It must not depend on
+`soroban-sdk` or any contract crate.
 
-| Parameter | Storage function | Description |
-|---|---|---|
-| `jump_threshold` | `set_jump_threshold(threshold: u32)` | Maximum permitted absolute delta between consecutive scores. Default: 50. |
+## Public API
 
-`get_jump_threshold() -> u32` returns the current threshold.
+All functions are pure: they take plain integers and return plain integers.
+They never touch `Env`, storage, or events.
 
-### Drift Check Logic
+### Fixed-point
 
-delta = |new_score - previous_score|
+| Function | Contract |
+| --- | --- |
+| `mul_div(a, b, denom)` | Computes `a * b / denom` with 128-bit intermediate. Returns `None` on `denom == 0` or overflow. Rounds toward zero. |
+| `mul_div_round(a, b, denom)` | As `mul_div`, but rounds half away from zero. |
+| `clamp(x, lo, hi)` | Returns `x` clamped to `[lo, hi]`. Panics only if `lo > hi`. |
 
-if delta > jump_threshold:
-    emit ScoreJumpAnomalyEvent { wallet, pair, prev, new, delta, timestamp }
-    increment jump_anomaly_count for (wallet, pair)
+### Statistics
 
-# The submission is still stored (fail-soft by default).
-# Use is_flagged=true to mark emergency overrides.
-```yaml
+| Function | Contract |
+| --- | --- |
+| `weighted_mean(values, weights)` | Weighted mean with 128-bit accumulation. Returns `None` if lengths differ, are empty, or the total weight is zero. Rounds toward zero. |
+| `decay(value, factor_bps, periods)` | Applies `factor_bps` decay per period. Returns `None` on overflow. |
+| `interpolate(x, x0, x1, y0, y1)` | Linear interpolation. Returns `None` if `x1 == x0`. Rounds toward zero. |
+| `variance(values)` | Population variance. Returns `None` if empty. Rounds toward zero. |
+| `percentile(values, p_bps)` | Nearest-rank percentile, `p_bps` in `[0, 10_000]`. Returns `None` if empty or `p_bps > 10_000`. |
 
-**Notes:**
-- The first submission for a `(wallet, pair)` has no previous score, so it is
-  never classified as a drift anomaly.
-- The boundary is **exclusive**: `delta == jump_threshold` is accepted without
-  an anomaly; `delta == jump_threshold + 1` triggers the anomaly.
-- Score drops (decreasing changes) are subject to the same check as increases.
+### Fees
 
-### Jump Stats API
+| Function | Contract |
+| --- | --- |
+| `fee(amount, rate_bps)` | Computes `amount * rate_bps / 10_000`. Returns `None` on overflow. Rounds toward zero. |
 
-- `get_jump_stats(wallet: Address, pair: Symbol) -> (u32, u64)` — returns
-  `(anomaly_count, last_anomaly_timestamp)` for the given wallet/pair.
-  Operators can poll this to detect wallets with frequent suspicious jumps.
+## Overflow and rounding contracts
 
-### Drift Threshold Guidelines
+- Every fallible function returns `Option`; callers must handle `None`.
+- Intermediate products use `i128`/`u128` to avoid silent wraparound.
+- Rounding is documented per function and is always deterministic.
+- No function panics on valid inputs; panics are reserved for programmer
+errors (e.g. `clamp` with `lo > hi`).
 
-| Threshold value | Behavior |
-|---|---|
-| 0 | Any change from the previous score triggers an anomaly (maximum sensitivity). |
-| 50 (default) | Changes of more than 50 points are flagged. Covers model recalibrations. |
-| 100 | Only the most extreme jumps (score goes from one extreme to another) are flagged. |
+## Differential testing
 
-### ABI / Storage Notes
+Before the old in-contract implementations were deleted, differential tests
+ran the old and new implementations side by side on generated inputs and
+asserted byte-identical results. These tests live in
+`crates/ledgerlens-math/tests/differential.rs` and are exercised in a nightly
+job over at least one million generated inputs.
 
-- `jump_threshold` is configurable post-deploy by admin multisig via
-  `set_jump_threshold`.
-- `ScoreJumpAnomalyEvent` is emitted on the `jmp_ano` topic with data
-  `(prev_score, new_score, abs_delta, threshold, timestamp)`.
-- Jump stats are stored per `(wallet, asset_pair)` under a persistent key.
+## WASM size and CPU budget
 
-### Test Coverage
+Extraction is size-neutral or better: the contract crate now depends on
+`ledgerlens-math` instead of carrying the math inline, and the crate is
+`no_std` with no SDK dependency. Size and CPU budget reports are recorded in
+the PR and show no regression.
 
-Drift boundary conditions are verified in
-`contracts/ledgerlens-score/src/test_bounded_drift.rs`, covering within-threshold,
-at-boundary, one-above-boundary, drops, first-submission, configurable threshold,
-and counter increment cases.
+## Consumers
 
----
+`ledgerlens-math` is the single dependency for:
 
-## References
+- the score contract,
+- Kani harnesses,
+- benchmarks,
+- off-chain tools (aggregator, replay, simulator).
 
-- **Interface specification:** [`docs/interface-spec.md`](interface-spec.md)
-- **Contract source:** `contracts/ledgerlens-score/src/lib.rs`
-- **Constants:** `contracts/ledgerlens-score/src/constants.rs`
+## Mutation testing
 
+Mutation coverage is preserved on the moved code by pointing the mutation
+testing configuration at `crates/ledgerlens-math/src/`.
