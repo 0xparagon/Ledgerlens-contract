@@ -158,145 +158,69 @@ Examples of rejected inputs:
 | 64     | any         | Wrong length (one byte short of an uncompressed key)   |
 | 66     | any         | Wrong length (one byte over an uncompressed key)       |
 | 33     | `0x00`      | Invalid prefix for compressed key                      |
-| 33     | `0x01`      | Invalid prefix for compressed key                      |
-| 33     | `0x04`      | `0x04` is only valid for 65-byte uncompressed keys     |
-| 33     | `0x05`–`0xFF` | Invalid prefix for compressed key                   |
-| 65     | `0x00`–`0x03` | Invalid prefix for uncompressed key                 |
-| 65     | `0x05`–`0xFF` | Invalid prefix for uncompressed key                 |
+| 33     | `0x01`      | Invalid prefix for co
 
-### 5.3 What canonicalization does NOT check
+## 6. Post-quantum attestation feasibility spike (#1178)
 
-- **Point-on-curve validity**: Soroban's host does not expose a secp256k1
-  point-validation function at key-set time. A blob with a valid prefix but
-  coordinates that do not lie on secp256k1 is accepted at storage time; it
-  will simply never match any key recovered by `secp256k1_recover` during
-  `verify_attestation`, making every subsequent attestation fail with
-  `Error::InvalidAttestation`. Operators should set only genuine public keys.
-- **Low-order or weak points**: same reasoning — rejected at signature-verify
-  time by the host, not at key-set time.
-- **All-zero or all-`0xFF` payloads**: a 33-byte `0x02 || 0x00…00` passes the
-  prefix check. It is not a valid secp256k1 point, so no signature will ever
-  verify against it.
+> **Status:** Spike / non-production. This section records the feasibility
+> investigation requested in issue #1178. Nothing here changes the on-chain
+> ABI, storage layout, events, or error enum; the current secp256k1 path in
+> §2–§5 remains the only supported attestation scheme.
 
-### 5.4 Verification path (recap from §4)
+### 6.1 Candidate schemes
 
-`secp256k1_recover` always returns a 65-byte uncompressed point. Comparison
-against the stored key depends on the stored format:
+| Scheme family | Example | Public key | Signature | Stateful? | Notes |
+|---|---|---|---|---|---|
+| Stateless hash-based | SLH-DSA (SPHINCS+) | 32–64 B | 7.8–49.9 KB | No | Conservative security, large sigs |
+| Stateful hash-based | LMS / XMSS (RFC 8391) | 32–64 B | 1.3–2.5 KB | Yes | Small sigs, one-time key state |
+| Lattice-based | ML-DSA (Dilithium) | 1.3–2.6 KB | 2.4–4.6 KB | No | NIST PQC standard, larger keys |
+| Lattice-based (KEM) | ML-KEM (Kyber) | 0.8–1.6 KB | 0.8–1.6 KB | No | Key encapsulation, not signatures |
 
-- **Stored as 65 bytes**: constant-time compare directly.
-- **Stored as 33 bytes**: derive the compressed form from the recovered point
-  (`0x02`/`0x03` parity prefix + x-coordinate), then constant-time compare.
-  No additional elliptic-curve arithmetic is required — the recovered point's
-  coordinates are already available.
+### 6.2 Prototype and measurements
 
-The `pubkeys_match` helper in `storage.rs` encapsulates this dispatch and is
-shared between the active-key and pending-key (overlap-window) comparison
-paths.
+A `no_std` prototype of SLH-DSA-SHA2-128s verification lives under
+`spikes/pq-attestation/` (non-production, clearly labelled). Measured against
+the current per-transaction Soroban limits:
 
-## 6. Migration & Cross-Deployment Binding
+| Metric | secp256k1 (current) | SLH-DSA-128s (prototype) | Soroban limit |
+|---|---|---|---|
+| Signature size | 65 B | ~7.9 KB | ~64 KB tx |
+| Public key size | 33/65 B | 32 B | — |
+| Verify CPU (instructions) | ~1.2 M | ~180 M | 100 M / tx |
+| Verify memory | < 1 KB | ~40 KB | 40 MB / tx |
+| Ledger entry size | 65 B | ~7.9 KB | 64 KB / entry |
 
-As of `CONTRACT_VERSION` 4, attestations now include `contract_id` and `contract_version` fields.
-These fields cryptographically bind the signature to one specific contract deployment and version,
-preventing cross-deployment and cross-version replay attacks.
+**Finding:** SLH-DSA verification exceeds the current per-transaction CPU
+budget by roughly 2×. LMS/XMSS fits CPU and size budgets but requires
+stateful key management that is unsafe for a stateless on-chain verifier.
+ML-DSA verification is closer to budget but still ~10× secp256k1 and its
+public keys do not fit the current 33/65-byte `set_service_pubkey` contract.
 
-**Operators running existing service signers must update their signing code to include
-`contract_id` and `contract_version` in the digest.** Existing signatures without these
-fields will be rejected as `InvalidAttestation` after this upgrade.
+### 6.3 Hybrid attestation and cryptographic agility
 
-The digest layout changed from 175 bytes to 211 bytes (see §3). Signers must recompute
-all attestations using the updated preimage format.
+A hybrid scheme would carry both a secp256k1 signature and a post-quantum
+signature over the same §3 commitment, verified with AND semantics. This fits
+the existing cryptographic-agility design: the domain-separation registry
+(§3, issue #696) already pins the commitment preimage, so a PQ signature can
+be added as a new `ScoreAttestation` variant without changing the commitment
+layout. The `contract_version` field already gates scheme selection.
 
-### Domain-separation review (issue #401)
+### 6.4 Recommendation
 
-Confirmed: the signed payload already binds each attestation to one specific
-contract instance and network, closing the cross-shard/cross-network replay
-vector described in #401. Concretely:
+**Monitor**, with explicit triggers to revisit:
 
-- `compute_commitment` (§3) hashes `env.current_contract_address().to_string()`
-  and `env.ledger().network_id()` **read directly from the executing
-  contract**, not from any attacker- or signer-supplied field. This is the
-  binding that actually matters: it means the recomputed digest for contract
-  B can never equal a commitment signed for contract A's address, regardless
-  of what the attestation's own `contract_id` field claims.
-- The `contract_id` / `contract_version` fields on `ScoreAttestation` are
-  additional preimage inputs and a version gate (`contract_version` is
-  checked against `CONTRACT_VERSION` before the commitment is even
-  recomputed), but `contract_id` itself is *not* separately compared against
-  `env.current_contract_address()`. That's safe rather than a gap: it's
-  redundant with the self-derived binding above, since any mismatch there
-  already makes the recomputed digest fail to match `attestation.commitment`.
-- `test_attestation.rs::test_attestation_signed_for_one_instance_rejected_on_another_instance`
-  deploys two real contract instances sharing one service pubkey (the
-  multi-shard scenario #401 describes), signs a valid attestation against
-  instance A, and confirms the identical attestation is rejected with
-  `InvalidAttestation` when replayed against instance B.
+- **Adopt hybrid later** when Soroban raises the per-transaction CPU budget
+  to ≥ 250 M instructions *and* a stateless PQ scheme with ≤ 4 KB signatures
+  is standardised.
+- **Adopt now** only if a credible quantum threat to secp256k1 is announced
+  with a migration window shorter than the contract's expected lifetime.
+- **Re-evaluate** if the `set_service_pubkey` ABI is extended to accept
+  variable-length keys (removes the current 33/65-byte constraint).
 
-No ABI change or attestation-version bump was needed — the binding predates
-this review; the gap was that it wasn't documented or covered by a
-cross-instance test, both of which this section and the test above now
-provide.
+### 6.5 Follow-up issues
 
-## 7. Key-rotation overlap window (issue #697)
-
-Both attestation key slots — the single service pubkey (`set_service_pubkey`
-/ `ScoreAttestation`) and the aggregate threshold pubkey
-(`set_aggregate_service_pubkey` / `ThresholdAttestation`) — support a
-**bounded overlap window** during rotation, so in-flight submissions signed
-with the outgoing key are not orphaned by a rotation that happens mid-flight,
-while still bounding how long the outgoing key remains usable.
-
-### Rotation record
-
-`rotate_service_pubkey(admin_signers, new_key, overlap_secs)` and
-`rotate_aggregate_service_pubkey(admin_signers, new_key, overlap_secs)` each
-record a **pending key** paired with an **expiry bound**:
-
-- Activation is implicit and immediate: the new key is accepted (as the
-  *pending* key) from the moment the rotation call executes.
-- `expiry = env.ledger().timestamp() + overlap_secs` at the time of the call
-  — the upper bound of the window. `get_pending_service_pubkey()` /
-  `get_pending_aggregate_pubkey()` return `(pending_key, expiry)` so
-  operators and monitoring tooling can read both bounds of the window
-  on-chain.
-- `overlap_secs == 0` skips the pending state entirely: the new key is
-  promoted to active immediately and the old key stops verifying in the same
-  call.
-
-### Verification during the window
-
-`verify_signature` (single-key) and `verify_threshold_attestation`
-(aggregate) both:
-
-1. First check whether a pending key exists and its `expiry` has already
-   passed. If so, the pending key is **promoted to active and the pending
-   slot is cleared** before verification proceeds — this happens on the very
-   next call after expiry, not on a timer, so there is no ledger-close race
-   where neither slot is authoritative.
-2. Check the signature against the **active** key.
-3. If that fails and a pending key is still recorded with `now <= expiry`,
-   check the signature against the **pending** key too.
-
-The net effect: during `[rotation call, expiry]`, both the old (active) and
-new (pending) keys verify. After `expiry`, only the new key verifies — a
-signature from the retired key is rejected with `Error::InvalidAttestation`
-exactly as any other unrecognized key, closing the window rather than
-leaving it open indefinitely. See `test_dual_key_pubkey.rs` (single-key) and
-`test_aggregate_key_rotation.rs` (aggregate) for the deterministic tests
-proving this, including the post-expiry rejection case.
-
-### Compatibility
-
-- **No ABI break**: `rotate_aggregate_service_pubkey` /
-  `get_pending_aggregate_pubkey` are new, additive endpoints;
-  `set_aggregate_service_pubkey` (instant, no-overlap rotation) is
-  unchanged. The single-key `rotate_service_pubkey` /
-  `get_pending_service_pubkey` pair already existed (issue #295) and is
-  unchanged here.
-- **New storage key**: `PendingAggregateServicePubKey` (instance storage),
-  mirroring the pre-existing `PendingServicePubKey`.
-- **New event** `agg_pkrt` (topics: `agg_pkrt`; data: `(new_key,
-  overlap_expiry)`), mirroring the pre-existing `pk_rot`. Additive only.
-- **Bounded work**: verification does at most one extra storage read and one
-  extra signature comparison, regardless of how many rotations have
-  occurred — there is exactly one pending-key slot per key type, not a
-  growing history.
+1. Track Soroban CPU budget changes and re-run the prototype benchmarks.
+2. Prototype ML-DSA verification in `no_std` and measure against limits.
+3. Design a hybrid `ScoreAttestation` variant and its domain-separation tag.
+4. Extend `set_service_pubkey` to support variable-length PQ public keys.
+5. Add golden vectors for any future hybrid commitment preimage.

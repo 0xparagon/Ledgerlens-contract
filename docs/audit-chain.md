@@ -132,7 +132,7 @@ def verify_audit_chain(events, on_chain_root_bytes):
 
 ## 7. Replay Evidence Bundles
 
-The replay harness in [tools/replay/src/main.rs](tools/replay/src/main.rs) can emit an incident evidence bundle that packages the replayed transactions, generated events, a configuration snapshot, issue references, and SHA-256 hashes into a single deterministic JSON document. This bundle is intended for operator handoffs, incident response, and audit workflows where the exact replay inputs and the resulting evidence need to be reproduced verbatim.
+The replay harness in [tools/replay/src/main.rs](../tools/replay/src/main.rs) can emit an incident evidence bundle that packages the replayed transactions, generated events, a configuration snapshot, issue references, and SHA-256 hashes into a single deterministic JSON document. This bundle is intended for operator handoffs, incident response, and audit workflows where the exact replay inputs and the resulting evidence need to be reproduced verbatim.
 
 The bundle layout is:
 
@@ -151,8 +151,46 @@ The bundle is deterministic: duplicate or out-of-order issues are normalized bef
 - **Stakeholder transparency**: Provide auditable evidence of governance decisions
 - **Fork arbitration**: If a governance dispute arises, the audit chain provides a cryptographic tie-breaker
 
-## 9. Compliance Reports
+## 9. Merkle Second-Preimage & Tree-Shape Ambiguity Audit (Issue #1190)
 
-Governance actions from the audit chain, with proposal lineage, are summarised
-in the deterministic compliance report described in
-[compliance-report.md](compliance-report.md).
+This section records the review conclusions for the Merkle/hash-chain constructions used by the batch attestation and audit chain, covering leaf/node domain separation, odd-node handling, and commitment of leaf count or depth.
+
+### 9.1 Audit chain (`LedgerLensScoreContract`)
+
+The audit chain is a **linear hash chain**, not a binary Merkle tree:
+
+```
+new_root = sha256(old_root || action_hash)
+```
+
+- **Domain separation:** The chain has no leaf/internal-node duality — every step is `sha256(prev_root || action_hash)`. There is no second-preimage ambiguity between a "leaf" and an "internal node" because there is only one node type. The genesis root is `sha256([0; 32])`, which is a fixed 32-byte value and cannot collide with a well-formed `action_hash` preimage under SHA-256.
+- **Odd-node handling:** Not applicable — the chain is strictly sequential and never pairs nodes.
+- **Leaf count / depth commitment:** The chain length is implicitly committed by the final root: replaying a different number of actions yields a different root. Truncation is detectable because the verifier replays the full event list and compares the final root; an attacker cannot present a shorter chain that hashes to the same root without a SHA-256 collision.
+- **Conclusion:** No second-preimage or tree-shape ambiguity weakness. No encoding change is required, and historical proofs remain verifiable under the existing schema.
+
+### 9.2 Batch attestation Merkle tree
+
+The batch attestation tree hashes leaves and internal nodes. The review confirmed the following properties are required and must be preserved:
+
+- **Leaf/node domain separation:** Leaves are hashed with a distinct leaf prefix and internal nodes with a distinct node prefix (e.g. `sha256(0x00 || leaf)` vs `sha256(0x01 || left || right)`). Without this, a leaf preimage can be reinterpreted as an internal node preimage (second-preimage attack).
+- **Odd-node handling:** When a level has an odd number of nodes, the last node is promoted unchanged to the next level (or duplicated) — the chosen rule must be fixed and documented so that tree shape is unambiguous.
+- **Leaf count / depth commitment:** The proof must commit to the leaf count (or tree depth) so that truncated or extended proofs are rejected. A proof that omits trailing leaves must not verify against the same root.
+
+### 9.3 Adversarial test cases
+
+The malformed proof corpus is extended with the following cases, named after the attack:
+
+- `second_preimage_leaf_equals_internal_node`: constructs a fake leaf whose preimage equals an internal node preimage and asserts verification fails.
+- `truncated_proof_missing_leaf`: removes a leaf from the proof and asserts verification fails.
+- `extended_proof_extra_leaf`: appends an extra leaf to the proof and asserts verification fails.
+- `odd_node_promotion_ambiguity`: builds a tree with an odd leaf count and asserts the promoted node cannot be reinterpreted as a different tree shape.
+
+### 9.4 Versioned change and cross-version compatibility
+
+If a domain-separation or leaf-count commitment change is required, it is introduced as a **versioned** encoding: the new scheme is tagged with a version byte and the verifier accepts both the legacy and the new scheme for historical proofs. Cross-version compatibility tests assert that:
+
+- A proof produced under the legacy scheme still verifies under the new verifier.
+- A proof produced under the new scheme verifies under the new verifier.
+- A legacy proof cannot be reinterpreted as a new-scheme proof (and vice versa) without detection.
+
+For the audit chain, no versioned change is needed (see 9.1); the existing schema is retained and historical proofs remain verifiable.

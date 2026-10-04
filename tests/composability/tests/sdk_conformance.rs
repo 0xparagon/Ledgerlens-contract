@@ -1,10 +1,10 @@
-use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
+use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient, RiskScore};
 use mock_amm::{FailPolicy as AmmFailPolicy, MockAmm, MockAmmClient, MockAmmError};
 use serde::Deserialize;
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger as _},
-    Address, Env, Vec,
+    Address, Env, IntoVal, TryFromVal, Vec,
 };
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +32,13 @@ struct Case {
     fail_policy: Option<String>,
     required_oracle_version: Option<serde_json::Value>,
     expected: String,
+}
+
+fn assert_risk_score_wire_roundtrip(env: &Env, expected: &RiskScore) {
+    let encoded: soroban_sdk::Val = expected.clone().into_val(env);
+    let decoded = RiskScore::try_from_val(env, &encoded)
+        .expect("RiskScore must round-trip through the Soroban Val/XDR boundary");
+    assert_eq!(decoded, *expected, "RiskScore field order or layout drifted");
 }
 
 #[test]
@@ -130,6 +137,12 @@ fn sdk_conformance() {
                 &1,
                 &None,
             );
+
+            let stored = ledgerlens.get_score(&wallet, &symbol_short!("XLM_USDC"));
+            assert_eq!(stored.score, s, "Case '{}' stored score differs from submitted score", case.name);
+            assert_eq!(stored.confidence, c, "Case '{}' stored confidence differs from submitted confidence", case.name);
+            assert_eq!(stored.timestamp, submission_time, "Case '{}' stored timestamp differs from submitted timestamp", case.name);
+            assert_risk_score_wire_roundtrip(&env, &stored);
 
             env.ledger().with_mut(|l| l.timestamp += a);
         }
