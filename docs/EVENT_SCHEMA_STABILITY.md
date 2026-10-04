@@ -158,6 +158,39 @@ All events are tested to ensure:
 2. **Use public API events** instead for production systems
 3. **Contact team** if you need production-grade observability for a feature currently in testing
 
+## Typed Event Decoding Crate
+
+Off-chain consumers should not hand-roll decoders for each event topic. The `ledgerlens-events` crate is generated from the machine-readable event schema (see `docs/event-schema-reference.md` and `tools/schema-gen`) so that the Rust types and decoders cannot drift from the contract.
+
+### Decoding example
+
+```rust
+use ledgerlens_events::{decode_event, DecodedEvent};
+
+// `raw` is a Soroban RPC `getEvents` entry or a replay-tool event record.
+let decoded = decode_event(&raw)?;
+
+match decoded {
+    DecodedEvent::Score(ev) => {
+        // Strongly typed fields, no manual topic/data parsing.
+        println!("score {} for {} on {}", ev.score, ev.wallet, ev.asset_pair);
+    }
+    DecodedEvent::Breach(ev) => println!("breach: {}", ev.wallet),
+    // Unknown schema versions are surfaced as opaque, never as an error.
+    DecodedEvent::Opaque(ev) => {
+        println!("unknown schema version {} for topic {}", ev.schema_version, ev.topic);
+    }
+}
+```
+
+### Versioning policy
+
+- Every event carries a `schema_version` field. The crate decodes the versions it was generated for and returns any other version as `DecodedEvent::Opaque`, preserving the raw topic and data so callers can log or forward it.
+- Unknown versions are **not** an error: consumers must be able to keep running across a contract upgrade before they regenerate the crate.
+- The crate is regenerated in CI from the event schema. CI fails if the contract emits an event that the schema or crate does not describe, so the crate cannot silently drift from the contract.
+- Golden fixtures exist for every event topic, and a compatibility test decodes fixtures across schema versions to guard against regressions.
+- The generated type shape (topic enum + per-event structs + opaque fallback) is intentionally language-neutral so the TypeScript and Python SDK generators can reuse the same schema and fixtures.
+
 ## Resource Usage Considerations
 
 Event emission has bounded resource costs:
@@ -179,21 +212,15 @@ Worst-case event payload size: ~500 bytes per score submission + ~200 bytes per 
 // 3. scr_veto(wallet, asset_pair, ...) - veto applied
 
 // Off-chain auditor can reconstruct: what score was submitted, when it changed, and why
-```yaml
+```
 
 ### Monitoring service health
 
 ```rust
 // These events help monitor:
-events:
-  - svc_upd - Service address changed
-  - svc_sil - Service went silent
-  - svc_res - Service came back online
+//   svc_upd - Service address changed
+//   svc_sil - Service went silent
+//   svc_res - Service came back online
 
 // Operators can set alerts on these without depending on stable schemas
-
-## See Also
-
-- [Event Causality Identifiers](./EVENT_CAUSALITY.md) - Correlation IDs linking multi-step workflows
-- [Audit Replay Testing](./AUDIT_REPLAY.md) - Reconstructing state from events
-- [Deployment Checklist](./DEPLOYMENT_CHECKLIST.md) - Production sign-off process
+```

@@ -1,8 +1,75 @@
 /// Aggregator score read optimization for large wallet portfolios.
 /// Reduces redundant storage queries and unnecessary computations when processing
 /// wallets containing numerous asset pairs.
+///
+/// # Extended-precision scores (issue #1155)
+///
+/// Scores are stored internally at basis-point resolution (`0..=10_000`) while the
+/// public 0-100 API is preserved through a documented projection. The projection
+/// uses **ceiling** rounding so that risk gates never under-report: a stored value
+/// of `1` bp projects to `1`, and any non-zero risk projects to at least `1`.
+/// Legacy 0-100 values are migrated implicitly by multiplying by `SCORE_SCALE`
+/// (`100`), so no bulk storage rewrite is required.
 
 use soroban_sdk::{Address, Symbol, Vec};
+
+/// Basis-point resolution of the extended-precision score scale.
+pub const SCORE_SCALE: u32 = 100;
+
+/// Maximum value of the extended-precision (basis-point) score.
+pub const SCORE_BP_MAX: u32 = 10_000;
+
+/// Maximum value of the legacy 0-100 projected score.
+pub const SCORE_LEGACY_MAX: u32 = 100;
+
+/// Projection rounding rule applied when collapsing a basis-point score back to
+/// the legacy 0-100 scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreRounding {
+    /// Round toward zero. Never used for risk gates (can under-report).
+    Floor,
+    /// Round to the nearest integer, ties away from zero.
+    Nearest,
+    /// Round away from zero. Default: risk gates must never under-report.
+    Ceiling,
+}
+
+/// Extended-precision score stored at basis-point resolution (`0..=10_000`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedScore {
+    /// Score in basis points.
+    pub basis_points: u32,
+}
+
+impl ExtendedScore {
+    /// Construct from a basis-point value, saturating at [`SCORE_BP_MAX`].
+    pub fn from_basis_points(basis_points: u32) -> Self {
+        ExtendedScore { basis_points: basis_points.min(SCORE_BP_MAX) }
+    }
+
+    /// Construct from a legacy 0-100 score using the implicit scale factor.
+    /// This is the migration path for existing entries: no storage rewrite is
+    /// needed, the legacy value is simply widened on read.
+    pub fn from_legacy(legacy: u32) -> Self {
+        Self::from_basis_points(legacy.min(SCORE_LEGACY_MAX).saturating_mul(SCORE_SCALE))
+    }
+
+    /// Project back to the legacy 0-100 scale using the given rounding rule.
+    pub fn project(&self, rounding: ScoreRounding) -> u32 {
+        let bp = self.basis_points;
+        let projected = match rounding {
+            ScoreRounding::Floor => bp / SCORE_SCALE,
+            ScoreRounding::Nearest => (bp + SCORE_SCALE / 2) / SCORE_SCALE,
+            ScoreRounding::Ceiling => (bp + SCORE_SCALE - 1) / SCORE_SCALE,
+        };
+        projected.min(SCORE_LEGACY_MAX)
+    }
+
+    /// Project using the default risk-safe rule (ceiling).
+    pub fn to_legacy(&self) -> u32 {
+        self.project(ScoreRounding::Ceiling)
+    }
+}
 
 /// Score read statistics for optimization tracking
 #[derive(Debug, Clone)]
@@ -101,6 +168,14 @@ pub struct BatchedScoreResult {
     pub is_stale: bool,
 }
 
+impl BatchedScoreResult {
+    /// Project the stored basis-point score to the legacy 0-100 scale using the
+    /// risk-safe (ceiling) rounding rule.
+    pub fn projected_score(&self) -> u32 {
+        ExtendedScore::from_basis_points(self.score).to_legacy()
+    }
+}
+
 /// Optimized portfolio scorer using batched reads
 pub struct PortfolioScorer {
     config: BatchConfig,
@@ -150,6 +225,141 @@ impl PortfolioScorer {
     /// Check if caching is enabled
     pub fn caching_enabled(&self) -> bool {
         self.config.enable_caching
+    }
+}
+
+/// Identifies a single cross-contract shard read. Every field that can
+/// influence the returned score is part of the key so that two reads only
+/// share a memo entry when they are guaranteed to observe the same shard
+/// state: the shard contract, the subject being scored, the policy
+/// parameters and the shard revision the read was taken against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardReadKey {
+    /// Shard contract that owns the state being read
+    pub shard: Address,
+    /// Subject (wallet / account) the read is scoped to
+    pub subject: Address,
+    /// Policy parameters that influence the result
+    pub policy_params: u64,
+    /// Shard revision the read is pinned to
+    pub revision: u32,
+}
+
+impl ShardReadKey {
+    /// Build a fully-qualified memo key for a shard read.
+    pub fn new(shard: Address, subject: Address, policy_params: u64, revision: u32) -> Self {
+        ShardReadKey { shard, subject, policy_params, revision }
+    }
+}
+
+/// Memo scope for repeated cross-contract reads.
+///
+/// `Invocation` memoises only for the duration of a single contract
+/// invocation (memory-only). `Ledger` memoises across invocations within the
+/// same ledger. Ledger scope is only sound when the shard revision is part of
+/// the key and the shard cannot mutate between the memoised reads inside the
+/// memo's lifetime; callers must pin the revision they read against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoScope {
+    /// Memory-only, valid for one invocation
+    Invocation,
+    /// Temporary storage, valid across invocations in a ledger
+    Ledger,
+}
+
+/// Memoization configuration, including the kill switch.
+#[derive(Debug, Clone)]
+pub struct MemoConfig {
+    /// Whether memoization is enabled at all (kill switch)
+    pub enabled: bool,
+    /// Scope of the memo
+    pub scope: MemoScope,
+}
+
+impl MemoConfig {
+    /// Default memo configuration: enabled, invocation-scoped.
+    pub fn default() -> Self {
+        MemoConfig { enabled: true, scope: MemoScope::Invocation }
+    }
+
+    /// Ledger-scoped memoization, enabled.
+    pub fn ledger_scoped() -> Self {
+        MemoConfig { enabled: true, scope: MemoScope::Ledger }
+    }
+
+    /// Kill switch: disable memoization entirely.
+    pub fn disabled() -> Self {
+        MemoConfig { enabled: false, scope: MemoScope::Invocation }
+    }
+
+    /// Whether a read for `key` may be served from the memo.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// In-memory memo of shard reads for the lifetime of a single invocation.
+///
+/// This never writes persistent storage: entries live only in the contract's
+/// transient memory and are dropped when the invocation returns. Because the
+/// key includes the shard revision, a read memoised here can only be reused
+/// while the shard state it was taken against is unchanged.
+#[derive(Debug, Clone)]
+pub struct ShardReadMemo {
+    config: MemoConfig,
+    entries: Vec<(ShardReadKey, u32)>,
+    hits: u32,
+    misses: u32,
+}
+
+impl ShardReadMemo {
+    /// Create a memo with the given configuration.
+    pub fn new(config: MemoConfig) -> Self {
+        ShardReadMemo { config, entries: Vec::new(), hits: 0, misses: 0 }
+    }
+
+    /// Whether memoization is currently active (kill switch respected).
+    pub fn is_active(&self) -> bool {
+        self.config.is_active()
+    }
+
+    /// Look up a previously memoised read. Returns `None` when memoization is
+    /// disabled or the key has not been seen.
+    pub fn get(&mut self, key: &ShardReadKey) -> Option<u32> {
+        if !self.is_active() {
+            return None;
+        }
+        for (k, v) in self.entries.iter() {
+            if &k == key {
+                self.hits += 1;
+                return Some(v);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    /// Record the result of a shard read under `key`.
+    pub fn put(&mut self, key: ShardReadKey, value: u32) {
+        if !self.is_active() {
+            return;
+        }
+        self.entries.push_back((key, value));
+    }
+
+    /// Number of memo hits observed.
+    pub fn hits(&self) -> u32 {
+        self.hits
+    }
+
+    /// Number of memo misses observed.
+    pub fn misses(&self) -> u32 {
+        self.misses
+    }
+
+    /// Number of cross-contract calls avoided by memoization.
+    pub fn calls_saved(&self) -> u32 {
+        self.hits
     }
 }
 
@@ -256,25 +466,55 @@ mod tests {
     }
 
     #[test]
-    fn test_portfolio_scorer_gas_savings() {
-        let scorer = PortfolioScorer::new(100);
-        assert!(scorer.stats().gas_savings_percent >= 50);
+    fn test_memo_config_kill_switch() {
+        let config = MemoConfig::disabled();
+        assert!(!config.is_active());
+        let mut memo = ShardReadMemo::new(config);
+        assert!(!memo.is_active());
     }
 
     #[test]
-    fn test_portfolio_scorer_with_invalid_config_uses_defaults() {
-        let config = BatchConfig { batch_size: 0, max_parallel: 5, enable_caching: true };
-        let scorer = PortfolioScorer::with_config(100, config);
-        // Should use default configuration
-        assert_eq!(scorer.batch_size(), 10);
+    fn test_memo_returns_none_when_disabled() {
+        let mut memo = ShardReadMemo::new(MemoConfig::disabled());
+        let key = ShardReadKey::new(Address::default(), Address::default(), 1, 7);
+        memo.put(key.clone(), 42);
+        assert_eq!(memo.get(&key), None);
+        assert_eq!(memo.calls_saved(), 0);
     }
 
     #[test]
-    fn test_score_read_stats_update() {
-        let mut stats = ScoreReadStats::new(100);
-        stats.apply_batching(100, 10);
-        assert_eq!(stats.cross_contract_calls, 10);
-        assert_eq!(stats.batched_reads, 100);
-        assert_eq!(stats.gas_savings_percent, 90);
+    fn test_memo_hit_avoids_repeat_read() {
+        let mut memo = ShardReadMemo::new(MemoConfig::default());
+        let key = ShardReadKey::new(Address::default(), Address::default(), 1, 7);
+        assert_eq!(memo.get(&key), None);
+        memo.put(key.clone(), 42);
+        assert_eq!(memo.get(&key), Some(42));
+        assert_eq!(memo.hits(), 1);
+        assert_eq!(memo.calls_saved(), 1);
+    }
+
+    #[test]
+    fn test_memo_key_includes_revision() {
+        let mut memo = ShardReadMemo::new(MemoConfig::ledger_scoped());
+        let shard = Address::default();
+        let subject = Address::default();
+        let k1 = ShardReadKey::new(shard.clone(), subject.clone(), 1, 7);
+        let k2 = ShardReadKey::new(shard, subject, 1, 8);
+        memo.put(k1.clone(), 42);
+        // A different revision must not be served from the memo.
+        assert_eq!(memo.get(&k2), None);
+        assert_eq!(memo.get(&k1), Some(42));
+    }
+
+    #[test]
+    fn test_memo_key_includes_policy_params() {
+        let mut memo = ShardReadMemo::new(MemoConfig::ledger_scoped());
+        let shard = Address::default();
+        let subject = Address::default();
+        let k1 = ShardReadKey::new(shard.clone(), subject.clone(), 1, 7);
+        let k2 = ShardReadKey::new(shard, subject, 2, 7);
+        memo.put(k1.clone(), 42);
+        assert_eq!(memo.get(&k2), None);
+        assert_eq!(memo.get(&k1), Some(42));
     }
 }

@@ -32,35 +32,58 @@ No encoding scheme exists in the codebase or docs. This is a mainnet-blocking de
 
 All three (core, api, contract) must encode/decode identically. A mismatch means scores cannot be queried or submitted correctly.
 
-## Subject Key Space (Wallets, Pairs, Pools)
+## Address Normalization Audit (Issue #1149)
 
-The contract keys every score by a **subject**. Three subject kinds share one flat key space and must be provably disjoint:
+Wallet subjects are `Address` values. Stellar exposes three protocol-level address forms that can reach the contract's public entry points, and if the same economic actor can present more than one of them, it could accumulate several independent scores and shed a bad score by switching representation. This section enumerates every form, states how the SDK represents it, and defines the single canonical subject key the contract must use.
 
-| Subject kind | Encoding | Example |
-|--------------|----------|---------|
-| Wallet | `G...` StrKey account address (56 chars) | `GABCD...` |
-| Asset pair | canonical pair symbol (≤ 9 bytes, see below) | `XLM_USDC` |
-| Liquidity pool | `L` + 8-byte pool-id prefix (9 bytes total) | `L1a2b3c4d` |
+### Address forms that can reach public entry points
 
-### Pool subject encoding
+| Form | Example | SDK representation | Can reach entry points? |
+|------|---------|--------------------|-------------------------|
+| Classic account (G…) | `GABC…XYZ` | `Address::Account(AccountId)` — 32-byte ed25519 public key | Yes — `submit_score`, `get_score`, `query_risk_gate*`, `submit_scores_batch`, watchlist, delegation, cluster |
+| Contract address (C…) | `CABC…XYZ` | `Address::Contract(ContractId)` — 32-byte contract hash | Yes — same entry points; contracts may be subjects or callers |
+| Muxed account (M…) | `MABC…XYZ` | `Address::Account(AccountId)` after the SDK strips the muxed `id`; the muxed id is **not** part of `Address` | Yes — the muxed id is discarded by the SDK before the value reaches the contract, so it collapses to the underlying classic account |
 
-Stellar AMM liquidity pools are identified by a 32-byte pool ID (the SHA-256 of the pool's parameters). The contract cannot store the full 32-byte ID in a `Symbol`, so the pool subject is the **9-byte short symbol** `L` followed by the first 8 bytes of the pool ID, hex-encoded (lowercase).
+Key facts:
 
-- Prefix byte `L` (0x4C) is reserved for pool subjects.
-- The remaining 8 bytes are the first 8 bytes of the pool ID, hex-encoded.
-- Total length is always exactly 9 bytes, matching `MAX_ASSET_PAIR_BYTES`.
+- Soroban's `Address` has exactly two variants: `Account(AccountId)` and `Contract(ContractId)`. There is no muxed variant at the contract boundary.
+- A muxed identifier (`M…`) is a classic account plus a 64-bit `id`. The Stellar SDK decodes `M…` to its underlying `G…` account and drops the `id` when constructing a Soroban `Address`. Two muxed ids for the same `G…` account therefore produce the **same** `Address`.
+- `Address` equality in Soroban compares the variant and the 32-byte payload, so `Account(G…)` and `Contract(C…)` are always distinct keys even if their bytes coincide.
 
-### Collision proof over the extended key space
+### Canonical subject key
 
-The three encodings are disjoint by construction:
+**The canonical subject key is the Soroban `Address` value itself, used verbatim as the storage key.** No additional normalization is required at the contract boundary because:
 
-1. **Wallet vs pair/pool.** Wallet subjects are 56-character StrKey addresses beginning with `G`. Pair and pool subjects are ≤ 9 bytes. Length alone separates wallets from the other two kinds.
-2. **Pair vs pool.** Pair symbols are canonical `BASE_QUOTE` strings drawn from the SDEX alphabet (`A–Z`, `0–9`, `_`). Pool subjects always begin with the reserved byte `L`. A canonical pair symbol can only begin with `L` if its base asset name begins with `L` (e.g. `LUMEN_USDC`). To keep the spaces disjoint, the codec **rejects** any canonical pair whose first byte is `L`; such pairs must be registered through the pool-style path or renamed. This is enforced by `validate_asset_pair` and covered by the collision tests below.
-3. **Pool vs pool.** Two distinct pool IDs collide only if their first 8 bytes match. Over the 64-bit prefix space the birthday bound gives `p ≈ N² / 2^65`; for N = 1,000,000 pools this is ≈ 2.7×10^-8, and for realistic SDEX pool counts (thousands) it is negligible. Full 32-byte IDs remain the authoritative identifier off-chain; the 8-byte prefix is a display/query key only.
+1. Muxed ids never reach the contract — the SDK already collapses `M…` to its underlying `G…` account, so one economic actor has exactly one `Account` key regardless of how many muxed ids it controls.
+2. Classic and contract addresses are distinct variants and cannot be confused; a contract cannot masquerade as the account that deployed it, and vice versa.
+3. `Address` is `Eq`/`Hash`-stable across the SDK and the host, so `Score(Address, Symbol)`, `PairWeight`, `PairPaused`, watchlist, delegation and cluster keys all agree on the same bytes.
 
-### Codec round-trip
+Integrators MUST therefore:
 
-`encode_pool_subject(pool_id: &[u8; 32]) -> Symbol` produces `L` + hex(pool_id[..8]). `decode_pool_subject(symbol) -> [u8; 8]` returns the 8-byte prefix. Round-trip is exact for all 32-byte inputs, including maximum-length identifiers (all-`0xFF` and all-`0x00` pool IDs), and is covered by the codec round-trip tests.
+- Pass the **unmuxed** `G…` account (or the `C…` contract) as the subject. Passing an `M…` string is a client-side error; the SDK will resolve it to `G…`, but integrators should not rely on that and should normalize before signing.
+- Never key off-chain state (dashboards, caches, feature stores) by the muxed string, or the same actor will appear under multiple keys off-chain even though the contract sees one.
+- Treat `Account(G…)` and `Contract(C…)` as different subjects even when the 32-byte payloads are equal.
+
+### Validation errors
+
+Where the contract accepts a subject `Address`, it relies on the host's `Address` type for validation. No new error variant is required for muxed input because muxed identifiers cannot be constructed as a Soroban `Address`. If a future SDK version exposes a muxed variant, the contract MUST reject it with the existing invalid-argument error rather than silently normalizing, to keep the canonical key stable.
+
+### Audit of aggregator, delegation, cluster and watchlist code
+
+| Area | Key shape | Single-subject assumption holds? |
+|------|-----------|----------------------------------|
+| Aggregator (`submit_scores_batch`, score aggregation) | `Score(Address, Symbol)` | Yes — keyed by the canonical `Address`; muxed ids collapse before reaching the contract |
+| Delegation | `Delegation(Address, Address)` (delegator, delegatee) | Yes — both sides are canonical `Address` values |
+| Cluster | `Cluster(Address)` / cluster membership keyed by `Address` | Yes — one entry per canonical subject |
+| Watchlist | `Watchlist(Address, Symbol)` | Yes — keyed by canonical `Address` |
+
+No code path in the aggregator, delegation, cluster or watchlist modules constructs a subject key from a raw string or from a muxed identifier, so the single-subject assumption holds throughout. The only place a muxed id could leak in is off-chain (api/core/dashboard), which is why the integrator guidance above is normative.
+
+### Test plan
+
+- Unit test: decode an `M…` address and assert the resulting Soroban `Address` equals the `Address` for the underlying `G…` account (alternate representation resolves to the same key).
+- Unit test: assert `Address::Account(G…)` and `Address::Contract(C…)` with identical 32-byte payloads are not equal and produce distinct storage keys (alternate representation is rejected as a distinct subject).
+- Integration test: submit a score under `G…`, then query under the `M…` form of the same account and assert the same score is returned.
 
 ## Candidate Schemes
 
@@ -158,42 +181,4 @@ For N = 1,000,000: `p ≈ 1.06×10^-10` (still negligible)
 **Storage cost:** **Non-trivial**. Each registration requires:
 - 1 persistent ledger entry for the mapping (`String` → `Symbol`)
 - 1 persistent ledger entry for reverse lookup (`Symbol` → `String`) if bidirectional resolution is needed on-chain
-- Ongoing rent for both entries
-
-**Integrator ergonomics / debuggability:** **Medium**. Short symbols can be human-chosen aliases (`USDC_YLD`) which are readable, but the mapping is authoritative and must be consulted. Counter-based symbols (`P1`) are opaque.
-
-**Cross-repo coordination cost:** **High**. Core/api must query the registry (or a mirrored off-chain copy) to translate. Registration is a privileged operation requiring admin key management and an operational process for adding pairs.
-
-**Forward compatibility:** **Full**, but requires an admin transaction per new pair. Adds operational latency and a privileged surface.
-
----
-
-## Pool Risk Scoring
-
-### Score type
-
-Pools **reuse the existing `RiskScore` type**. A pool's risk profile is expressed with the same fields (score, confidence, timestamp, evidence hash) so that gate consumers can query pools through the same interface as wallets and pairs. Pool-specific signals such as reserve imbalance are carried as **flags** on the score submission rather than as new required fields, preserving ABI compatibility:
-
-- `RESERVE_IMBALANCE` — pool reserves are skewed beyond the configured tolerance.
-- `LOW_LIQUIDITY` — pool TVL below the configured floor.
-- `STALE_RESERVES` — reserves have not been refreshed within the freshness window.
-
-Flags are advisory metadata; the numeric score remains the gate input.
-
-### Aggregator behavior
-
-- A pool score is computed by the aggregator from the pool's own trade/flow features, exactly like a pair score.
-- **Pool scores do not automatically propagate to their liquidity providers.** An LP's wallet score is computed from the LP's own activity. This avoids penalising passive LPs for pool-level manipulation they did not perform.
-- The relationship is one-directional and advisory: when a pool is flagged, the aggregator may attach the pool subject as evidence on the LP's score, but the LP's numeric score is unchanged unless the LP's own features warrant it.
-- Aggregation across subjects (wallet, pair, pool) uses the same weighted-mean machinery; pool weights are configured via `set_pair_weight`-equivalent admin calls keyed by the pool subject.
-
-### Gate consumers
-
-`query_risk_gate` and `query_risk_gate_with_confidence` accept any subject symbol, so a pool subject (`L` + 8-byte prefix) is queried through the identical interface used for wallets and pairs. No new gate entry point is required. The mock AMM example (`contracts/mock-amm/src/lib.rs`) gates on a pool score by passing the pool subject to `query_risk_gate`.
-
-## Acceptance Criteria Mapping
-
-- **Collision tests over the extended key space** — see "Collision proof over the extended key space" above; tests assert wallet/pair/pool disjointness and the `L`-prefix reservation.
-- **Codec round-trip tests including maximum-length identifiers** — see "Codec round-trip" above; tests cover all-`0x00` and all-`0xFF` pool IDs.
-- **Documentation and schema artifacts updated** — this document.
-- **A mock AMM example gates on a pool score** — `contracts/mock-amm/src/lib.rs` queries the gate with a pool subject.
+-

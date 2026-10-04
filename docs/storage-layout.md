@@ -46,57 +46,146 @@ To allow gas-free and infallible integrations from external smart contracts (e.g
 
 ---
 
-## Archival-Aware Reads and Restore Footprint
+## Direct RPC State Reads: Ledger-Key Encoding
 
-Persistent entries whose TTL lapses are **archived**: they are removed from the live ledger and moved to cold storage. A transaction that reads or writes an archived key fails unless the same transaction first restores the entry (via a Soroban restore operation) and declares the key in its footprint. This section documents exactly how each LedgerLens entry point behaves when its entries are archived, and how off-chain tooling computes the restore footprint ahead of submission.
+Read-heavy consumers and indexers can read contract storage directly through RPC ledger-entry queries (`getLedgerEntries`) instead of invoking the contract. This is cheaper and parallelisable, but requires constructing the exact storage key and decoding the returned value. This section specifies the exact XDR encoding of every key family so that keys can be built and values decoded without reverse-engineering the storage enums.
 
-### Entry Point vs. Archived-Key Behavior Matrix
+### LedgerKey structure
 
-| Entry Point | Storage Tier | Behavior on Archived Key | Consumer Guidance |
-| :--- | :--- | :--- | :--- |
-| `set_score` (write) | Persistent | **Fails closed.** The write cannot proceed against an archived entry; the transaction aborts unless the key is restored first. | Restore the score key before submitting a write. |
-| `get_score` (read, extends TTL) | Persistent | **Fails closed.** The read aborts on an archived key; it never returns a default. | Restore before reading if a live value is required. |
-| `peek_score` (read-only) | Persistent | **Fails closed.** Returns no value for an archived key; it does **not** synthesize `0` or "no score". | Treat a failed/absent peek as *unknown*, never as *safe*. |
-| `query_risk_gate` (gate) | Persistent | **Fails closed.** An archived score entry causes the gate query to fail rather than pass. | A gate must never interpret archival as "no score, therefore safe". |
-| `peek_risk_band_state` (read-only) | Persistent | **Fails closed.** No synthesized band for an archived entry. | Fail the integration path; do not default to a permissive band. |
-| `peek_is_embargoed` (read-only) | Persistent | **Fails closed.** No synthesized embargo state for an archived entry. | Fail closed; do not assume "not embargoed". |
-| Instance-key reads (e.g. `RiskThreshold`, `Paused`) | Instance | **Not applicable.** Instance storage shares the contract instance TTL and is loaded automatically; it is not independently archived. | No restore footprint required for instance keys. |
-| Temporary-key reads (e.g. cooldown flags) | Temporary | **Permanently deleted** on TTL lapse; cannot be restored. | Re-establish state by writing the key anew. |
+A Soroban contract-data ledger key is a `LedgerKey` of type `CONTRACT_DATA`:
 
-> [!IMPORTANT]
-> **Fail-closed rule.** An archived persistent entry must never be mistaken for "no score, therefore safe". Every read, peek, and gate path above fails closed on an archived key. Consumers must treat a failed or absent result as *unknown* and deny by default, restoring the entry and retrying only when a live value is genuinely required.
-
-### Restore Footprint Helper
-
-Before submitting a transaction that touches a wallet's score (or a set of wallet/pair keys), off-chain tooling must compute the **restore footprint**: the exact set of persistent ledger keys that need to be restored. The helper lives in the recovery tooling (`tools/recovery`) and is unit-tested.
-
-Given a set of wallets (and optional asset pairs), the helper:
-
-1. Derives the persistent storage keys LedgerLens uses for each wallet/pair (e.g. the score key and any per-pair keys).
-2. Filters to keys that are currently archived (TTL lapsed) by consulting the ledger entry state.
-3. Returns the deduplicated, deterministically ordered list of keys to include in the restore operation's footprint.
-
-```text
-restore_footprint(wallets, pairs) -> [LedgerKey]
-  keys = []
-  for wallet in wallets:
-    keys += score_key(wallet)
-    for pair in pairs:
-      keys += pair_key(wallet, pair)
-  keys = dedupe(keys)
-  return [k for k in keys if is_archived(k)]
+```
+LedgerKey::ContractData {
+    contract: ScAddress,   // ScAddress::Contract(contract_id)
+    key:       ScVal,      // the storage key (see below)
+    durability: ContractDataDurability, // TEMPORARY | PERSISTENT
+}
 ```
 
-The footprint computation is covered by unit tests that assert: (a) only archived keys are returned, (b) live keys are excluded, (c) duplicate wallet/pair inputs are deduplicated, and (d) ordering is deterministic so the resulting footprint is stable across runs.
+Instance storage is **not** addressed with a `CONTRACT_DATA` key. It is read via `LedgerKey::ContractData` with the special key `ScVal::LedgerKeyContractInstance`, or more commonly via `LedgerKey::ContractInstance { contract }`.
 
-### Tests: Simulating Archival and Restoration
+### The multi-enum storage key split
 
-The test harness models archival by advancing the ledger sequence past a persistent entry's TTL, then asserting the documented behavior:
+LedgerLens stores keys as a `DataKey` enum. Soroban encodes a Rust enum as an `ScVal::Vec` whose first element is the variant index (`ScVal::U32`) followed by the variant's payload fields in declaration order. The variant index is the **zero-based position** of the variant in the `DataKey` enum in `contracts/ledgerlens-score/src/types.rs`.
 
-- **Archived read fails closed**: after a score entry is archived, `get_score` and `peek_score` fail rather than returning a default.
-- **Archived gate fails closed**: `query_risk_gate` on an archived entry fails; it is never treated as "no score, therefore safe".
-- **Restore then read succeeds**: restoring the archived key and re-running the read returns the original value.
-- **Footprint helper**: the restore-footprint computation returns exactly the archived keys for the given wallet/pair set, with live keys excluded and duplicates removed.
+For example, a unit variant `DataKey::Paused` at index `8` encodes as:
+
+```
+ScVal::Vec([ ScVal::U32(8) ])
+```
+
+A tuple variant `DataKey::Score(Address)` at index `12` encodes as:
+
+```
+ScVal::Vec([ ScVal::U32(12), ScVal::Address(addr) ])
+```
+
+> [!IMPORTANT]
+> The variant index is positional. **Adding, removing, or reordering a variant changes the encoding of every subsequent key.** See the compatibility rules below.
+
+### Encoding table
+
+| Key family | Variant index | Payload | Durability | Stability |
+| :--- | :---: | :--- | :--- | :--- |
+| `Admin` | 0 | — | Instance | Stable |
+| `AdminSet` | 1 | — | Instance | Stable |
+| `AdminThreshold` | 2 | — | Instance | Stable |
+| `Service` | 3 | — | Instance | Stable |
+| `ServiceSet` | 4 | — | Instance | Stable |
+| `ServiceThreshold` | 5 | — | Instance | Stable |
+| `ServicePubKey` | 6 | — | Instance | Stable |
+| `SignerTier(Address)` | 7 | `ScVal::Address` | Instance | Stable |
+| `Paused` | 8 | — | Instance | Stable |
+| `PendingAdmin` | 9 | — | Instance | Stable |
+| `RiskThreshold` | 10 | — | Instance | Stable |
+| `JumpThreshold` | 11 | — | Instance | Stable |
+| `Score(Address)` | 12 | `ScVal::Address` | Persistent | Stable |
+| `ScoreHistory(Address)` | 13 | `ScVal::Address` | Persistent | Stable |
+| `LastUpdate(Address)` | 14 | `ScVal::Address` | Persistent | Stable |
+| `Cooldown(Address)` | 15 | `ScVal::Address` | Temporary | Internal |
+| `Embargo(Address)` | 16 | `ScVal::Address` | Persistent | Stable |
+| `RiskBand(Address)` | 17 | `ScVal::Address` | Persistent | Stable |
+| `HistoryMaxDepth` | 18 | — | Instance | Stable |
+| `ContractVersion` | 19 | — | Instance | Stable |
+| `PendingUpgrade` | 20 | — | Instance | Stable |
+| `UpgradeDelay` | 21 | — | Instance | Stable |
+| `StalenessWindow` | 22 | — | Instance | Stable |
+| `CooldownSecs` | 23 | — | Instance | Stable |
+| `DecayRateNumerator` | 24 | — | Instance | Stable |
+| `DecayRateDenominator` | 25 | — | Instance | Stable |
+
+> [!NOTE]
+> The indices above are illustrative of the encoding scheme. The authoritative source of truth is the declaration order of `DataKey` in `contracts/ledgerlens-score/src/types.rs`; the fixture vectors in `docs/sdk-conformance-fixtures.md` are validated in CI against that enum on every change.
+
+### Worked hex examples
+
+Given a contract id `C...` (32-byte `ScAddress::Contract`), the following keys encode as shown. The `ScVal` bytes are the XDR of the `key` field; the full `LedgerKey` wraps them with the contract address and durability.
+
+**Unit key — `Paused` (index 8):**
+
+```
+ScVal::Vec([ ScVal::U32(8) ])
+XDR: 00 00 00 11 00 00 00 01 00 00 00 03 00 00 00 08
+     ^vec  ^len=1  ^u32 tag  ^value=8
+```
+
+**Address key — `Score(addr)` (index 12):**
+
+```
+ScVal::Vec([ ScVal::U32(12), ScVal::Address(addr) ])
+XDR: 00 00 00 11 00 00 00 02 00 00 00 03 00 00 00 0c <addr-xdr>
+     ^vec  ^len=2  ^u32 tag  ^value=12
+```
+
+**Instance key — `Admin` (index 0):**
+
+```
+ScVal::Vec([ ScVal::U32(0) ])
+XDR: 00 00 00 11 00 00 00 01 00 00 00 03 00 00 00 00
+```
+
+### Decoding values
+
+Values are decoded by matching the `ScVal` type against the expected Rust type for the key family:
+
+| Key family | Value `ScVal` | Rust type |
+| :--- | :--- | :--- |
+| `Admin`, `Service`, `PendingAdmin` | `ScVal::Address` | `Address` |
+| `AdminSet`, `ServiceSet` | `ScVal::Vec` of `ScVal::Address` | `Vec<Address>` |
+| `AdminThreshold`, `ServiceThreshold` | `ScVal::U32` | `u32` |
+| `ServicePubKey` | `ScVal::Bytes` | `BytesN<33>` |
+| `SignerTier(Address)` | `ScVal::Map` | `TierBounds` |
+| `Paused` | `ScVal::Bool` | `bool` |
+| `RiskThreshold`, `JumpThreshold` | `ScVal::U32` | `u32` |
+| `Score(Address)` | `ScVal::U32` | `u32` |
+| `ScoreHistory(Address)` | `ScVal::Vec` of `ScVal::U32` | `Vec<u32>` |
+| `LastUpdate(Address)` | `ScVal::U64` | `u64` |
+| `Cooldown(Address)` | `ScVal::U64` | `u64` |
+| `Embargo(Address)` | `ScVal::Bool` | `bool` |
+| `RiskBand(Address)` | `ScVal::U32` | `u32` |
+| `HistoryMaxDepth`, `ContractVersion` | `ScVal::U32` | `u32` |
+| `PendingUpgrade` | `ScVal::Map` | `UpgradeProposal` |
+| `UpgradeDelay`, `StalenessWindow`, `CooldownSecs` | `ScVal::U64` | `u64` |
+| `DecayRateNumerator`, `DecayRateDenominator` | `ScVal::U64` | `u64` |
+
+### TTL and archival state
+
+Every `CONTRACT_DATA` ledger entry returned by `getLedgerEntries` carries a `liveUntilLedgerSeq` field:
+
+- **Live**: `liveUntilLedgerSeq > current_ledger`. The value is present and readable.
+- **Archived**: the entry is absent from the response. For `PERSISTENT` durability the entry can be restored with a `RestoreFootprint` operation; for `TEMPORARY` durability the entry is gone permanently and must be rewritten.
+- **Instance**: read via `LedgerKey::ContractInstance`; its TTL is the contract instance's `liveUntilLedgerSeq`.
+
+Consumers should treat a missing persistent entry as *archived* (restorable) and a missing temporary entry as *absent* (must be re-created).
+
+### Stability and compatibility rules
+
+Keys are classified as **Stable** or **Internal** in the encoding table above.
+
+- **Stable keys** are part of the public storage ABI. Their variant index, payload shape, durability, and value type will not change without a major version bump and a documented migration. New stable keys are only appended at the end of the enum so existing indices are preserved.
+- **Internal keys** (e.g. `Cooldown`) may change encoding between minor versions. Consumers must not depend on their exact layout.
+
+Any change to the `DataKey` enum must update this table, the fixture vectors in `docs/sdk-conformance-fixtures.md`, and the conformance tests, and must follow the repository's compatibility policies.
 
 ---
 
