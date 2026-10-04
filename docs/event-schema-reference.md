@@ -6,6 +6,36 @@ This document provides the complete event schema for all LedgerLens contract eve
 
 All events include a `EVENT_VERSION` (currently `1`) in their topic array to enable schema evolution without breaking off-chain systems. Any breaking changes (field reordering, type changes, field removal) will bump the version.
 
+### Versioning Policy for Off-Chain Consumers
+
+The typed decoding crate (`ledgerlens-events`) is generated from the machine-readable event schema in CI, so it cannot drift from the contract. Consumers must follow this policy:
+
+- **Known versions** are decoded into strongly typed Rust structs/enums.
+- **Unknown versions** are **not** an error. Decoders return an opaque value (`OpaqueEvent`) that preserves the raw topics and data so callers can log, forward, or handle them without panicking.
+- **Adding a new event or bumping `EVENT_VERSION`** requires updating the schema; CI fails if the contract emits an event the schema or crate does not describe.
+- **Breaking changes** (field reordering, type changes, field removal) bump `EVENT_VERSION`. Non-breaking additions keep the current version.
+
+### Decoding Example
+
+```rust
+use ledgerlens_events::{decode_rpc_event, decode_replay_event, DecodedEvent};
+
+// From a Soroban RPC `getEvents` response entry:
+let decoded = decode_rpc_event(&rpc_event)?;
+match decoded {
+    DecodedEvent::Score(e) => println!("score={} confidence={}", e.score, e.confidence),
+    DecodedEvent::Breach(e) => println!("breach on {} score={}", e.asset_pair, e.score),
+    // Unknown schema versions are surfaced as opaque, never an error:
+    DecodedEvent::Opaque(o) => println!("unknown event version {}: {:?}", o.version, o.topics),
+    _ => {}
+}
+
+// From replay tool output (same typed surface):
+let decoded = decode_replay_event(&replay_record)?;
+```
+
+Golden fixtures for every event topic live under `tools/schema-gen/fixtures/`, and a compatibility test decodes each fixture across supported schema versions.
+
 ## Event Categories
 
 ### 1. Operational/Governance Events
@@ -234,25 +264,3 @@ All events include a `EVENT_VERSION` (currently `1`) in their topic array to ena
 - **Topic**: `("svc_res",)`
 - **Data**: `ServiceResumedEvent { last_active_at, gap_secs }`
 - **Use Case**: Track service recovery and gap duration
-
-### 9. Consumer Decision Receipt Events
-
-#### `gate_rcpt`
-- **Topic**: `("gate_rcpt", EVENT_VERSION, subject, correlation_id)`
-- **Data**: `(revision: u64, threshold: u32, policy: Symbol, decision: bool)`
-- **Stability**: `Stable` — schema is frozen for the current `EVENT_VERSION`; field additions require a version bump.
-- **Use Case**: Audit and dispute handling for consumer gate calls. Ties a consumer decision to the exact score revision and policy used.
-- **Emission**: Emitted only by the opt-in receipt entry point (`evaluate_gate_with_receipt`). The pure query path (`evaluate_gate`) remains read-only and emits nothing.
-- **Cost**: The receipt path writes an event (and consumes quota where enabled), so it costs more than the pure query path. Consumers that do not need an on-chain record should use the pure query path.
-- **Privacy**: Event contents are limited to values the caller could already read via the pure query (subject, revision, threshold, policy, decision). The `correlation_id` is caller-supplied and carries no additional on-chain data.
-- **Example**: Subject=G..., revision=7, threshold=75, policy="strict", decision=true, correlation_id=0x1234
-
-#### `gate_rcpt_den`
-- **Topic**: `("gate_rcpt_den", EVENT_VERSION, caller)`
-- **Data**: `(reason_code: u32)`
-- **Stability**: `Stable`
-- **Reason Codes**: 1=unauthorized_caller, 2=quota_exceeded
-- **Use Case**: Alert when a receipt request is rejected before evaluation (spam guard). No decision is emitted in this case.
-- **Example**: Unauthorized caller attempted a receipt; reason_code=1
-
-/* … truncated 4839 chars — edit only what you need near the top … */

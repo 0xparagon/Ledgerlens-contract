@@ -1,0 +1,24 @@
+[package]
+name = "conformance-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Provider-neutral conformance suite for the On-Chain Risk Score Registry Interface (SEP draft in docs/standards/)"
+
+[lib]
+name = "risk_registry_conformance"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+soroban-sdk = "21.0.0"
+
+# The harness itself is provider-neutral. Providers enter through the two
+# adapters under `tests/common/`, so adding a provider never touches `src/`.
+[dev-dependencies]
+ledgerlens-score = { version = "0.1.0", path = "../../contracts/ledgerlens-score" }
+reference-provider = { version = "0.1.0", path = "../../contracts/reference-provider" }
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
