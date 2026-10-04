@@ -164,6 +164,11 @@ A margin (`set_hysteresis_margin`) that keeps a wallet gated as risky for a peri
 drops back below the gate threshold, to prevent an attacker from oscillating a score just under
 and over the line to slip through repeatedly. While "in the band," `query_risk_gate` returns
 `false` even if the current raw score would otherwise pass.
+Band membership is evaluated on each `submit_score` against the contract-level `risk_threshold`
+(default `75`), **not** against the threshold passed to the gate query: a submitted score
+`>= risk_threshold` enters the band, and the wallet leaves it only when a later score is
+`< risk_threshold - hysteresis_margin`. A score of 99 is therefore gated even for a query
+threshold of 100. (Clarified in #1240; see `tools/reference-model/DISAGREEMENTS.md` D5.)
 
 ### Model version
 

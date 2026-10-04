@@ -4,37 +4,21 @@ members = [
     "contracts/ledgerlens-score",
     "contracts/ledgerlens-aggregator",
     "contracts/ledgerlens-test-support",
+    "contracts/reference-provider",
     "contracts/mock-amm",
     "contracts/mock-lending",
     "tools/replay",
     "tools/recovery",
     "tools/schema-gen",
     "tools/invocation-fuzzer",
-    "tools/wasm-allowlist",
+    "tools/reference-model/driver",
+    "tools/score-submitter",
     "tests/composability",
+    "tests/conformance",
 ]
 
-[workspace.metadata.vet]
-# cargo-vet configuration for the LedgerLens dependency tree.
-#
-# Criteria:
-#   safe-to-deploy  -> crates linked into the WASM contract artifacts
-#                      (contracts/* and their transitive dependencies).
-#   safe-to-run     -> dev-only, tooling and test crates that never ship
-#                      inside a contract (tools/*, tests/*, dev-dependencies).
-#
-# Trusted audit import sources (documented in supply-chain/README.md):
-#   - bytecodealliance (https://github.com/bytecodealliance/wasmtime)
-#   - google            (https://github.com/google/supply-chain)
-#   - mozilla           (https://github.com/mozilla/supply-chain)
-#   - embarkstudios     (https://github.com/embarkstudios/cargo-vet)
-#
-# Run `cargo vet` locally; CI enforces this via the supply-chain job.
-[workspace.metadata.vet.trusted]
-bytecodealliance = "https://github.com/bytecodealliance/wasmtime"
-google = "https://github.com/google/supply-chain"
-mozilla = "https://github.com/mozilla/supply-chain"
-embarkstudios = "https://github.com/embarkstudios/cargo-vet"
+[workspace.dependencies]
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [profile.release]
 opt-level = "z"

@@ -1,0 +1,74 @@
+name: Nightly tests
+
+# Issue #1244. The nightly tier is what is left when fast (3-minute budget) and
+# standard (30-minute budget) have both taken their share: resource-exhaustion
+# and hostile-read stress suites, the long-horizon soak suite, and the one
+# cargo-mutants kill-suite that is expensive enough to defer. Before tiers
+# existed these either ran on every PR or had no scheduled home at all. (Six of
+# the fourteen kill-suites in .cargo/mutants.toml are wired; the other eight are
+# recorded as `disabled` and `check` warns about them on every run.)
+#
+# The unit list is not written here: it is whatever test-tiers.toml says the
+# nightly tier contains, so adding a slow suite to the nightly tier is a
+# manifest edit reviewed like any other.
+#
+# The execution budget (60 minutes) is enforced by the report, not by the job
+# timeout, so a tier that overruns produces a readable failure naming the units
+# that ate the time instead of a bare "timed out".
+
+on:
+  schedule:
+    # 03:17 UTC. Deliberately off the hour: scheduled workflows on the hour
+    # queue behind everyone else's.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base revision to diff tier moves against (blank to skip the review gate)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "contracts/ledgerlens-score/src/**"
+      - "test-tiers.toml"
+      - ".github/workflows/nightly-tests.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  nightly:
+    name: "Test tier: nightly"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Classify the suite before running it
+        run: python3 tools/test-tiering.py check
+
+      - name: Run the nightly tier (60-minute execution budget)
+        # A manual dispatch may be asking "would this PR's tier change hold?",
+        # so honour the requested base revision when one is given.
+        run: |
+          if [ -n "${{ inputs.base }}" ]; then
+            scripts/test-tier.sh nightly --base "${{ inputs.base }}"
+          else
+            scripts/test-tier.sh nightly
+          fi
+
+      - name: Upload the nightly tier report and per-unit logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-tier-nightly-report
+          path: target/test-tiers/
+          retention-days: 30

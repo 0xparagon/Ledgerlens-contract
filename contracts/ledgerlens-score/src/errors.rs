@@ -77,6 +77,10 @@ impl Error {
     pub const DisputeIndexFull: Error = Error::ServiceSetFull;
     pub const ActorDisputeLimitExceeded: Error = Error::RateLimitExceeded;
     pub const EmbargoedWalletIndexFull: Error = Error::ServiceSetFull;
+    /// `overlap_secs` outside `[0, MAX_KEY_OVERLAP_SECS]` in a key rotation.
+    pub const InvalidKeyOverlap: Error = Error::InvalidThreshold;
+    /// `secs` outside `[0, MAX_REVEAL_WINDOW_SECS]` in `set_reveal_window`.
+    pub const InvalidRevealWindow: Error = Error::InvalidThreshold;
 
     pub const ModelVersionNotRegistered: Error = Error::InvalidScore;
     pub const ModelVersionDeprecated: Error = Error::Unauthorized;
@@ -143,4 +147,47 @@ impl Error {
     /// `Policy::DataDeletion`, which is configured via
     /// `set_deletion_approval_policy` instead.
     pub const InvalidPolicy: Error = Error::InvalidThreshold;
+
+    // ── Permissionless keeper TTL reward pool ───────────────────────────────
+    /// Returned when the keeper reward token has not been configured via
+    /// `set_keeper_reward_token`.
+    pub const KeeperRewardTokenNotSet: Error = Error::FeeTokenNotSet;
+    /// Returned by `set_keeper_reward_params` when `reward_per_entry` exceeds
+    /// `MAX_KEEPER_REWARD_PER_ENTRY` or `window_ledgers` exceeds
+    /// `SCORE_TTL_THRESHOLD`.
+    pub const InvalidKeeperRewardParams: Error = Error::InvalidThreshold;
+
+    // ── Permissionless attested relay ───────────────────────────────────────
+    /// Returned by `relay_attested_score` when `valid_before_ledger` is in
+    /// the past, or the attestation's `contract_version` no longer matches —
+    /// i.e. the attestation is no longer safe to relay.
+    pub const StaleAttestation: Error = Error::InvalidAttestation;
+    /// Returned when the relayer-tip token has not been configured via
+    /// `set_relay_tip_token`.
+    pub const RelayTipTokenNotSet: Error = Error::FeeTokenNotSet;
+
+    // ── Prepaid gate-query credits ──────────────────────────────────────────
+    /// Returned when `deposit_gate_credits`/`withdraw_gate_credits_request`
+    /// is called with a non-positive amount, or a withdrawal request exceeds
+    /// the depositor's current balance.
+    pub const InvalidCreditAmount: Error = Error::InvalidScore;
+    /// Returned when the gate-credit token has not been configured via
+    /// `set_gate_credit_token`.
+    pub const GateCreditTokenNotSet: Error = Error::FeeTokenNotSet;
+    /// Returned by `query_risk_gate_metered` when the consumer's prepaid
+    /// credit balance is below the computed fee for this call.
+    pub const InsufficientGateCredits: Error = Error::RateLimitExceeded;
+    /// Returned by `withdraw_gate_credits` when called before no request is
+    /// pending, or before its unlock time has elapsed.
+    pub const NoWithdrawalRequest: Error = Error::ScoreNotFound;
+    pub const WithdrawalNotYetUnlocked: Error = Error::RateLimitExceeded;
+
+    // ── Tiered gate fee schedule ─────────────────────────────────────────────
+    /// Returned by `set_fee_tier_schedule` when tiers are not sorted in
+    /// strictly ascending volume order, or any tier's fee exceeds the
+    /// configured hard ceiling.
+    pub const InvalidFeeTierSchedule: Error = Error::InvalidThreshold;
+    /// Returned by `set_fee_exemption` when `expires_at` is not in the
+    /// future relative to the current ledger timestamp.
+    pub const InvalidExemptionExpiry: Error = Error::InvalidTimestamp;
 }
