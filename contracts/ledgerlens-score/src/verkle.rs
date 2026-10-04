@@ -132,6 +132,17 @@
 
 use soroban_sdk::{Bytes, BytesN, Env};
 
+/// Version tag for the stateless verifier interface.
+///
+/// Bump this whenever the pure verification inputs/outputs or any domain
+/// separator changes. Callers pin the verifier contract hash alongside this
+/// version so a mismatched verifier fails closed rather than accepting proofs
+/// under a different scheme.
+///
+/// * `1` — initial extraction: `verify_membership` / `verify_non_membership`
+///   over the hash-based polynomial commitment described above.
+pub const VERIFIER_INTERFACE_VERSION: u32 = 1;
+
 // ── BLS12-381 scalar field modulus ────────────────────────────────────────────
 //
 // r = 0x73eda753299d7d483339d80809a1d80553bda402fffe5bfeffffffff00000001
@@ -340,7 +351,7 @@ pub fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
 /// commitment = SHA-256(0x06 || accumulator)
 /// ```
 pub fn finalize_commitment(env: &Env, accumulator: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 33];
+    let mut buf = [0u8; 33]; // 1 + 32
     buf[0] = DOMAIN_COMMIT;
     buf[1..33].copy_from_slice(accumulator);
     env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
