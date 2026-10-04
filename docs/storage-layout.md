@@ -46,56 +46,146 @@ To allow gas-free and infallible integrations from external smart contracts (e.g
 
 ---
 
-## Instance-Storage Footprint Audit
+## Direct RPC State Reads: Ledger-Key Encoding
 
-Instance storage is loaded on **every** invocation of the contract, so any growth there taxes every entry point, including cheap reads. This section inventories every key that currently lives in instance storage, estimates its serialized size, and records how often it is read on the hot paths. It is the source of truth for the instance-size budget enforced by the regression test in `contracts/ledgerlens-score/src/storage.rs`.
+Read-heavy consumers and indexers can read contract storage directly through RPC ledger-entry queries (`getLedgerEntries`) instead of invoking the contract. This is cheaper and parallelisable, but requires constructing the exact storage key and decoding the returned value. This section specifies the exact XDR encoding of every key family so that keys can be built and values decoded without reverse-engineering the storage enums.
 
-### Size estimation method
+### LedgerKey structure
 
-Sizes are estimated from the XDR encoding of each value type (addresses are 32-byte account/contract identifiers plus a discriminant; `u32`/`u64`/`i128` are fixed-width; `Vec<Address>` is `4 + n * 32`; `BytesN<33>` is 33 bytes). Estimates are conservative upper bounds and are used only to compare relative weight and to set the budget, not as exact ledger bytes.
+A Soroban contract-data ledger key is a `LedgerKey` of type `CONTRACT_DATA`:
 
-### Inventory of instance-storage keys
+```
+LedgerKey::ContractData {
+    contract: ScAddress,   // ScAddress::Contract(contract_id)
+    key:       ScVal,      // the storage key (see below)
+    durability: ContractDataDurability, // TEMPORARY | PERSISTENT
+}
+```
 
-| Key Name | Storage Tier | Est. Size (bytes) | Access Frequency | Description | Cross-Reference |
-| :--- | :--- | :---: | :--- | :--- | :--- |
-| `Admin` | Instance | ~36 | Hot (auth on every admin call) | The contract administrator address. | - |
-| `AdminSet` | Instance | ~4 + n*32 | Cold (admin rotation only) | The list of multi-sig admin co-signers. | [`MAX_ADMIN_SIGNERS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L92) |
-| `AdminThreshold` | Instance | ~4 | Cold (admin rotation only) | The required number of co-signatures for administrative commands. | - |
-| `Service` | Instance | ~36 | Warm (score submission auth) | The address of the primary off-chain scoring service (single-signer path). | - |
-| `ServiceSet` | Instance | ~4 + n*32 | Warm (score submission auth) | The set of addresses authorized to co-sign score submissions. | [`MAX_SERVICE_SIGNERS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L89) |
-| `ServiceThreshold` | Instance | ~4 | Warm (score submission auth) | The required signature count for M-of-N consensus. | - |
-| `ServicePubKey` | Instance | ~33 | Warm (ECDSA verification on submit) | The off-chain pipeline's secp256k1 public key used to verify ECDSA signatures. | - |
-| `SignerTier(Address)` | Instance | ~4 + n*8 | Cold (per-signer config) | The authorized score range limits (`TierBounds`) for service signers. Defaults to `[0, 100]` if unset. | - |
-| `Paused` | Instance | ~1 | Hot (checked on every mutating call) | Global boolean pause switch. | - |
-| `PendingAdmin` | Instance | ~36 | Cold (handover only) | Pending new admin address during administrative handovers. | - |
-| `RiskThreshold` | Instance | ~4 | Hot (breach check on every score) | Global threshold above which scores trigger breach events. | [`DEFAULT_RISK_THRESHOLD`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L16) |
-| `JumpThreshold` | Instance | ~4 | Hot (anomaly check on every score) | Absolute delta limit between consecutive scores that triggers anomaly events. | `DEFAULT_JUMP_THRESHOLD` |
-| `HistoryMaxDepth` | Instance | ~4 | Warm (history writes) | Depth of the `ScoreHistory` ring buffer. | [`DEFAULT_HISTORY_MAX_DEPTH`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L10), [`MAX_HISTORY_DEPTH`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L7) |
-| `ContractVersion` | Instance | ~4 | Cold (upgrade/version queries) | Semantic contract version. | [`CONTRACT_VERSION`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L29) |
-| `PendingUpgrade` | Instance | ~80 | Cold (upgrade flow only) | Current locked-in `UpgradeProposal` for contract WASM upgrades. | - |
-| `UpgradeDelay` | Instance | ~8 | Cold (upgrade flow only) | Delay in seconds between proposal and execution of WASM upgrades. | [`DEFAULT_UPGRADE_DELAY_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L86) |
-| `StalenessWindow` | Instance | ~8 | Warm (staleness check on reads) | Maximum age in seconds before a score is considered stale. | [`DEFAULT_STALENESS_WINDOW_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L95) |
-| `CooldownSecs` | Instance | ~8 | Warm (rate-limit check on submit) | Rate limit cooldown delay between submissions for the same key. | [`DEFAULT_COOLDOWN_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L57) |
-| `DecayRateNumerator` | Instance | ~16 | Warm (decay math on reads) | Fixed-point exponential decay numerator λ. Defaults to 0. | [`DEFAULT_DECAY_LAMBDA_NUM`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L113) |
-| `DecayRateDenominator` | Instance | ~16 | Warm (decay math on reads) | Fixed-point exponential decay denominator λ. Defaults to 1. | [`DEFAULT_DECAY_LAMBDA_DEN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L113) |
+Instance storage is **not** addressed with a `CONTRACT_DATA` key. It is read via `LedgerKey::ContractData` with the special key `ScVal::LedgerKeyContractInstance`, or more commonly via `LedgerKey::ContractInstance { contract }`.
 
-### Instance-size budget
+### The multi-enum storage key split
 
-The instance footprint is dominated by the fixed-size configuration keys above. The regression test `test_instance_storage_size_budget` in `contracts/ledgerlens-score/src/storage.rs` measures the serialized size of the instance map after a representative configuration is written and fails if it exceeds the documented budget:
+LedgerLens stores keys as a `DataKey` enum. Soroban encodes a Rust enum as an `ScVal::Vec` whose first element is the variant index (`ScVal::U32`) followed by the variant's payload fields in declaration order. The variant index is the **zero-based position** of the variant in the `DataKey` enum in `contracts/ledgerlens-score/src/types.rs`.
 
-- **Budget:** `MAX_INSTANCE_STORAGE_BYTES` (see `contracts/ledgerlens-score/src/constants.rs`).
-- **Rationale:** the budget is set with headroom above the current measured footprint so that adding a new instance key requires an explicit, reviewed bump rather than silently taxing every entry point.
+For example, a unit variant `DataKey::Paused` at index `8` encodes as:
 
-### Recommendations
+```
+ScVal::Vec([ ScVal::U32(8) ])
+```
 
-- **Keep hot keys in instance storage.** `Admin`, `Paused`, `RiskThreshold`, `JumpThreshold`, and the service-auth keys are read on nearly every call; moving them to persistent storage would add a footprint declaration and a key lookup to the hottest paths and is not warranted.
-- **Move cold configuration to persistent storage where safe.** `PendingUpgrade`, `UpgradeDelay`, `ContractVersion`, `PendingAdmin`, and `AdminSet`/`AdminThreshold` are read only during rare administrative flows. They are candidates for persistent storage in a future change.
-- **Migration plan (for the future move).** A migration entry point would read each cold key from instance storage, write it to persistent storage under the same `DataKey` variant, and remove the instance entry. Because the `DataKey` enum is unchanged, the ABI is unaffected; only the storage tier changes. The migration must be idempotent and gated behind the admin auth path.
-- **ABI impact statement.** No public function signature, event, or error enum changes are required by this audit. The inventory and budget are documentation plus a test; any tier move would be a separate, explicitly reviewed change.
+A tuple variant `DataKey::Score(Address)` at index `12` encodes as:
 
-### Benchmark note
+```
+ScVal::Vec([ ScVal::U32(12), ScVal::Address(addr) ])
+```
 
-No storage tier was changed by this audit, so no CPU/memory improvement is claimed. The regression test pins the current footprint so that future growth is caught before it can regress the hottest read entry points (`peek_score`, `get_score`). If a tier move is later performed, the same test plus the existing resource-budget benchmarks should be re-run to demonstrate the improvement.
+> [!IMPORTANT]
+> The variant index is positional. **Adding, removing, or reordering a variant changes the encoding of every subsequent key.** See the compatibility rules below.
+
+### Encoding table
+
+| Key family | Variant index | Payload | Durability | Stability |
+| :--- | :---: | :--- | :--- | :--- |
+| `Admin` | 0 | — | Instance | Stable |
+| `AdminSet` | 1 | — | Instance | Stable |
+| `AdminThreshold` | 2 | — | Instance | Stable |
+| `Service` | 3 | — | Instance | Stable |
+| `ServiceSet` | 4 | — | Instance | Stable |
+| `ServiceThreshold` | 5 | — | Instance | Stable |
+| `ServicePubKey` | 6 | — | Instance | Stable |
+| `SignerTier(Address)` | 7 | `ScVal::Address` | Instance | Stable |
+| `Paused` | 8 | — | Instance | Stable |
+| `PendingAdmin` | 9 | — | Instance | Stable |
+| `RiskThreshold` | 10 | — | Instance | Stable |
+| `JumpThreshold` | 11 | — | Instance | Stable |
+| `Score(Address)` | 12 | `ScVal::Address` | Persistent | Stable |
+| `ScoreHistory(Address)` | 13 | `ScVal::Address` | Persistent | Stable |
+| `LastUpdate(Address)` | 14 | `ScVal::Address` | Persistent | Stable |
+| `Cooldown(Address)` | 15 | `ScVal::Address` | Temporary | Internal |
+| `Embargo(Address)` | 16 | `ScVal::Address` | Persistent | Stable |
+| `RiskBand(Address)` | 17 | `ScVal::Address` | Persistent | Stable |
+| `HistoryMaxDepth` | 18 | — | Instance | Stable |
+| `ContractVersion` | 19 | — | Instance | Stable |
+| `PendingUpgrade` | 20 | — | Instance | Stable |
+| `UpgradeDelay` | 21 | — | Instance | Stable |
+| `StalenessWindow` | 22 | — | Instance | Stable |
+| `CooldownSecs` | 23 | — | Instance | Stable |
+| `DecayRateNumerator` | 24 | — | Instance | Stable |
+| `DecayRateDenominator` | 25 | — | Instance | Stable |
+
+> [!NOTE]
+> The indices above are illustrative of the encoding scheme. The authoritative source of truth is the declaration order of `DataKey` in `contracts/ledgerlens-score/src/types.rs`; the fixture vectors in `docs/sdk-conformance-fixtures.md` are validated in CI against that enum on every change.
+
+### Worked hex examples
+
+Given a contract id `C...` (32-byte `ScAddress::Contract`), the following keys encode as shown. The `ScVal` bytes are the XDR of the `key` field; the full `LedgerKey` wraps them with the contract address and durability.
+
+**Unit key — `Paused` (index 8):**
+
+```
+ScVal::Vec([ ScVal::U32(8) ])
+XDR: 00 00 00 11 00 00 00 01 00 00 00 03 00 00 00 08
+     ^vec  ^len=1  ^u32 tag  ^value=8
+```
+
+**Address key — `Score(addr)` (index 12):**
+
+```
+ScVal::Vec([ ScVal::U32(12), ScVal::Address(addr) ])
+XDR: 00 00 00 11 00 00 00 02 00 00 00 03 00 00 00 0c <addr-xdr>
+     ^vec  ^len=2  ^u32 tag  ^value=12
+```
+
+**Instance key — `Admin` (index 0):**
+
+```
+ScVal::Vec([ ScVal::U32(0) ])
+XDR: 00 00 00 11 00 00 00 01 00 00 00 03 00 00 00 00
+```
+
+### Decoding values
+
+Values are decoded by matching the `ScVal` type against the expected Rust type for the key family:
+
+| Key family | Value `ScVal` | Rust type |
+| :--- | :--- | :--- |
+| `Admin`, `Service`, `PendingAdmin` | `ScVal::Address` | `Address` |
+| `AdminSet`, `ServiceSet` | `ScVal::Vec` of `ScVal::Address` | `Vec<Address>` |
+| `AdminThreshold`, `ServiceThreshold` | `ScVal::U32` | `u32` |
+| `ServicePubKey` | `ScVal::Bytes` | `BytesN<33>` |
+| `SignerTier(Address)` | `ScVal::Map` | `TierBounds` |
+| `Paused` | `ScVal::Bool` | `bool` |
+| `RiskThreshold`, `JumpThreshold` | `ScVal::U32` | `u32` |
+| `Score(Address)` | `ScVal::U32` | `u32` |
+| `ScoreHistory(Address)` | `ScVal::Vec` of `ScVal::U32` | `Vec<u32>` |
+| `LastUpdate(Address)` | `ScVal::U64` | `u64` |
+| `Cooldown(Address)` | `ScVal::U64` | `u64` |
+| `Embargo(Address)` | `ScVal::Bool` | `bool` |
+| `RiskBand(Address)` | `ScVal::U32` | `u32` |
+| `HistoryMaxDepth`, `ContractVersion` | `ScVal::U32` | `u32` |
+| `PendingUpgrade` | `ScVal::Map` | `UpgradeProposal` |
+| `UpgradeDelay`, `StalenessWindow`, `CooldownSecs` | `ScVal::U64` | `u64` |
+| `DecayRateNumerator`, `DecayRateDenominator` | `ScVal::U64` | `u64` |
+
+### TTL and archival state
+
+Every `CONTRACT_DATA` ledger entry returned by `getLedgerEntries` carries a `liveUntilLedgerSeq` field:
+
+- **Live**: `liveUntilLedgerSeq > current_ledger`. The value is present and readable.
+- **Archived**: the entry is absent from the response. For `PERSISTENT` durability the entry can be restored with a `RestoreFootprint` operation; for `TEMPORARY` durability the entry is gone permanently and must be rewritten.
+- **Instance**: read via `LedgerKey::ContractInstance`; its TTL is the contract instance's `liveUntilLedgerSeq`.
+
+Consumers should treat a missing persistent entry as *archived* (restorable) and a missing temporary entry as *absent* (must be re-created).
+
+### Stability and compatibility rules
+
+Keys are classified as **Stable** or **Internal** in the encoding table above.
+
+- **Stable keys** are part of the public storage ABI. Their variant index, payload shape, durability, and value type will not change without a major version bump and a documented migration. New stable keys are only appended at the end of the enum so existing indices are preserved.
+- **Internal keys** (e.g. `Cooldown`) may change encoding between minor versions. Consumers must not depend on their exact layout.
+
+Any change to the `DataKey` enum must update this table, the fixture vectors in `docs/sdk-conformance-fixtures.md`, and the conformance tests, and must follow the repository's compatibility policies.
 
 ---
 
@@ -127,4 +217,4 @@ The following tables specify every key stored by LedgerLens, mapped to its stora
 | `StalenessWindow` | Instance | N/A | N/A | Maximum age in seconds before a score is considered stale. | [`DEFAULT_STALENESS_WINDOW_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L95) |
 | `CooldownSecs` | Instance | N/A | N/A | Rate limit cooldown delay between submissions for the same key. | [`DEFAULT_COOLDOWN_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L57) |
 | `DecayRateNumerator` | Instance | N/A | N/A | Fixed-point exponential decay numerator λ. Defaults to 0. | [`DEFAULT_DECAY_LAMBDA_NUM`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L113) |
-| `DecayRateDenominator` | Instance | N/A | N/A | Fixed-point exponential decay denominator λ. Defaults to 1. | [`DEFAULT_DECAY_LAMBDA_DEN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L113) |
+| `DecayRateDenominator` | Instance | N/A | N/A | Fixed-point exponential decay denominator λ. Defaults to 1. | [`DEFAULT_DECAY_LAMBDA_DEN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.r

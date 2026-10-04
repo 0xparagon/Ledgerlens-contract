@@ -1,0 +1,85 @@
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1450, "score": 57, "type": "score", "wallet": "GWALLET015"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 2600, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2170, "score": 58, "type": "score", "wallet": "GWALLET039"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2140, "score": 72, "type": "score", "wallet": "GWALLET038"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1540, "score": 53, "type": "score", "wallet": "GWALLET018"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1400, "type": "heartbeat"}
+{"contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 1, "ledger": 1900, "new": 3, "old": 2, "param": "quorum", "proposal_id": "Q1", "type": "param_change"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1210, "score": 65, "type": "score", "wallet": "GWALLET007"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1720, "score": 61, "type": "score", "wallet": "GWALLET024"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1780, "score": 50, "type": "score", "wallet": "GWALLET026"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2350, "score": 67, "type": "score", "wallet": "GWALLET045"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1000, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2530, "score": 64, "type": "score", "wallet": "GWALLET051"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2320, "score": 32, "type": "score", "wallet": "GWALLET044"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2230, "score": 18, "type": "score", "wallet": "GWALLET041"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1930, "score": 61, "type": "score", "wallet": "GWALLET031"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2110, "score": 51, "type": "score", "wallet": "GWALLET037"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1360, "score": 66, "type": "score", "wallet": "GWALLET012"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2740, "score": 65, "type": "score", "wallet": "GWALLET058"}
+{"change": "added", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 2, "ledger": 1000, "signer": "GSIGNERC", "type": "signer_change"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2650, "score": 57, "type": "score", "wallet": "GWALLET055"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2410, "score": 70, "type": "score", "wallet": "GWALLET047"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2290, "score": 95, "type": "score", "wallet": "GWALLET043"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1030, "score": 48, "type": "score", "wallet": "GWALLET001"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1690, "score": 51, "type": "score", "wallet": "GWALLET023"}
+{"contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1000, "type": "heartbeat"}
+{"action": "set_param", "actor": "GADMIN1", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1500, "parent_proposal_id": "P1", "proposal_id": "P2", "tx_hash": "aa02", "type": "governance_action"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1300, "score": 75, "type": "score", "wallet": "GWALLET010"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2260, "score": 43, "type": "score", "wallet": "GWALLET042"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1420, "score": 53, "type": "score", "wallet": "GWALLET014"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1570, "score": 66, "type": "score", "wallet": "GWALLET019"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1240, "score": 29, "type": "score", "wallet": "GWALLET008"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1060, "score": 52, "type": "score", "wallet": "GWALLET002"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1900, "score": 56, "type": "score", "wallet": "GWALLET030"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2710, "score": 60, "type": "score", "wallet": "GWALLET057"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2620, "score": 73, "type": "score", "wallet": "GWALLET054"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1270, "score": 76, "type": "score", "wallet": "GWALLET009"}
+{"change": "added", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1000, "signer": "GSIGNERA", "type": "signer_change"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1660, "score": 32, "type": "score", "wallet": "GWALLET022"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1600, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1480, "score": 61, "type": "score", "wallet": "GWALLET016"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1510, "score": 14, "type": "score", "wallet": "GWALLET017"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2380, "score": 65, "type": "score", "wallet": "GWALLET046"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1330, "score": 39, "type": "score", "wallet": "GWALLET011"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1630, "score": 66, "type": "score", "wallet": "GWALLET021"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 2800, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1840, "score": 41, "type": "score", "wallet": "GWALLET028"}
+{"action": "set_quorum", "actor": "GADMIN1", "contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1900, "proposal_id": "Q1", "tx_hash": "bb01", "type": "governance_action"}
+{"action": "remove_signer", "actor": "GADMIN2", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1800, "proposal_id": "P3", "tx_hash": "aa03", "type": "governance_action"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1870, "score": 26, "type": "score", "wallet": "GWALLET029"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2470, "score": 48, "type": "score", "wallet": "GWALLET049"}
+{"contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 2000, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 1, "ledger": 1500, "new": 30, "param": "jump_threshold", "proposal_id": "P2", "type": "param_change"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1120, "score": 56, "type": "score", "wallet": "GWALLET004"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1960, "score": 54, "type": "score", "wallet": "GWALLET032"}
+{"contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 3000, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1150, "score": 37, "type": "score", "wallet": "GWALLET005"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1200, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2500, "score": 34, "type": "score", "wallet": "GWALLET050"}
+{"action": "set_param", "actor": "GADMIN1", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1100, "proposal_id": "P1", "tx_hash": "aa01", "type": "governance_action"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2440, "score": 55, "type": "score", "wallet": "GWALLET048"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 5000, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 1, "ledger": 1100, "new": 25, "old": 20, "param": "jump_threshold", "proposal_id": "P1", "type": "param_change"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2560, "score": 35, "type": "score", "wallet": "GWALLET052"}
+{"change": "removed", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 1, "ledger": 1800, "signer": "GSIGNERB", "type": "signer_change"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2680, "score": 54, "type": "score", "wallet": "GWALLET056"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2050, "score": 54, "type": "score", "wallet": "GWALLET035"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2999, "score": 100, "type": "score", "wallet": "GWALLETMAX"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1810, "score": 75, "type": "score", "wallet": "GWALLET027"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1090, "score": 53, "type": "score", "wallet": "GWALLET003"}
+{"change": "added", "contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 1, "ledger": 1000, "signer": "GSIGNERB", "type": "signer_change"}
+{"contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 2500, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2770, "score": 60, "type": "score", "wallet": "GWALLET059"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2200, "score": 53, "type": "score", "wallet": "GWALLET040"}
+{"contract_id": "CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 1500, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1600, "score": 59, "type": "score", "wallet": "GWALLET020"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "ledger": 3000, "type": "heartbeat"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2020, "score": 38, "type": "score", "wallet": "GWALLET034"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1180, "score": 52, "type": "score", "wallet": "GWALLET006"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2080, "score": 88, "type": "score", "wallet": "GWALLET036"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 2590, "score": 10, "type": "score", "wallet": "GWALLET053"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1990, "score": 58, "type": "score", "wallet": "GWALLET033"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1390, "score": 57, "type": "score", "wallet": "GWALLET013"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1000, "score": 41, "type": "score", "wallet": "GWALLET000"}
+{"contract_id": "CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "event_index": 5, "ledger": 1750, "score": 57, "type": "score", "wallet": "GWALLET025"}

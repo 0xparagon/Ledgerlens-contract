@@ -42,3 +42,12 @@ Operational rule:
   as non-deployable until the toolchain is aligned.
 - If CI ever moves this boundary, update this policy, `rust-toolchain.toml`,
   and the workflow toolchain pins in the same PR.
+
+SDK upgrades:
+
+- The supported SDK is `soroban-sdk 21.0.0`. The staged migration to 22.x/23.x, including its toolchain
+  change (`wasm32v1-none`, Rust ≥ 1.84), is tracked in [`soroban-sdk-migration.md`](soroban-sdk-migration.md).
+- Candidate SDKs are built and compared on every manifest change by
+  [`sdk-compat.yml`](../.github/workflows/sdk-compat.yml). See [`dependency-update-policy.md`](dependency-update-policy.md).
+- WASM built with SDK 21 stays reproducible with the toolchain above after the migration. The last SDK-21
+  artifact is kept in `tests/fixtures/historical/`.

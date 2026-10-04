@@ -1,0 +1,38 @@
+name: Reference model differential test
+
+# Issue #1240: compare the independent Python reference model against the
+# contract on 100,000 generated operation sequences every night.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      sequences:
+        description: "Number of generated sequences"
+        default: "100000"
+  pull_request:
+    paths:
+      - "tools/reference-model/**"
+      - "docs/score-math.md"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.81.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Reference model unit tests
+        run: python3 -m unittest discover -v tools/reference-model
+      - name: Build contract driver
+        run: cargo build --release --locked -p reference-model-driver
+      - name: Differential run
+        run: |
+          n="${{ github.event.inputs.sequences }}"
+          [ "${{ github.event_name }}" = "pull_request" ] && n=5000
+          python3 tools/reference-model/run_diff.py --sequences "${n:-100000}" --seed "${{ github.run_id }}"
