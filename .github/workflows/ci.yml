@@ -420,6 +420,65 @@ jobs:
       - name: Enforce WASM size budget
         run: ./scripts/check-wasm-size.sh
 
+  # ── Contract metadata & build provenance (issue #1167) ──────────────────────
+  #
+  # The release WASM must carry deterministic build/interface metadata custom
+  # sections (source repository, commit, crate version, toolchain versions and
+  # interface version) so explorers and auditors can tie a deployed hash back
+  # to a source revision. This job:
+  #   • builds the contract twice from independent target dirs and asserts the
+  #     two artifacts are byte-identical (reproducibility, metadata included);
+  #   • enforces presence of every required metadata key in the built WASM;
+  #   • runs the verification script against a release manifest and confirms it
+  #     fails on a tampered artifact.
+  # Metadata generation is deterministic: no timestamps, no host paths.
+  contract-metadata:
+    name: Contract metadata & provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release WASM (build A)
+        run: |
+          CARGO_TARGET_DIR=target/repro-a \
+            cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
+      - name: Build release WASM (build B)
+        run: |
+          CARGO_TARGET_DIR=target/repro-b \
+            cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
+      - name: Assert byte-identical reproducible builds
+        run: |
+          A=target/repro-a/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          B=target/repro-b/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          sha256sum "$A" "$B"
+          cmp "$A" "$B"
+      - name: Enforce required metadata keys
+        run: |
+          WASM=target/repro-a/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          scripts/verify-deployment.sh --check-metadata "$WASM"
+      - name: Verify release manifest and tamper detection
+        run: |
+          WASM=target/repro-a/wasm32-unknown-unknown/release/ledgerlens_score.wasm
+          scripts/verify-deployment.sh --emit-manifest target/release-manifest.json "$WASM"
+          scripts/verify-deployment.sh --manifest target/release-manifest.json "$WASM"
+          cp "$WASM" target/tampered.wasm
+          printf '\x00' | dd of=target/tampered.wasm bs=1 seek=8 count=1 conv=notrunc
+          if scripts/verify-deployment.sh --manifest target/release-manifest.json target/tampered.wasm; then
+            echo "::error::verification script accepted a tampered artifact"
+            exit 1
+          fi
+      - name: Upload release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ledgerlens-score-release-manifest
+          path: target/release-manifest.json
+          retention-days: 7
 
   audit:
     name: Security audit
