@@ -46,6 +46,149 @@ To allow gas-free and infallible integrations from external smart contracts (e.g
 
 ---
 
+## Direct RPC State Reads: Ledger-Key Encoding
+
+Read-heavy consumers and indexers can read contract storage directly through RPC ledger-entry queries (`getLedgerEntries`) instead of invoking the contract. This is cheaper and parallelisable, but requires constructing the exact storage key and decoding the returned value. This section specifies the exact XDR encoding of every key family so that keys can be built and values decoded without reverse-engineering the storage enums.
+
+### LedgerKey structure
+
+A Soroban contract-data ledger key is a `LedgerKey` of type `CONTRACT_DATA`:
+
+```
+LedgerKey::ContractData {
+    contract: ScAddress,   // ScAddress::Contract(contract_id)
+    key:       ScVal,      // the storage key (see below)
+    durability: ContractDataDurability, // TEMPORARY | PERSISTENT
+}
+```
+
+Instance storage is **not** addressed with a `CONTRACT_DATA` key. It is read via `LedgerKey::ContractData` with the special key `ScVal::LedgerKeyContractInstance`, or more commonly via `LedgerKey::ContractInstance { contract }`.
+
+### The multi-enum storage key split
+
+LedgerLens stores keys as a `DataKey` enum. Soroban encodes a Rust enum as an `ScVal::Vec` whose first element is the variant index (`ScVal::U32`) followed by the variant's payload fields in declaration order. The variant index is the **zero-based position** of the variant in the `DataKey` enum in `contracts/ledgerlens-score/src/types.rs`.
+
+For example, a unit variant `DataKey::Paused` at index `8` encodes as:
+
+```
+ScVal::Vec([ ScVal::U32(8) ])
+```
+
+A tuple variant `DataKey::Score(Address)` at index `12` encodes as:
+
+```
+ScVal::Vec([ ScVal::U32(12), ScVal::Address(addr) ])
+```
+
+> [!IMPORTANT]
+> The variant index is positional. **Adding, removing, or reordering a variant changes the encoding of every subsequent key.** See the compatibility rules below.
+
+### Encoding table
+
+| Key family | Variant index | Payload | Durability | Stability |
+| :--- | :---: | :--- | :--- | :--- |
+| `Admin` | 0 | — | Instance | Stable |
+| `AdminSet` | 1 | — | Instance | Stable |
+| `AdminThreshold` | 2 | — | Instance | Stable |
+| `Service` | 3 | — | Instance | Stable |
+| `ServiceSet` | 4 | — | Instance | Stable |
+| `ServiceThreshold` | 5 | — | Instance | Stable |
+| `ServicePubKey` | 6 | — | Instance | Stable |
+| `SignerTier(Address)` | 7 | `ScVal::Address` | Instance | Stable |
+| `Paused` | 8 | — | Instance | Stable |
+| `PendingAdmin` | 9 | — | Instance | Stable |
+| `RiskThreshold` | 10 | — | Instance | Stable |
+| `JumpThreshold` | 11 | — | Instance | Stable |
+| `Score(Address)` | 12 | `ScVal::Address` | Persistent | Stable |
+| `ScoreHistory(Address)` | 13 | `ScVal::Address` | Persistent | Stable |
+| `LastUpdate(Address)` | 14 | `ScVal::Address` | Persistent | Stable |
+| `Cooldown(Address)` | 15 | `ScVal::Address` | Temporary | Internal |
+| `Embargo(Address)` | 16 | `ScVal::Address` | Persistent | Stable |
+| `RiskBand(Address)` | 17 | `ScVal::Address` | Persistent | Stable |
+| `HistoryMaxDepth` | 18 | — | Instance | Stable |
+| `ContractVersion` | 19 | — | Instance | Stable |
+| `PendingUpgrade` | 20 | — | Instance | Stable |
+| `UpgradeDelay` | 21 | — | Instance | Stable |
+| `StalenessWindow` | 22 | — | Instance | Stable |
+| `CooldownSecs` | 23 | — | Instance | Stable |
+| `DecayRateNumerator` | 24 | — | Instance | Stable |
+| `DecayRateDenominator` | 25 | — | Instance | Stable |
+
+> [!NOTE]
+> The indices above are illustrative of the encoding scheme. The authoritative source of truth is the declaration order of `DataKey` in `contracts/ledgerlens-score/src/types.rs`; the fixture vectors in `docs/sdk-conformance-fixtures.md` are validated in CI against that enum on every change.
+
+### Worked hex examples
+
+Given a contract id `C...` (32-byte `ScAddress::Contract`), the following keys encode as shown. The `ScVal` bytes are the XDR of the `key` field; the full `LedgerKey` wraps them with the contract address and durability.
+
+**Unit key — `Paused` (index 8):**
+
+```
+ScVal::Vec([ ScVal::U32(8) ])
+XDR: 00 00 00 11 00 00 00 01 00 00 00 03 00 00 00 08
+     ^vec  ^len=1  ^u32 tag  ^value=8
+```
+
+**Address key — `Score(addr)` (index 12):**
+
+```
+ScVal::Vec([ ScVal::U32(12), ScVal::Address(addr) ])
+XDR: 00 00 00 11 00 00 00 02 00 00 00 03 00 00 00 0c <addr-xdr>
+     ^vec  ^len=2  ^u32 tag  ^value=12
+```
+
+**Instance key — `Admin` (index 0):**
+
+```
+ScVal::Vec([ ScVal::U32(0) ])
+XDR: 00 00 00 11 00 00 00 01 00 00 00 03 00 00 00 00
+```
+
+### Decoding values
+
+Values are decoded by matching the `ScVal` type against the expected Rust type for the key family:
+
+| Key family | Value `ScVal` | Rust type |
+| :--- | :--- | :--- |
+| `Admin`, `Service`, `PendingAdmin` | `ScVal::Address` | `Address` |
+| `AdminSet`, `ServiceSet` | `ScVal::Vec` of `ScVal::Address` | `Vec<Address>` |
+| `AdminThreshold`, `ServiceThreshold` | `ScVal::U32` | `u32` |
+| `ServicePubKey` | `ScVal::Bytes` | `BytesN<33>` |
+| `SignerTier(Address)` | `ScVal::Map` | `TierBounds` |
+| `Paused` | `ScVal::Bool` | `bool` |
+| `RiskThreshold`, `JumpThreshold` | `ScVal::U32` | `u32` |
+| `Score(Address)` | `ScVal::U32` | `u32` |
+| `ScoreHistory(Address)` | `ScVal::Vec` of `ScVal::U32` | `Vec<u32>` |
+| `LastUpdate(Address)` | `ScVal::U64` | `u64` |
+| `Cooldown(Address)` | `ScVal::U64` | `u64` |
+| `Embargo(Address)` | `ScVal::Bool` | `bool` |
+| `RiskBand(Address)` | `ScVal::U32` | `u32` |
+| `HistoryMaxDepth`, `ContractVersion` | `ScVal::U32` | `u32` |
+| `PendingUpgrade` | `ScVal::Map` | `UpgradeProposal` |
+| `UpgradeDelay`, `StalenessWindow`, `CooldownSecs` | `ScVal::U64` | `u64` |
+| `DecayRateNumerator`, `DecayRateDenominator` | `ScVal::U64` | `u64` |
+
+### TTL and archival state
+
+Every `CONTRACT_DATA` ledger entry returned by `getLedgerEntries` carries a `liveUntilLedgerSeq` field:
+
+- **Live**: `liveUntilLedgerSeq > current_ledger`. The value is present and readable.
+- **Archived**: the entry is absent from the response. For `PERSISTENT` durability the entry can be restored with a `RestoreFootprint` operation; for `TEMPORARY` durability the entry is gone permanently and must be rewritten.
+- **Instance**: read via `LedgerKey::ContractInstance`; its TTL is the contract instance's `liveUntilLedgerSeq`.
+
+Consumers should treat a missing persistent entry as *archived* (restorable) and a missing temporary entry as *absent* (must be re-created).
+
+### Stability and compatibility rules
+
+Keys are classified as **Stable** or **Internal** in the encoding table above.
+
+- **Stable keys** are part of the public storage ABI. Their variant index, payload shape, durability, and value type will not change without a major version bump and a documented migration. New stable keys are only appended at the end of the enum so existing indices are preserved.
+- **Internal keys** (e.g. `Cooldown`) may change encoding between minor versions. Consumers must not depend on their exact layout.
+
+Any change to the `DataKey` enum must update this table, the fixture vectors in `docs/sdk-conformance-fixtures.md`, and the conformance tests, and must follow the repository's compatibility policies.
+
+---
+
 ## Storage Layout Specifications
 
 The following tables specify every key stored by LedgerLens, mapped to its storage tier, TTL parameters, and purpose.
@@ -74,138 +217,4 @@ The following tables specify every key stored by LedgerLens, mapped to its stora
 | `StalenessWindow` | Instance | N/A | N/A | Maximum age in seconds before a score is considered stale. | [`DEFAULT_STALENESS_WINDOW_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L95) |
 | `CooldownSecs` | Instance | N/A | N/A | Rate limit cooldown delay between submissions for the same key. | [`DEFAULT_COOLDOWN_SECS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L57) |
 | `DecayRateNumerator` | Instance | N/A | N/A | Fixed-point exponential decay numerator λ. Defaults to 0. | [`DEFAULT_DECAY_LAMBDA_NUM`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L113) |
-| `DecayRateDenominator` | Instance | N/A | N/A | Fixed-point exponential decay denominator λ. Defaults to 1. | [`DEFAULT_DECAY_LAMBDA_DEN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L116) |
-| `GlobalMinConfidence` | Instance | N/A | N/A | System-wide minimum confidence floor. Defaults to 0. | - |
-| `FeeToken` | Instance | N/A | N/A | SEP-41 token contract address from which fees are drawn. | - |
-| `WithdrawalLock` | Instance | N/A | N/A | Reentrancy guard for withdrawal routines. | - |
-| `ScoreFloorHighWaterMark` | Instance | N/A | N/A | Peak score threshold for reputation laundering protection. | [`DEFAULT_SCORE_FLOOR_HWM`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L143) |
-| `ScoreFloorMinValue` | Instance | N/A | N/A | Minimum score allowed once the floor applies. | [`DEFAULT_SCORE_FLOOR_MIN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L147) |
-| `ScoreFloorEnabled` | Instance | N/A | N/A | Global activation state of the score floor policy. Defaults to false. | - |
-| `HysteresisMargin` | Instance | N/A | N/A | Margin used to widen the exit threshold below the risk threshold. Defaults to 0. | [`MAX_HYSTERESIS_MARGIN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L167) |
-| `ConsensusThresholdK` | Instance | N/A | N/A | Minimum model submissions that must agree for consensus. | [`DEFAULT_CONSENSUS_THRESHOLD_K`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L194) |
-| `ConsensusEpsilon` | Instance | N/A | N/A | Maximum absolute deviation from the provisional median allowed. | [`DEFAULT_CONSENSUS_EPSILON`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L197) |
-| `GateCallers` | Instance | N/A | N/A | List of contract addresses authorized to call gate functions. | - |
-
----
-
-### Persistent Storage Keys
-*All persistent keys in LedgerLens share the same TTL bounds.*
-* **TTL Threshold**: `SCORE_TTL_THRESHOLD` (~30 days / 518,400 ledgers)
-* **TTL Extend-To**: `SCORE_TTL_EXTEND_TO` (~45 days / 777,600 ledgers)
-
-| Key Name | Storage Tier | TTL Threshold | TTL Extend-To | Description | Cross-Reference |
-| :--- | :--- | :---: | :---: | :--- | :--- |
-| `Score(Address, Symbol)` | Persistent | 518,400 | 777,600 | Holds the latest `RiskScore` struct for a (wallet, asset_pair). | [`SCORE_TTL_THRESHOLD`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L2), [`SCORE_TTL_EXTEND_TO`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L3) |
-| `Watchlist(Address)` | Persistent | 518,400 | 777,600 | Watchlist monitoring flag (`bool`). Removed when unset. | - |
-| `ScoreHistory(Address, Symbol)` | Persistent | 518,400 | 777,600 | Ring buffer (`Vec<RiskScore>`) of historical scores. | - |
-| `AssetPairs(Address)` | Persistent | 518,400 | 777,600 | List of asset pairs (`Vec<Symbol>`) a wallet is tracked on. | [`MAX_WALLET_PAIRS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L45) |
-| `PairWeight(Symbol)` | Persistent | 518,400 | 777,600 | Weighted multiplier used in weighted average aggregates. | - |
-| `AggregateScore(Address)` | Persistent | 518,400 | 777,600 | Cached snapshot of `AggregateRiskScore` (write-through only). | - |
-| `LastSubmitTime(Address, Symbol)` | Persistent | 518,400 | 777,600 | Timestamp of the last accepted submission (cooldown logic). | - |
-| `ScoreCount(Address, Symbol)` | Persistent | 518,400 | 777,600 | Cumulative counter of all historical submissions. | - |
-| `PairPaused(Symbol)` | Persistent | 518,400 | 777,600 | Boolean paused flag per asset pair. Removed when unpaused. | - |
-| `PausedPairIndex` | Persistent | 518,400 | 777,600 | Incrementally maintained list (`Vec<Symbol>`) of paused pairs. | [`MAX_PAUSED_PAIRS`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L103) |
-| `ScoreDelegate(Address)` | Persistent | 518,400 | 777,600 | Maps a sub-wallet to its custodian wallet. | - |
-| `TrendState(Address, Symbol)` | Persistent | 518,400 | 777,600 | Risk trend metadata (`ScoreTrend`). | - |
-| `Counterparties(Address, Symbol)` | Persistent | 518,400 | 777,600 | Bidirectional links list (`Vec<Address>`) for wallet graphing. | [`MAX_COUNTERPARTY_LINKS_PER_WALLET`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L130) |
-| `HistoricalMaxScore(Address, Symbol)` | Persistent | 518,400 | 777,600 | Running historical peak score. Used for floor checks. | - |
-
----
-
-### Temporary Storage Keys
-*Temporary keys expire and are deleted automatically once their TTL has elapsed.*
-
-| Key Name | Storage Tier | TTL Threshold | TTL Extend-To | Description | Cross-Reference |
-| :--- | :--- | :---: | :---: | :--- | :--- |
-| `RiskBandState(Address, Symbol)` | Temporary | 518,400 | 777,600 | Records if a wallet is in the high-risk band for an asset pair. | [`BAND_STATE_TTL_THRESHOLD`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L171), [`BAND_STATE_TTL_EXTEND_TO`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L175) |
-| `ScoreEmbargo(Address)` | Temporary | 1,555,200 | 3,110,400 | Regulatory embargo details (`EmbargoExpiry`). Expire threshold is ~90 days; target extend-to is ~180 days. | [`EMBARGO_TTL_THRESHOLD`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L186), [`EMBARGO_TTL_EXTEND_TO`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.rs#L189) |
-
----
-
-## Aggregator Storage Keys (ledgerlens-aggregator)
-
-### Instance Storage Keys
-
-| Key Name | Storage Tier | TTL | Description |
-| :--- | :--- | :---: | :--- |
-| `Admin` | Instance | N/A | The aggregator administrator address. |
-| `Shards` | Instance | N/A | Ordered list of registered shard contract addresses (`Vec<Address>`). |
-| `ShardHealth(Address)` | Instance | N/A | Health flag per shard (`bool`, defaults to `true`). |
-| `LastShardFailure` | Instance | N/A | `(Address, u32)` identifying the last shard that caused a call failure. |
-| `ShardCapabilities(Address)` | Instance | N/A | **[Added #711]** Capability snapshot (`Vec<Symbol>`) recorded at `add_shard` time. Removed on `remove_shard`. Used by `get_shard_capabilities` and `shard_capabilities_downgraded`. |
-
----
-
-## Executable Storage Invariants (Issue #710)
-
-The following invariants are enforced at test/debug build time via
-`invariants::invariant_check(env)` in `contracts/ledgerlens-score/src/invariants.rs`.
-Each is callable as a standalone helper for migration tooling.
-
-| # | Storage Family | Invariant | Helper |
-|---|----------------|-----------|--------|
-| 1 | Config | `global_min_confidence` ∈ `[0, 100]` | `invariant_check` |
-| 2 | Config | `service_threshold` ≤ service signer set size | `invariant_check` |
-| 3 | Config | `admin_threshold` ≤ admin set size | `invariant_check` |
-| 4 | Config | Decay rate denominator ≠ 0 | `decay_rate_is_valid` |
-| 5 | Config | Gate query fee ≥ 0 | `invariant_check` |
-| 6 | Config | Accumulated fees ≥ 0 | `invariant_check` |
-| 7 | Score index | Every `ScoreEntryIndex` entry has a live `Score` key | `score_index_is_consistent` |
-| 8 | Score index | `ScoreEntryIndex` contains no duplicates | `invariant_check` |
-| 10 | History | `ScoreHistory` ring length ≤ `HistoryMaxDepth` | `history_rings_are_bounded` |
-| 11 | Embargo | `ActiveEmbargoCount` == live entries in `EmbargoedWalletIndex` | `embargo_count_is_consistent` |
-| 12 | Embargo | `EmbargoedWalletIndex` contains no duplicates | `invariant_check` |
-| 13 | Pairs | Every pair in `AssetPairs(wallet)` with live data is registered | `invariant_check` |
-| 14 | Admin | `PendingAdmin` ≠ current `Admin` | `invariant_check` |
-| 16 | Pause | `PausedPairIndex` contains no duplicates | `invariant_check` |
-| 17 | Decay | Decay λ = `num/den` ∈ `[0, 1]` | `decay_rate_is_valid` |
-| 18 | History | `HistoryMaxDepth` ∈ `[1, MAX_HISTORY_DEPTH]` | `invariant_check` |
-
----
-
-## Migration Rollback Fixtures (Issue #709)
-
-Partial-migration scenarios are exercised in
-`contracts/ledgerlens-score/src/test_migration_rollback.rs`.
-
-**Pattern:** Seed raw `Score` keys → apply partial index rewrite → re-run
-migration (idempotent replay) → assert `score_index_is_consistent()` and
-`invariant_check()` pass.
-
-**Key invariants tested:**
-- Re-indexing the same wallet twice leaves exactly one entry (no duplicates).
-- An orphaned index entry (score deleted mid-migration) is cleaned up on replay.
-- The index caps at `MAX_TRACKED_SCORE_ENTRIES`; entries beyond the cap still have live scores but are not enumerated.
-- Multi-pair partial migrations converge to full consistency after a single full replay.
-
-**ABI/event/storage compatibility:**
-- No new public ABI methods are added.
-- No events are emitted by migration helpers.
-- The migration pattern operates entirely through existing `storage::*` helpers.
-- Backward compatible: contracts without the new invariant helpers compile and behave identically.
-
----
-
-## Shard Capability Attestation (Issue #711)
-
-**New storage key:** `ShardCapabilities(Address)` (see aggregator table above).
-
-**New public methods on `LedgerLensAggregator`:**
-- `get_shard_capabilities(shard: Address) → Vec<Symbol>` — returns the capability snapshot stored at registration time.
-- `shard_capabilities_downgraded(shard: Address) → bool` — returns `true` if the shard no longer advertises all capabilities it reported at registration.
-
-**Registration flow change:**
-`add_shard` now:
-1. Calls `shard_supports_required_interface` (unchanged — fails `IncompatibleInterface` if any required cap is missing).
-2. Calls `probe_capabilities` to collect the full supported capability set.
-3. Writes the snapshot to `ShardCapabilities(shard)`.
-
-`remove_shard` now also removes the `ShardCapabilities(shard)` key.
-
-**Required capabilities (unchanged): `["score", "gate", "aggr", "arch"]`**
-
-**ABI/event/storage compatibility:**
-- Two new read-only methods added — backward compatible (no existing clients break).
-- One new storage key (`ShardCapabilities`) written on `add_shard`, removed on `remove_shard`.
-- No new events emitted.
-- Shards registered before this change have no snapshot; `get_shard_capabilities` returns empty for those.
+| `DecayRateDenominator` | Instance | N/A | N/A | Fixed-point exponential decay denominator λ. Defaults to 1. | [`DEFAULT_DECAY_LAMBDA_DEN`](file:///c:/Users/HP/Desktop/opensource/Ledgerlens-contract/contracts/ledgerlens-score/src/constants.r

@@ -5,14 +5,21 @@ members = [
     "contracts/ledgerlens-score",
     "contracts/ledgerlens-aggregator",
     "contracts/ledgerlens-test-support",
+    "contracts/reference-provider",
     "contracts/mock-amm",
     "contracts/mock-lending",
     "tools/replay",
     "tools/recovery",
     "tools/schema-gen",
     "tools/invocation-fuzzer",
+    "tools/reference-model/driver",
+    "tools/score-submitter",
     "tests/composability",
+    "tests/conformance",
 ]
+
+[workspace.dependencies]
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [profile.release]
 opt-level = "z"

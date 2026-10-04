@@ -142,7 +142,7 @@ sequenceDiagram
 | `commit_consensus` | Consensus Phase 1 | Model | Submits a consensus score commitment (hashed) |
 | `reveal_consensus` | Consensus Phase 2 | Service Signers | Reveals scores, verifies commitments, tallies consensus |
 
-**Source:** [contracts/ledgerlens-score/src/lib.rs](../../contracts/ledgerlens-score/src/lib.rs)
+**Source:** [contracts/ledgerlens-score/src/lib.rs](../contracts/ledgerlens-score/src/lib.rs)
 
 ## Commitment Scoping Trace & Isolation Analysis
 

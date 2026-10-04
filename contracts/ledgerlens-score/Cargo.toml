@@ -13,15 +13,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = "21.0.0"
 subtle = { version = "2.6", default-features = false }
-libm = "0.2"
-# Shared no_std fixed-point and statistics primitives. No Soroban SDK
-# dependency, so the same audited implementation is reused by the aggregator,
-# the replay tool, the simulator and Kani harnesses (see #1192).
-ledgerlens-math = { version = "0.1.0", path = "../ledgerlens-math", default-features = false }
+# `libm` is retained only for the deterministic, integer-backed helpers that
+# were previously expressed with floating point. All consensus-critical math
+# now uses integer / fixed-point arithmetic; see `docs/score-math.md` for the
+# determinism audit (issue #1199).
+libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 ledgerlens-test-support = { version = "0.1.0", path = "../ledgerlens-test-support" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # Used only by tests, to produce real secp256k1 ECDSA signatures that
 # exercise `verify_attestation` end-to-end (see `test_attestation.rs`).
 k256 = { version = "0.13.4", features = ["ecdsa"] }

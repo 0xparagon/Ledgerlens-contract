@@ -41,3 +41,4 @@ crate-type = ["lib"]
 name = "aggregator_shard_pause_example"
 path = "../../examples/aggregator_shard_pause_example.rs"
 crate-type = ["lib"]
+
