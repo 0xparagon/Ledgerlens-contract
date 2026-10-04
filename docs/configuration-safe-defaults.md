@@ -7,6 +7,48 @@ The baseline assumption is fail-closed risk gating: when data is missing,
 stale beyond the configured model, embargoed, or held in pending-finality
 state, downstream protocols should assume the wallet is not safe.
 
+## On-chain parameter bounds registry
+
+All governed parameters are validated against a single on-chain bounds
+registry (`parameter_governance.rs`). Every setter routes through one shared
+validation function, and the upgrade smoke checks consult the same table, so a
+value that is individually valid but unsafe in combination cannot be landed by
+governance or by an upgrade. The registry is exposed read-only via
+`get_parameter_bounds()` for tooling and the production deployment validator,
+and the table itself can only be changed by upgrade, never by runtime
+governance.
+
+### Hard bounds table
+
+| Parameter | Min | Max | Cross-parameter constraint |
+|---|---:|---:|---|
+| `risk_threshold` | `0` | `100` | `hysteresis_margin < risk_threshold` |
+| `global_min_confidence` | `0` | `100` | — |
+| `staleness_window` | `1s` | `2_592_000s` | `staleness_window > cooldown` |
+| `finality_buffer` | `0s` | `86_400s` | — |
+| `cooldown` | `60s` | `86_400s` | `cooldown < staleness_window` |
+| `adaptive_rate_limit` | `variance_scale >= 0` | unbounded | — |
+| `burst_capacity` | `1` | `1_000` | — |
+| `score_floor_policy` | `high_water_mark ∈ [50,100]` | — | `floor_value < high_water_mark` |
+| `hysteresis_margin` | `0` | `100` | `hysteresis_margin < risk_threshold` |
+| `escalation_threshold` | `2` | `20` | — |
+| `consensus_config (k, epsilon)` | `k >= 1` | `epsilon <= 100` | `k <= signer_count` |
+| `adaptive_epsilon` | `min >= 0` | `max <= 100` | `min <= max` |
+| `privacy_epsilon` | `0` | `1_000_000` | — |
+| `hll_precision` | `4` | `16` | — |
+| `history_max_depth` | `1` | `50` | — |
+| `upgrade_delay` | `172_800s` | `1_209_600s` | — |
+| `reveal_window` | `1` | `86_400` | — |
+| `heartbeat_alert_threshold` | `1s` | `86_400s` | — |
+| `oracle_staleness_threshold` | `1s` | `86_400s` | — |
+| `pair_volatility_window` | `1` | `86_400` | — |
+| `momentum_window` | `1` | `86_400` | — |
+| `momentum_alert_threshold` | `0` | `100` | — |
+| `admin_threshold` | `1` | `admin_set.len()` | `admin_threshold <= admin_set.len()` |
+| `service_threshold` | `1` | `service_set.len()` | `service_threshold <= service_set.len()` |
+| `deletion_approval_policy` | disabled | enabled | approver non-admin and disjoint from admin set |
+| `gate_callers` | — | — | bounded allowlist |
+
 ## Core gate parameters
 
 | Parameter | Threat controlled | Default | Bounds / rules | Safe production guidance | Forbidden or high-risk configuration |
@@ -59,11 +101,14 @@ state, downstream protocols should assume the wallet is not safe.
   - `set_deletion_approval_policy`
   - `get_deletion_approval_policy`
   - `export_configuration`
+  - `get_parameter_bounds` (read-only bounds registry entry point)
 - Event impact:
   - adds `del_pol`
 - Storage impact:
   - adds deletion-policy keys only; existing storage is unchanged
+  - the bounds registry is a compile-time table, not runtime storage, so it
+    cannot be mutated by governance
 - Worst relevant bounded-resource case:
   - `export_configuration()` is bounded by a fixed list of global parameters and
     the capped pending-proposal index
-
+  - `get_parameter_bounds()` returns a fixed-size table

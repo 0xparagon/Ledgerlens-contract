@@ -33,6 +33,73 @@ pub fn param_key_upgrade_delay() -> Symbol {
     symbol_short!("upg_dlay")
 }
 
+/// Symbol identifying a staleness window change (`set_staleness_window`).
+pub fn param_key_staleness_window() -> Symbol {
+    symbol_short!("stale_win")
+}
+
+/// Hard bounds for a single governed parameter. `min`/`max` are inclusive.
+/// The registry is a compile-time constant table: it can only be changed by
+/// upgrading the contract, never by runtime governance.
+#[derive(Clone, Copy)]
+pub struct ParamBounds {
+    pub key: Symbol,
+    pub min: u64,
+    pub max: u64,
+}
+
+/// The single source of truth for every governed parameter's hard bounds.
+/// Every setter must consult this table via [`validate_parameter_value`].
+pub fn bounds_registry(env: &Env) -> soroban_sdk::Vec<ParamBounds> {
+    use soroban_sdk::Vec as SorobanVec;
+
+    let mut table = SorobanVec::new(env);
+    table.push_back(ParamBounds {
+        key: param_key_cooldown(),
+        min: constants::MIN_COOLDOWN_SECS,
+        max: constants::MAX_COOLDOWN_SECS,
+    });
+    table.push_back(ParamBounds {
+        key: param_key_history_depth(),
+        min: 1,
+        max: constants::MAX_HISTORY_DEPTH as u64,
+    });
+    table.push_back(ParamBounds {
+        key: param_key_decay_rate(),
+        min: 0,
+        max: constants::MAX_DECAY_LAMBDA_NUM as u64,
+    });
+    table.push_back(ParamBounds {
+        key: param_key_velocity_cap(),
+        min: 0,
+        max: u32::MAX as u64,
+    });
+    table.push_back(ParamBounds {
+        key: param_key_upgrade_delay(),
+        min: constants::MIN_UPGRADE_DELAY_SECS,
+        max: constants::MAX_UPGRADE_DELAY_SECS,
+    });
+    table.push_back(ParamBounds {
+        key: param_key_staleness_window(),
+        min: constants::MIN_STALENESS_WINDOW_SECS,
+        max: constants::MAX_STALENESS_WINDOW_SECS,
+    });
+    table
+}
+
+/// Returns the hard bounds for `param_key`, or `None` if the key is not
+/// registered. Used by the deployment validator and tooling.
+pub fn get_parameter_bounds(env: &Env, param_key: &Symbol) -> Option<ParamBounds> {
+    let table = bounds_registry(env);
+    for i in 0..table.len() {
+        let entry = table.get(i).unwrap();
+        if &entry.key == param_key {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 fn read_u64(bytes: &Bytes) -> Result<u64, Error> {
     if bytes.len() != 8 {
         return Err(Error::InvalidParameterValue);
@@ -55,22 +122,51 @@ fn read_u32(bytes: &Bytes, offset: u32) -> Result<u32, Error> {
     Ok(u32::from_be_bytes(arr))
 }
 
-/// Validates that `new_value` is well-formed and within bounds for `param_key`.
-pub fn validate_parameter_value(
-    _env: &Env,
+/// Enforces cross-parameter constraints that cannot be expressed as a single
+/// min/max pair. Currently: the cooldown must not exceed the staleness window,
+/// otherwise a rate-limited caller could be served stale data.
+fn validate_cross_parameter_constraints(
+    env: &Env,
     param_key: &Symbol,
     new_value: &Bytes,
 ) -> Result<(), Error> {
     if param_key == &param_key_cooldown() {
         let secs = read_u64(new_value)?;
-        if !(constants::MIN_COOLDOWN_SECS..=constants::MAX_COOLDOWN_SECS).contains(&secs) {
+        let staleness = storage::get_staleness_window_secs(env);
+        if secs > staleness {
             return Err(Error::InvalidCooldown);
         }
-        return Ok(());
+    }
+    if param_key == &param_key_staleness_window() {
+        let staleness = read_u64(new_value)?;
+        let cooldown = storage::get_cooldown_secs(env);
+        if staleness < cooldown {
+            return Err(Error::InvalidParameterValue);
+        }
+    }
+    Ok(())
+}
+
+/// Validates that `new_value` is well-formed and within bounds for `param_key`.
+/// All setters route through this function; the bounds come from
+/// [`bounds_registry`] so no setter can bypass the hard limits.
+pub fn validate_parameter_value(
+    env: &Env,
+    param_key: &Symbol,
+    new_value: &Bytes,
+) -> Result<(), Error> {
+    let bounds = get_parameter_bounds(env, param_key).ok_or(Error::InvalidParameterKey)?;
+
+    if param_key == &param_key_cooldown() {
+        let secs = read_u64(new_value)?;
+        if !(bounds.min..=bounds.max).contains(&secs) {
+            return Err(Error::InvalidCooldown);
+        }
+        return validate_cross_parameter_constraints(env, param_key, new_value);
     }
     if param_key == &param_key_history_depth() {
-        let depth = read_u32(new_value, 0)?;
-        if depth == 0 || depth > constants::MAX_HISTORY_DEPTH {
+        let depth = read_u32(new_value, 0)? as u64;
+        if !(bounds.min..=bounds.max).contains(&depth) {
             return Err(Error::InvalidHistoryDepth);
         }
         return Ok(());
@@ -108,11 +204,17 @@ pub fn validate_parameter_value(
     }
     if param_key == &param_key_upgrade_delay() {
         let delay = read_u64(new_value)?;
-        if !(constants::MIN_UPGRADE_DELAY_SECS..=constants::MAX_UPGRADE_DELAY_SECS).contains(&delay)
-        {
+        if !(bounds.min..=bounds.max).contains(&delay) {
             return Err(Error::InvalidUpgradeDelay);
         }
         return Ok(());
+    }
+    if param_key == &param_key_staleness_window() {
+        let secs = read_u64(new_value)?;
+        if !(bounds.min..=bounds.max).contains(&secs) {
+            return Err(Error::InvalidParameterValue);
+        }
+        return validate_cross_parameter_constraints(env, param_key, new_value);
     }
     Err(Error::InvalidParameterKey)
 }
@@ -157,6 +259,11 @@ pub fn apply_parameter_change(
         storage::set_upgrade_delay(env, delay);
         return Ok(());
     }
+    if param_key == &param_key_staleness_window() {
+        let secs = read_u64(new_value)?;
+        storage::set_staleness_window_secs(env, secs);
+        return Ok(());
+    }
     Err(Error::InvalidParameterKey)
 }
 
@@ -191,6 +298,10 @@ pub fn get_current_parameter_value(env: &Env, param_key: &Symbol) -> Result<Byte
         let delay = storage::get_upgrade_delay(env);
         return Ok(Bytes::from_array(env, &delay.to_be_bytes()));
     }
+    if param_key == &param_key_staleness_window() {
+        let secs = storage::get_staleness_window_secs(env);
+        return Ok(Bytes::from_array(env, &secs.to_be_bytes()));
+    }
     Err(Error::InvalidParameterKey)
 }
 
@@ -214,6 +325,9 @@ fn get_affected_capabilities(env: &Env, param_key: &Symbol) -> soroban_sdk::Vec<
     } else if param_key == &param_key_upgrade_delay() {
         caps.push_back(symbol_short!("upgrade"));
         caps.push_back(symbol_short!("govern"));
+    } else if param_key == &param_key_staleness_window() {
+        caps.push_back(symbol_short!("stale"));
+        caps.push_back(symbol_short!("cooldown"));
     }
     caps
 }
@@ -225,21 +339,4 @@ pub fn simulate_parameter_change(
     param_key: &Symbol,
     new_value: &Bytes,
     proposed_at: u64,
-    time_lock_secs: u64,
-) -> Result<crate::types::ParameterSimulation, Error> {
-    validate_parameter_value(env, param_key, new_value)?;
-
-    let current_value = get_current_parameter_value(env, param_key)?;
-    let affected = get_affected_capabilities(env, param_key);
-    let exec_start = proposed_at.saturating_add(time_lock_secs);
-    let exec_end = proposed_at.saturating_add(time_lock_secs.saturating_mul(2));
-
-    Ok(crate::types::ParameterSimulation {
-        param_key: param_key.clone(),
-        current_value,
-        new_value: new_value.clone(),
-        affected_capabilities: affected,
-        execution_window_start: exec_start,
-        execution_window_end: exec_end,
-    })
-}
+    
