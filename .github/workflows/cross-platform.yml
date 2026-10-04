@@ -1,0 +1,40 @@
+name: Cross-platform
+
+# Issue #1229: macOS and Windows coverage for build, unit tests and the tool
+# crates. Linux coverage (and reproducible WASM builds, Linux-only by design)
+# stays in ci.yml. Supported matrix: CONTRIBUTING.md#platform-support.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Unit tests (contract library)
+        run: cargo test --locked -p ledgerlens-score --lib
+      - name: Tool crates
+        run: cargo test --locked -p replay -p recovery -p schema-gen -p invocation-fuzzer
+      - name: WASM builds (not byte-reproducible off Linux)
+        run: cargo build --locked --target wasm32-unknown-unknown --release -p ledgerlens-score

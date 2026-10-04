@@ -1,0 +1,65 @@
+# Per-module coverage thresholds enforced by tools/ci/coverage_gate.py (#1225).
+# See docs/coverage.md for how to read reports and raise coverage.
+#
+# Paths are matched as prefixes against repository-relative source paths;
+# the longest matching prefix wins. Percentages are line coverage; `branch`
+# is enforced only when the report contains branch data (nightly job).
+
+# Files never counted: test modules, generated code, benches and fuzz targets.
+exclude = [
+  "contracts/ledgerlens-score/src/test",   # test_*.rs and test.rs
+  "contracts/ledgerlens-score/src/upgrade_smoke.rs",
+  "contracts/ledgerlens-test-support/",
+  "contracts/mock-amm/",
+  "contracts/mock-lending/",
+  "tests/",
+  "fuzz/",
+  "benches/",
+  "/tests/",
+  "/test_snapshots/",
+  "/generated/",
+]
+
+# Maximum allowed drop (percentage points) for any changed file versus the
+# baseline report from `main` ("no decrease" rule, with float tolerance).
+max_changed_file_drop = 0.0
+
+[default]
+line = 50.0
+
+# ── Security-critical modules ───────────────────────────────────────────────
+[modules."contracts/ledgerlens-score/src/governance_actions.rs"]
+line = 85.0
+branch = 70.0
+
+[modules."contracts/ledgerlens-score/src/governance_helpers.rs"]
+line = 85.0
+branch = 70.0
+
+[modules."contracts/ledgerlens-score/src/parameter_governance.rs"]
+line = 85.0
+branch = 70.0
+
+[modules."contracts/ledgerlens-score/src/storage.rs"]
+line = 85.0
+branch = 70.0
+
+[modules."contracts/ledgerlens-score/src/zk_range_proof.rs"]
+line = 85.0
+branch = 70.0
+
+[modules."contracts/ledgerlens-score/src/verkle.rs"]
+line = 85.0
+branch = 70.0
+
+[modules."contracts/ledgerlens-score/src/lib.rs"]
+# Entry points: authorisation and attestation checks live here.
+line = 80.0
+branch = 65.0
+
+[modules."contracts/ledgerlens-aggregator/src/"]
+line = 75.0
+
+# ── Peripheral code ─────────────────────────────────────────────────────────
+[modules."tools/"]
+line = 40.0

@@ -1,0 +1,123 @@
+name: Coverage
+
+# Coverage gating with cargo-llvm-cov (#1225). Thresholds live in
+# coverage-thresholds.toml; see docs/coverage.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly branch-coverage run (branch coverage needs a nightly toolchain).
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Excluded from reports: test modules, generated code, benches, fuzz targets
+  # and test-only crates. Keep in sync with `exclude` in coverage-thresholds.toml.
+  IGNORE_REGEX: '(/src/test[^/]*\.rs$|/tests/|/benches/|/fuzz/|/generated/|ledgerlens-test-support/|mock-amm/|mock-lending/)'
+
+jobs:
+  coverage:
+    name: Coverage
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read          # download the baseline report from main
+      pull-requests: write   # sticky summary comment (same-repo PRs only)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.81.0"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.6.16
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --workspace --locked --no-report
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" --json --output-path target/coverage.json
+          cargo llvm-cov report --ignore-filename-regex "$IGNORE_REGEX" --lcov --output-path target/coverage.lcov
+      - name: Fetch baseline report from main
+        if: github.event_name == 'pull_request'
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: coverage.yml
+          branch: main
+          name: coverage-report
+          path: baseline
+          if_no_artifact_found: warn
+      - name: Changed files
+        if: github.event_name == 'pull_request'
+        run: git diff --name-only "${{ github.event.pull_request.base.sha }}"...HEAD > target/changed-files.txt
+      - name: Coverage gate
+        id: gate
+        run: |
+          set +e
+          args=(target/coverage.json --markdown target/coverage-summary.md)
+          if [ -f baseline/coverage.json ] && [ -f target/changed-files.txt ]; then
+            args+=(--baseline baseline/coverage.json --changed target/changed-files.txt)
+          fi
+          python3 tools/ci/coverage_gate.py "${args[@]}"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            target/coverage.json
+            target/coverage.lcov
+            target/coverage-summary.md
+          retention-days: 30
+      - name: Comment summary on PR
+        # Fork PRs get a read-only token; they still see the job summary.
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage
+          path: target/coverage-summary.md
+      - name: Enforce gate
+        if: steps.gate.outputs.rc != '0'
+        run: exit 1
+
+  branch-coverage:
+    name: Branch coverage (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Nightly toolchains can break Soroban builds; this job is informative
+    # until branch coverage stabilises (line gating above stays required).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.6.16
+      - name: Measure line + branch coverage
+        run: |
+          cargo +nightly llvm-cov --workspace --branch --no-report
+          cargo +nightly llvm-cov report --branch --ignore-filename-regex "$IGNORE_REGEX" --json --output-path target/coverage-branch.json
+      - name: Coverage gate (line and branch thresholds)
+        run: python3 tools/ci/coverage_gate.py target/coverage-branch.json --markdown target/coverage-branch-summary.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-branch-report
+          path: target/coverage-branch*
+          retention-days: 30
