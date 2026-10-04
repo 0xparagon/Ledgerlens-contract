@@ -16,6 +16,21 @@ This document doesn't replace the deeper specs it cites — [`docs/interface-ver
 [`docs/storage-layout.md`](storage-layout.md), [`docs/errors.md`](errors.md) — it's the short,
 scannable index a contributor should check *before* touching `lib.rs`.
 
+> **Caveat added by #1244: nine suites linked from this document do not currently run.**
+> `error_coverage.rs`, `test_batch_watchlist.rs`, `test_bulk_signer_tier.rs`,
+> `test_confidence_gate.rs`, `test_embargo.rs`, `test_fuzz_submit_score.rs`,
+> `test_gate_enforcement.rs`, `test_histogram.rs` and `test_hysteresis.rs` are present in
+> `contracts/ledgerlens-score/src/` but are not declared in `src/lib.rs`, so no cargo target
+> compiles them and they execute zero assertions today. The invariants they are cited under
+> therefore have weaker enforcement than this document implies. Each is recorded as
+> `tier = "disabled"` in [`test-tiers.toml`](test-tiers.toml) with the evidence for its state,
+> and [`docs/test-tiers.md`](test-tiers.md) § Disabled inventory tracks the triage. The gate
+> cannot be satisfied by leaving them invisible: a `mod` line that wires one of them up
+> without classifying it fails `python3 tools/test-tiering.py check`, and un-wiring a live
+> suite fails the same way. This note is deliberately not a claim that the invariants are
+> unenforced — the wired suites cited alongside them are the current enforcement — it is a
+> correction to the coverage impression this document gives.
+
 ---
 
 ## 1. Fail-closed gates

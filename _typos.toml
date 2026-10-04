@@ -1,0 +1,10 @@
+# Spelling / terminology check for the docs site (issue #1231).
+# Glossary terms from docs/glossary.md that typos must not "correct".
+[default.extend-words]
+benford = "benford"
+verkle = "verkle"
+soroban = "soroban"
+ser = "ser"
+
+[files]
+extend-exclude = ["target", "Cargo.lock", "*.json", "*.tla", "*.cfg"]

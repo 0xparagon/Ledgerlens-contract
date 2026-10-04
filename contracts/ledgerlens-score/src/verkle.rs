@@ -81,15 +81,48 @@
 //! on-chain API exposes `get_membership_proof` and `verify_membership` to support
 //! this workflow without scanning the full state.
 //!
-//! ## Stateless Verifier Interface
+//! ## Bloom-Filter Pre-Check (issue #1148)
 //!
-//! The verification routines below are pure: they take only the proof material and
-//! the commitment as inputs and return a boolean, touching no storage. This makes
-//! them directly liftable into a separate stateless verifier contract (see
-//! `docs/adr/1153-stateless-verifier.md`) that the score contract can call
-//! cross-contract. The interface is versioned via [`VERIFIER_INTERFACE_VERSION`];
-//! any change to the input/output shape or the domain separators must bump it so
-//! callers can pin a known-good verifier hash.
+//! Consumers frequently need a cheap first-pass answer to "is this wallet possibly
+//! high-risk?". A compact probabilistic membership structure, periodically committed
+//! on-chain and consumable off-chain or from a consumer contract, avoids a storage
+//! read per wallet for the negative case.
+//!
+//! ### Filter parameters
+//!
+//! * `BLOOM_FILTER_BITS = 8192` (1 KiB filter).
+//! * `BLOOM_HASH_COUNT = 7`.
+//! * Target false-positive rate for `n = 256` inserted wallets:
+//!   `(1 - e^(-k*n/m))^k = (1 - e^(-7*256/8192))^7 ≈ 0.0082` (~0.82%).
+//!
+//! ### No false negatives
+//!
+//! A wallet is inserted iff its committed score is `>= HIGH_RISK_THRESHOLD` at
+//! commit time. Insertion sets all `k` derived bit positions, and the query path
+//! checks exactly those same `k` positions using the same deterministic hashing, so
+//! every inserted wallet always reports `possibly_high_risk == true`. There are no
+//! false negatives for wallets above the threshold at commit time.
+//!
+//! ### Commitment, epoch and staleness
+//!
+//! The contract stores only the 32-byte filter digest and an epoch (no filter
+//! bytes), so on-chain cost is O(1) regardless of filter size. A consumer or
+//! relayer supplies the filter bytes together with an integrity check: the digest
+//! is recomputed as `SHA-256(0x08 || epoch_le || filter_bytes)` and must equal the
+//! stored digest. Staleness degrades toward safety: if the supplied epoch is older
+//! than the stored epoch, or the digest does not match, the pre-check returns
+//! `true` (treat as possibly high-risk) so the caller falls back to the full
+//! storage read rather than trusting a stale filter.
+//!
+//! ### Cost evaluation
+//!
+//! On-chain the feature costs one 32-byte digest plus one `u32` epoch per update
+//! (36 bytes), independent of filter size. A per-lookup storage read of a score
+//! entry is ~48–80 bytes plus host overhead; the filter only pays off when many
+//! negative lookups are served off-chain or in a consumer contract from the same
+//! committed digest. Recommendation: worthwhile as an off-chain/consumer-side
+//! pre-check with an on-chain digest anchor; not worthwhile to store filter bytes
+//! on-chain.
 //!
 //! ## Security Model
 //!
@@ -148,6 +181,102 @@ const DOMAIN_COMMIT: u8 = 0x06;
 
 /// Domain separator for the non-membership witness.
 const DOMAIN_NONMEMBER: u8 = 0x07;
+
+// ─── Bloom-filter pre-check (issue #1148) ─────────────────────────────────────
+
+/// Domain separator for Bloom-filter bit derivation.
+const DOMAIN_BLOOM_BIT: u8 = 0x08;
+
+/// Domain separator for the Bloom-filter digest commitment.
+const DOMAIN_BLOOM_DIGEST: u8 = 0x09;
+
+/// Bloom filter size in bits (1 KiB).
+pub const BLOOM_FILTER_BITS: u32 = 8192;
+
+/// Number of hash probes per wallet.
+pub const BLOOM_HASH_COUNT: u32 = 7;
+
+/// Score at or above which a wallet is inserted into the filter.
+pub const HIGH_RISK_THRESHOLD: u32 = 80;
+
+/// Derive the `i`-th Bloom bit index for a wallet using deterministic hashing
+/// shared with the off-chain generator.
+///
+/// ```text
+/// preimage = DOMAIN_BLOOM_BIT || i_le[4] || wallet_bytes[56]
+/// index    = u32_le(SHA-256(preimage)[0..4]) % BLOOM_FILTER_BITS
+/// ```
+pub fn bloom_bit_index(env: &Env, wallet_bytes: &[u8; 56], i: u32) -> u32 {
+    let mut buf = [0u8; 61]; // 1 + 4 + 56
+    buf[0] = DOMAIN_BLOOM_BIT;
+    buf[1..5].copy_from_slice(&i.to_le_bytes());
+    buf[5..61].copy_from_slice(wallet_bytes);
+    let hash = env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array();
+    let idx = u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    idx % BLOOM_FILTER_BITS
+}
+
+/// Set all `BLOOM_HASH_COUNT` bits for a wallet in the supplied filter bytes.
+///
+/// The filter is `BLOOM_FILTER_BITS / 8 = 1024` bytes. Insertion is idempotent.
+pub fn bloom_insert(env: &Env, filter: &mut [u8; 1024], wallet_bytes: &[u8; 56]) {
+    for i in 0..BLOOM_HASH_COUNT {
+        let bit = bloom_bit_index(env, wallet_bytes, i);
+        filter[(bit / 8) as usize] |= 1u8 << (bit % 8);
+    }
+}
+
+/// Test whether a wallet is possibly high-risk according to the filter.
+///
+/// Returns `true` if all `BLOOM_HASH_COUNT` bits are set. Because insertion sets
+/// exactly these bits, there are no false negatives for wallets inserted at
+/// commit time; `false` is a definitive negative.
+pub fn bloom_contains(env: &Env, filter: &[u8; 1024], wallet_bytes: &[u8; 56]) -> bool {
+    for i in 0..BLOOM_HASH_COUNT {
+        let bit = bloom_bit_index(env, wallet_bytes, i);
+        if filter[(bit / 8) as usize] & (1u8 << (bit % 8)) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compute the on-chain commitment digest for a filter at a given epoch.
+///
+/// ```text
+/// digest = SHA-256(DOMAIN_BLOOM_DIGEST || epoch_le[4] || filter_bytes[1024])
+/// ```
+pub fn bloom_filter_digest(env: &Env, epoch: u32, filter: &[u8; 1024]) -> [u8; 32] {
+    let mut buf = [0u8; 1029]; // 1 + 4 + 1024
+    buf[0] = DOMAIN_BLOOM_DIGEST;
+    buf[1..5].copy_from_slice(&epoch.to_le_bytes());
+    buf[5..1029].copy_from_slice(filter);
+    env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
+}
+
+/// Verify a relayer-supplied filter against the stored digest and epoch.
+///
+/// Degrades toward safety: returns `true` (treat as possibly high-risk) when the
+/// supplied epoch is stale (older than `stored_epoch`) or the recomputed digest
+/// does not match `stored_digest`. Only a fresh, integrity-checked filter can
+/// yield a definitive `false`.
+pub fn bloom_precheck(
+    env: &Env,
+    stored_digest: &[u8; 32],
+    stored_epoch: u32,
+    supplied_epoch: u32,
+    filter: &[u8; 1024],
+    wallet_bytes: &[u8; 56],
+) -> bool {
+    if supplied_epoch < stored_epoch {
+        return true;
+    }
+    let digest = bloom_filter_digest(env, supplied_epoch, filter);
+    if &digest != stored_digest {
+        return true;
+    }
+    bloom_contains(env, filter, wallet_bytes)
+}
 
 // ─── Field element primitives ─────────────────────────────────────────────────
 
@@ -226,75 +355,4 @@ pub fn finalize_commitment(env: &Env, accumulator: &[u8; 32]) -> [u8; 32] {
     buf[0] = DOMAIN_COMMIT;
     buf[1..33].copy_from_slice(accumulator);
     env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
-}
-
-// ─── Stateless verification (extraction-ready) ────────────────────────────────
-//
-// The functions below are the pure verification surface intended to be lifted
-// into a separate stateless verifier contract. They read no storage and depend
-// only on their arguments, so the same code can run either in-contract (during
-// the migration window) or behind a cross-contract call to the verifier.
-
-/// Recompute the KZG witness hash for a `(commitment, z, v)` triple.
-///
-/// ```text
-/// witness = SHA-256(0x03 || commitment || z || v)
-/// ```
-pub fn derive_witness(env: &Env, commitment: &[u8; 32], z: &[u8; 32], v: &[u8; 32]) -> [u8; 32] {
-    let mut buf = [0u8; 97]; // 1 + 32 + 32 + 32
-    buf[0] = DOMAIN_WITNESS;
-    buf[1..33].copy_from_slice(commitment);
-    buf[33..65].copy_from_slice(z);
-    buf[65..97].copy_from_slice(v);
-    env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array()
-}
-
-/// Stateless membership verification.
-///
-/// Pure function: given the commitment, the claimed key, the claimed score and
-/// timestamp, and the supplied witness, recompute `z`, `v` and the expected
-/// witness and confirm they match. Returns `true` iff the proof is valid.
-///
-/// This is the exact routine the extracted verifier contract exposes; keeping it
-/// here lets the score contract continue verifying in-contract during migration
-/// while the differential test proves both paths agree.
-pub fn verify_membership(
-    env: &Env,
-    commitment: &[u8; 32],
-    wallet_bytes: &[u8; 56],
-    pair_bytes: &[u8; 9],
-    score: u32,
-    timestamp: u64,
-    witness: &[u8; 32],
-) -> bool {
-    let z = derive_evaluation_point(env, wallet_bytes, pair_bytes);
-    let v = derive_value_element(env, score, timestamp, &z);
-    let expected = derive_witness(env, commitment, &z, &v);
-    expected == *witness
-}
-
-/// Stateless non-membership verification.
-///
-/// Pure function: confirms that the key is absent from the committed state by
-/// checking the proof's value element equals [`NON_MEMBER_SENTINEL`] and that
-/// the witness matches the non-membership derivation.
-///
-/// ```text
-/// witness = SHA-256(0x07 || commitment || z || NON_MEMBER_SENTINEL)
-/// ```
-pub fn verify_non_membership(
-    env: &Env,
-    commitment: &[u8; 32],
-    wallet_bytes: &[u8; 56],
-    pair_bytes: &[u8; 9],
-    witness: &[u8; 32],
-) -> bool {
-    let z = derive_evaluation_point(env, wallet_bytes, pair_bytes);
-    let mut buf = [0u8; 97]; // 1 + 32 + 32 + 32
-    buf[0] = DOMAIN_NONMEMBER;
-    buf[1..33].copy_from_slice(commitment);
-    buf[33..65].copy_from_slice(&z);
-    buf[65..97].copy_from_slice(&NON_MEMBER_SENTINEL);
-    let expected = env.crypto().sha256(&Bytes::from_array(env, &buf)).to_bytes().to_array();
-    expected == *witness
 }

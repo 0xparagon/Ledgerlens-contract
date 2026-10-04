@@ -81,3 +81,86 @@ The audit confirms that commitments in both mechanisms are strictly isolated by 
 
 No security gap was identified.
 
+---
+
+## 5. Update: permissionless attested relay (`relay_attested_score`)
+
+**Date:** 2026-09-29 · **Status:** Implemented — see `rent_relay_credits.rs`,
+`test_relay_attestation.rs`.
+
+`submit_score`'s existing single-key `ScoreAttestation` path proves a
+submission's cryptographic origin, but the transaction submitter is still
+required to independently satisfy `require_auth()` as the service account
+(or an M-of-N signer) — so only the service account itself could ever be the
+one to actually submit the transaction. This update adds
+`relay_attested_score`, a new permissionless entry point any relayer may
+call, authorized *solely* by a new, more tightly-bound attestation variant.
+
+### Which variant is relayable
+
+Only the new `RelayScoreAttestation` type is relayable — the legacy
+`ScoreAttestation` used by `submit_score` is untouched (no ABI/behavior
+change there) precisely because it does not bind every field that affects
+state, and loosening its verification to drop `require_auth` would have
+been a live security regression rather than an additive feature. See the
+finding below.
+
+### Binding (issue requirement: "prove the attestation binds all fields that
+### affect state, including nonce, sequence, contract address and network")
+
+`compute_relay_commitment` binds, in the signed SHA-256 preimage: the full
+score payload (wallet, asset pair, score, flags, timestamp, confidence,
+model version), the contract address, the network passphrase
+(`env.ledger().network_id()`), the contract id and version, **and** —
+unlike the legacy attestation — `nonce` and `valid_before_ledger` (the
+"sequence" freshness bound).
+
+**Finding, documented for transparency:** auditing the legacy
+`ScoreAttestation`/`verify_attestation` path (`lib.rs`, `compute_commitment`)
+while designing this binding found that `nonce` is checked against stored
+state but is *not* part of the signed digest — a signature for a given
+score payload is valid for whatever nonce value the caller passes, not
+cryptographically tied to one. In practice this is not currently
+exploitable on the `submit_score` path *only* because that path still also
+requires `require_auth()` from the service account, which independently
+prevents anyone else from supplying an arbitrary nonce alongside a replayed
+signature. It would become exploitable if that `require_auth` requirement
+were ever relaxed without also fixing the binding — which is exactly why
+this feature introduces a new attestation type with the fix baked in,
+rather than relaxing the legacy path. Tracked here rather than silently
+patched, since changing the legacy commitment byte layout is a
+compatibility-impacting change to `docs/attestation-spec.md` and existing
+off-chain signer integrations, out of scope for this issue.
+
+### Ordering & idempotency
+
+The recomputed commitment digest doubles as an idempotency key
+(`RelayedAttestationUsed`, temporary storage). A second relayer posting the
+identical attestation gets a single storage read and an early `Ok(false)`
+return — no signature verification, no nonce mutation, no tip. `submit_score`
+and `relay_attested_score` are otherwise unrelated).
+
+`test_relay_attestation.rs::duplicate_relay_is_a_noop_independent_of_which_relayer_posts_first`
+covers this directly: the score state after the first accepted relay is
+identical no matter which of two relayer addresses submitted it, and the
+second submission is a no-op.
+
+### Threat model coverage
+
+| Threat | Mitigation |
+|---|---|
+| Griefing (relayer floods duplicate attestations) | Duplicate detection short-circuits before any expensive verification (signature check, nonce read/write, submission pipeline) — the second and later calls are cheap. |
+| Censorship by relayers | Permissionless by design — the service can always fall back to `submit_score` directly, or sign for multiple redundant relayers simultaneously; no relayer is privileged. |
+| Stale/leaked attestation replayed later | `valid_before_ledger` bounds relayability to a ledger-sequence window; expired attestations are rejected outright (`Error::StaleAttestation`). |
+| Key revocation | Rotating the service pubkey (`set_service_pubkey`) takes effect immediately; attestations signed by a revoked key fail signature verification on any subsequent relay attempt. |
+| Front-running the score value | The attestation binds the exact score payload; a relayer cannot alter any field without invalidating the signature. |
+
+### Operator guidance: running redundant relayers
+
+Multiple relayers may hold and race the same signed attestation — only the
+first to land on-chain does any work; every other submission observes the
+same final state at negligible extra cost (one storage read). Operators
+wanting redundancy against a single relayer going offline should distribute
+the same attestation (and its `valid_before_ledger` bound) to several
+independent relayer processes rather than relying on one.
+

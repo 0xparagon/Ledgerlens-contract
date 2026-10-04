@@ -24,9 +24,12 @@ Use it when you need to:
   and a matching entry count
 - **Report** — generate a structured post-action verification report for audit
 
-The tool is **read-only**: it never holds signing keys and performs no on-chain
-mutations. All on-chain state changes require admin multisig signatures through
-the normal contract flows.
+Snapshot, export, reconcile, and verify are read-only. The plan workflow can
+co-sign and apply deterministic changes to a local live-state export file; this
+crate does not yet submit transactions to an RPC endpoint. Treat that file
+adapter as a planning/rehearsal boundary, not as an on-chain recovery backend.
+The co-sign key is read from an environment variable and is never written to the
+plan.
 
 ## Snapshot Format
 
@@ -117,6 +120,55 @@ cargo run -p recovery --manifest-path tools/recovery/Cargo.toml -- report \
 
 Produces a structured report capturing the action type, description, and
 verification notes for the audit trail.
+
+### 6. Plan, co-sign, and resume a restore
+
+Fetch a fresh score export from the network separately, then compare it with
+the known-good export. Operations are sorted by `(wallet, asset_pair)`, split
+into bounded batches, and include predicted effects and an estimated operation
+cost. The plan hash binds the export roots, operations, and batch boundaries.
+
+```bash
+cargo run -p recovery -- plan --export known-good.json --live-state current.json \
+  --batch-size 50 --output recovery-plan.json
+```
+
+Each operator signs the same plan hash with a distinct Ed25519 key. Set
+`RECOVERY_SIGNING_KEY` (or the variable named by `--key-env`) to the operator's
+32-byte private seed encoded as hex; do not pass private keys on the command
+line or store them in the plan.
+
+```bash
+cargo run -p recovery -- cosign --plan recovery-plan.json --operator operator-a
+cargo run -p recovery -- cosign --plan recovery-plan.json --operator operator-b
+```
+
+The trusted-key file maps operator IDs to their 32-byte Ed25519 public keys:
+
+```json
+{
+  "operator-a": "<64 lowercase hex characters>",
+  "operator-b": "<64 lowercase hex characters>"
+}
+```
+
+Apply verifies the plan hash, both signatures, trusted public keys, and the
+base-state root before starting. Each idempotent upsert/delete batch is
+postcondition-checked, written to the state file, and followed by an atomic
+checkpoint. Re-running the same command resumes at the first uncheckpointed
+batch; if a crash occurs after the state write but before the checkpoint, the
+same upsert/delete operations can safely be replayed.
+
+```bash
+cargo run -p recovery -- apply --plan recovery-plan.json --state current.json \
+  --trusted-operators trusted-operators.json --checkpoint recovery-checkpoint.json
+cargo run -p recovery -- verify --state current.json --export known-good.json
+```
+
+The apply command currently edits the JSON state file only. A production RPC
+adapter must fetch and mutate contract state through Soroban transactions,
+preserving the same plan hash, checkpoint, idempotency, signature, and
+postcondition rules before this flow can be used for live recovery.
 
 ## Testing
 
