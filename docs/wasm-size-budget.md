@@ -1,105 +1,82 @@
-# WASM Size Budget and Analysis Guide
+# WASM Size Budget
 
-This document establishes the baseline WebAssembly (WASM) binary size breakdown for the `ledgerlens-score` contract and documents local reproduction steps for tracking size regression.
+This document defines the WASM size budget for the `ledgerlens-score` contract and
+the size-tiered build profiles introduced for issue #1193.
 
-## Baseline Overview
+## Build profiles
 
-- **Target Contract**: `ledgerlens-score`
-- **WASM Binary Path**: `target/wasm32-unknown-unknown/release/ledgerlens_score.wasm`
-- **Total Binary Size**: 599,000 bytes (~585 KB)
-- **Tolerance**: 5%
+The contract exposes a Cargo feature graph so operators can compile out optional
+subsystems they do not use. Each profile is a named combination of features and
+has its own size budget and ABI snapshot.
 
-The previous budget (442,107 bytes, set 2026-09-02) was exceeded by normal
-feature growth across the many contract PRs merged since — the CI gate had
-been red on `main` for several days as a result. This budget was refreshed
-on 2026-09-07 against the actual built size (593,321 bytes) plus headroom,
-so the gate is enforcing real regressions again rather than routine growth.
-The Top 10 tables below are from the 2026-09-02 baseline and are stale
-pending a fresh `./scripts/wasm-size-report.sh` run; they are not read by
-the CI budget check (only the Total Binary Size line above is).
+| Profile    | Features enabled                                                        | Intended use                          |
+| ---------- | ----------------------------------------------------------------------- | ------------------------------------- |
+| `core`     | `core`                                                                  | Minimal scoring only                  |
+| `standard` | `core`, `governance`, `privacy`                                         | Default operator deployment           |
+| `full`     | `core`, `governance`, `privacy`, `proofs`, `oracle`, `dispute`          | All optional subsystems               |
 
----
+### Feature dependency rules
 
-## Top 10 Shallow Size Contributors (`twiggy top`)
+- `core` is always enabled and has no dependencies on optional features.
+- `governance`, `privacy`, `proofs`, `oracle` and `dispute` each depend on `core`.
+- `dispute` additionally depends on `proofs` (dispute resolution consumes proof
+  verification entry points).
+- No feature silently changes the semantics of another: enabling a feature only
+  adds its own entry points and never alters the behaviour of `core`.
 
-The shallow size measures the raw byte size directly attributable to an item in the WASM binary.
+When a feature is disabled its entry points are **not compiled into the ABI**
+(rather than being present and failing at runtime), and `supports_interface`
+reports only the interfaces available in the compiled profile.
 
-_Stale — see note above. Regenerate with `./scripts/wasm-size-report.sh --top 10`._
+## Size budget per profile
 
-| Rank | Item | Shallow Size (Bytes) | Shallow % | Description |
-|------|------|----------------------|-----------|-------------|
-| 1 | `custom section 'contractspecv0'` | 178,232 | 40.31% | Soroban contract XDR specification metadata section |
-| 2 | `data[0]` | 15,421 | 3.49% | Static data segment (string literals, error message tables) |
-| 3 | `code[952]` | 8,743 | 1.98% | Compiled function code block |
-| 4 | `code[51]` | 4,954 | 1.12% | Compiled function code block |
-| 5 | `code[53]` | 4,795 | 1.08% | Compiled function code block |
-| 6 | `code[46]` | 4,576 | 1.04% | Compiled function code block |
-| 7 | `code[319]` | 4,311 | 0.98% | Compiled function code block |
-| 8 | `code[993]` | 3,559 | 0.81% | Compiled function code block |
-| 9 | `code[441]` | 2,994 | 0.68% | Compiled function code block |
-| 10 | `code[683]` | 2,180 | 0.49% | Compiled function code block |
+The budget is enforced in CI by the size-check job in the build matrix. The
+budget is measured on the optimised release WASM artifact.
 
----
+| Profile    | Size budget (KiB) |
+| ---------- | ----------------- |
+| `core`     | 180               |
+| `standard` | 320               |
+| `full`     | 512               |
 
-## Top 10 Retained Size / Dominator Tree (`twiggy dominators`)
+A build that exceeds its profile budget fails the CI matrix job.
 
-The retained size measures the size of an item plus all items in the call graph that are kept alive exclusively by it.
+## Entry points per profile
 
-_Stale — see note above. Regenerate with `./scripts/wasm-size-report.sh --top 10`._
+The table below is generated from the ABI snapshots produced by the schema
+generation step. Each profile has its own snapshot so the ABI diff gate compares
+like-for-like and does not report spurious diffs between profiles.
 
-| Rank | Item / Subtree Node | Retained Size (Bytes) | Retained % |
-|------|---------------------|-----------------------|------------|
-| 1 | `export "verify_score_range_proof"` | 17,717 | 4.01% |
-| 2 | `⤷ code[1441]` | 17,689 | 4.00% |
-| 3 | `⤷ code[1074]` | 17,669 | 4.00% |
-| 4 | `⤷ code[952]` | 17,395 | 3.93% |
-| 5 | `⤷ code[323]` | 1,133 | 0.26% |
-| 6 | `⤷ code[326]` | 809 | 0.18% |
-| 7 | `⤷ code[346]` | 601 | 0.14% |
-| 8 | `⤷ code[343]` | 531 | 0.12% |
-| 9 | `⤷ code[328]` | 511 | 0.12% |
-| 10 | `⤷ code[342]` | 97 | 0.02% |
+| Entry point              | `core` | `standard` | `full` |
+| ------------------------ | ------ | ---------- | ------ |
+| `init`                   | yes    | yes        | yes    |
+| `score`                  | yes    | yes        | yes    |
+| `supports_interface`     | yes    | yes        | yes    |
+| `set_governance_params`  | no     | yes        | yes    |
+| `get_governance_params`  | no     | yes        | yes    |
+| `set_privacy_policy`     | no     | yes        | yes    |
+| `get_privacy_policy`     | no     | yes        | yes    |
+| `submit_proof`           | no     | no         | yes    |
+| `verify_proof`           | no     | no         | yes    |
+| `set_oracle`             | no     | no         | yes    |
+| `get_oracle`             | no     | no         | yes    |
+| `open_dispute`           | no     | no         | yes    |
+| `resolve_dispute`        | no     | no         | yes    |
 
----
+## CI matrix
 
-## Local Reproduction Steps
+The CI workflow builds and tests each profile independently:
 
-### Prerequisites
+- `cargo build --no-default-features --features core`
+- `cargo build --no-default-features --features standard`
+- `cargo build --no-default-features --features full`
 
-Install `twiggy` using Cargo:
+Each matrix entry runs the applicable test subset and the size-budget check for
+that profile. The ABI diff gate and schema generation run per profile so each
+profile keeps its own snapshot.
 
-```bash
-cargo install twiggy
-```yaml
+## Default release profile
 
-### Running the Analysis Script
-
-Run the automated reporting script:
-
-```bash
-# Generate report for top 10 items to stdout:
-./scripts/wasm-size-report.sh --top 10
-
-# Generate report for top 20 items to a specific markdown file:
-./scripts/wasm-size-report.sh --top 20 --output docs/wasm-size-report-latest.md
-
-### Manual Analysis Commands
-
-You can also run `twiggy` directly against the release binary:
-
-```bash
-# 1. Build the release WASM target
-cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score
-
-# 2. View top shallow size items
-twiggy top -n 10 target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
-
-# 3. View top retained size / dominator tree
-twiggy dominators -r 10 target/wasm32-unknown-unknown/release/ledgerlens_score.wasm
-```yaml
-
----
-
-## CI Integration
-
-The WASM size report is automatically executed in GitHub Actions (`.github/workflows/ci.yml`) on pull requests and main branch builds. The resulting analysis document is uploaded as a build artifact named `ledgerlens-score-wasm-size-report`.
+The default release profile is unchanged unless an ADR explicitly decides
+otherwise. The `standard` profile remains the default feature set for release
+builds.

@@ -1,0 +1,6 @@
+# External-link allowlist for lychee (issue #1231): hosts that rate-limit CI
+# or require auth. One regex per line.
+^https://github\.com/.*/(issues|pull)/\d+
+^https://.*\.stellar\.org/.*rpc
+^http://localhost
+^https://www\.drips\.network
