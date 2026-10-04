@@ -8,6 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Caching policy (#1224, docs/ci-performance.md): incremental compilation
+  # is useless with sccache and bloats caches.
+  CARGO_INCREMENTAL: 0
+
+# Read-only token by default; jobs that need more request it explicitly.
+permissions:
+  contents: read
 
 # Cancel superseded runs on pull requests only. Pushes to main (and any tag)
 # get a unique group per commit, so they are never cancelled.
@@ -61,6 +68,10 @@ jobs:
           toolchain: "1.81.0"
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -75,6 +86,16 @@ jobs:
           toolchain: "1.81.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - run: cargo clippy --all-targets -- -D warnings
 
   contract-build-lints:
@@ -89,6 +110,16 @@ jobs:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - run: tools/check_contract_build_lints.sh
 
   # ── Test tiers (#1244) ──────────────────────────────────────────────────────
@@ -295,6 +326,16 @@ jobs:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - name: Run production acceptance suite
         run: scripts/production-acceptance.sh --output target/production-readiness-report.md
       - name: Upload production readiness report
@@ -343,6 +384,16 @@ jobs:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable sccache (restore-only on PRs)
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
       - run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
       - name: Record WASM byte-size evidence
         run: |
@@ -384,6 +435,10 @@ jobs:
           # only inspects Cargo.lock; contract builds remain pinned to Rust 1.81.
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-audit
         run: cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
       - name: Run security audit
@@ -423,6 +478,10 @@ jobs:
         with:
           toolchain: "1.88.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Only trusted pushes to main write caches; PRs (including forks)
+          # restore only, so they can never poison a cache main will read.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-deny
         run: cargo +1.88.0 install cargo-deny --version 0.20.2 --locked
       - name: Run cargo-deny checks (licenses, bans, advisories, sources)
@@ -600,6 +659,12 @@ jobs:
           targets: wasm32-unknown-unknown
       # Deliberately no Swatinem/rust-cache — each run must be a cold,
       # independent build to prove there is no cache-based non-determinism.
+      - name: Assert cold build (no compiler or target cache)
+        run: |
+          if [ -n "${RUSTC_WRAPPER:-}" ] || [ -n "${SCCACHE_GHA_ENABLED:-}" ] || [ -d target ]; then
+            echo "::error::Reproducible builds must not use sccache, rust-cache or a pre-existing target dir"
+            exit 1
+          fi
       - name: Build WASM (run 1)
         run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
       - name: Compute SHA-256 (run 1)
@@ -627,6 +692,12 @@ jobs:
           toolchain: "1.81.0"
           targets: wasm32-unknown-unknown
       # No cache — independent cold build, same as run 1.
+      - name: Assert cold build (no compiler or target cache)
+        run: |
+          if [ -n "${RUSTC_WRAPPER:-}" ] || [ -n "${SCCACHE_GHA_ENABLED:-}" ] || [ -d target ]; then
+            echo "::error::Reproducible builds must not use sccache, rust-cache or a pre-existing target dir"
+            exit 1
+          fi
       - name: Build WASM (run 2)
         run: cargo build --target wasm32-unknown-unknown --release -p ledgerlens-score --locked
       - name: Compute SHA-256 (run 2)
