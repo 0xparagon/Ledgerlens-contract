@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ledgerlens-staging-status-schema-v1",
+  "title": "LedgerLens staging deployment status",
+  "description": "Machine-readable record of the continuously deployed staging instance. Written by scripts/staging-upgrade.sh and published by .github/workflows/staging-deploy.yml. See docs/staging-deployment.md.",
+  "type": "object",
+  "required": [
+    "network",
+    "contract_id",
+    "wasm_sha256",
+    "version",
+    "schema_version",
+    "status",
+    "health",
+    "canary",
+    "commit_sha",
+    "last_deploy_utc"
+  ],
+  "properties": {
+    "network": {
+      "type": "string",
+      "enum": ["testnet", "futurenet"],
+      "description": "Staging network alias. Staging CD never targets mainnet."
+    },
+    "contract_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Staging contract instance upgraded in place."
+    },
+    "wasm_sha256": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SHA-256 of the currently deployed staging WASM artifact."
+    },
+    "previous_wasm_sha256": {
+      "type": "string",
+      "description": "SHA-256 of the last known-good WASM used for automatic rollback."
+    },
+    "version": {
+      "type": "string",
+      "description": "On-chain contract version reported by get_version after deploy."
+    },
+    "schema_version": {
+      "type": "integer",
+      "const": 4,
+      "description": "Contract schema version this status file was validated against."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "proposed-pending", "deployed", "rolled-back", "failed"],
+      "description": "Last deployment outcome. proposed-pending means the upgrade proposal is recorded and awaiting the time-lock window."
+    },
+    "health": {
+      "type": "string",
+      "enum": ["unknown", "pass", "fail", "pending"],
+      "description": "Result of scripts/health_check.sh against the staging instance."
+    },
+    "canary": {
+      "type": "string",
+      "enum": ["unknown", "pass", "fail", "pending", "skip"],
+      "description": "Result of scripts/verify-deployment.sh canary checks."
+    },
+    "note": { "type": "string" },
+    "commit_sha": {
+      "type": "string",
+      "description": "Main-branch commit the staging artifact was built from."
+    },
+    "workflow_run_url": {
+      "type": "string",
+      "description": "Link to the GitHub Actions run that produced this status."
+    },
+    "last_deploy_utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "UTC timestamp of the last status update."
+    }
+  },
+  "additionalProperties": false
+}

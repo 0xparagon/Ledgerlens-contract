@@ -18,6 +18,60 @@ Each alert includes:
 - **Example**: Concrete scenario showing the alert in action
 - **Response**: Recommended operator action
 
+## Indexer Health Alerts
+
+The reference event indexer (see `tools/indexer`) ingests contract events from Soroban RPC into Postgres. It exposes three health metrics that operators should alert on: **ledger lag**, **last processed ledger**, and **gap count**. These are emitted as gauges/counters (e.g. Prometheus) and are also queryable from the `indexer_health` table.
+
+### Alert: Indexer Ledger Lag High
+- **Metric**: `indexer_ledger_lag` (latest network ledger − last processed ledger)
+- **Severity**: Warning
+- **Threshold**: `indexer_ledger_lag > 50` for 5 minutes
+- **Example**: Indexer stalled after an RPC error; lag climbs to 120 ledgers
+- **Response**:
+  - Check indexer process health and RPC connectivity
+  - Inspect logs for repeated ingestion errors
+  - Confirm the cursor in `indexer_cursor` matches the last processed ledger
+
+### Alert: Indexer Ledger Lag Critical
+- **Metric**: `indexer_ledger_lag`
+- **Severity**: Critical
+- **Threshold**: `indexer_ledger_lag > 500` for 5 minutes
+- **Example**: Indexer down for over an hour; lag exceeds the RPC retention window
+- **Response**:
+  - Restart the indexer; it will resume from the persisted cursor
+  - If the cursor predates the RPC retention window, trigger backfill from the archive source
+  - Verify gap detection fires and backfill completes before lag recovers
+
+### Alert: Indexer Stalled
+- **Metric**: `indexer_last_processed_ledger`
+- **Severity**: Critical
+- **Threshold**: `indexer_last_processed_ledger` unchanged for 10 minutes while network is producing ledgers
+- **Example**: Ingestion loop deadlocked; last processed ledger frozen at 1_234_567
+- **Response**:
+  - Restart the indexer (idempotent upserts make restarts safe)
+  - Check for RPC pagination cursor errors in logs
+  - Confirm the process is not blocked on a DB lock
+
+### Alert: Indexer Gap Detected
+- **Metric**: `indexer_gap_count`
+- **Severity**: Warning
+- **Threshold**: `indexer_gap_count > 0` (any detected missed ledger range)
+- **Example**: RPC returned a cursor jump; ledgers 1_234_600–1_234_650 were skipped
+- **Response**:
+  - Confirm the automatic backfill path ran for the missing range
+  - Verify the archive source is reachable and returned the missing ledgers
+  - Ensure `indexer_gap_count` returns to 0 after backfill completes
+
+### Alert: Backfill Failed
+- **Metric**: `indexer_backfill_failures_total`
+- **Severity**: Critical
+- **Threshold**: Any increment in `indexer_backfill_failures_total`
+- **Example**: Archive source unreachable; backfill for a detected gap failed
+- **Response**:
+  - Check archive source availability and credentials
+  - Re-run backfill for the recorded gap range once the source recovers
+  - Do not advance the cursor past an unbackfilled gap
+
 ## Pause Events
 
 ### Alert: Contract Pause Detected
@@ -203,181 +257,106 @@ Each alert includes:
 
 ### Alert: Upgrade Executed
 - **Event**: `upg_exec` (upgrade_executed)
-- **Severity**: Info
-- **Threshold**: Successful upgrade execution
-- **Example**: Contract upgraded to WASM hash 0xabcd...
-- **Response**:
-  - Verify contract is functioning with canary checks
-  - Monitor canary event emissions:
-    - New scores submitted and readable
-    - Gate enforcement still working
-    - Pause/unpause operations functional
-    - Governance parameters intact
-  - Check for any anomalies in post-upgrade events
-
-### Alert: Upgrade Vetoed
-- **Event**: `upg_veto` (upgrade_vetoed)
 - **Severity**: Warning
-- **Threshold**: Admin veto of pending upgrade
-- **Example**: Admin vetoes upgrade 2 days before execution
+- **Threshold**: Any `upg_exec` event
+- **Example**: Upgrade v2.1.0 executed at 2026-08-01 14:05:00 UTC
 - **Response**:
-  - Contact admin to understand veto reason
-  - Assess if new/modified upgrade is needed
-  - Monitor for replacement proposal
-  - Verify no service degradation from veto
+  - Verify new contract version is active
+  - Monitor for post-upgrade anomalies
+  - Check that indexer cursor advanced past the upgrade ledger
+  - Validate all dependent services are compatible
 
-## Governance Actions
+## Configuration Changes
 
-### Alert: Risk Threshold Changed
-- **Event**: `thresh` (threshold_updated)
-- **Severity**: Info (if within expected range), Warning (if extreme)
-- **Threshold**: Threshold change > 20 points or outside [10, 95] range
-- **Example**: Threshold changed from 75 to 55 (20-point reduction)
-- **Response**:
-  - Log change for audit trail
-  - Verify change was intentional (admin action)
-  - Monitor gate rejection rate for changes
-  - Alert consumers of downstream threshold change
-
-### Alert: Parameter Change Proposed
-- **Event**: `prm_prop` (parameter_change_proposed)
+### Alert: Parameter Updated
+- **Event**: `cfg_upd` (config_updated)
 - **Severity**: Info
-- **Threshold**: Any parameter proposal with timelock
-- **Example**: `cooldown` parameter change proposed; executable in 24 hours
+- **Threshold**: Any configuration parameter change
+- **Example**: `staleness_threshold` changed from 3600 to 1800 seconds
 - **Response**:
   - Log parameter change for audit trail
-  - Identify which parameter is changing
-  - Calculate veto window
-  - Notify team for change management
+  - Verify change was intentional and approved
+  - Monitor for behavioral changes in dependent systems
 
-### Alert: Parameter Change Executed
-- **Event**: `prm_exec` (parameter_change_executed)
+### Alert: Model Version Registered
+- **Event**: `mdl_reg` (model_version_registered)
 - **Severity**: Info
-- **Threshold**: Successful parameter change application
-- **Example**: `cooldown` parameter updated to new value
+- **Threshold**: New model version registration
+- **Example**: Model v4 registered with new scoring algorithm
 - **Response**:
-  - Verify new parameter is in effect
-  - Check for any unexpected behavior changes
-  - Monitor downstream effects (e.g., submission rate if cooldown changed)
+  - Log model version for audit trail
+  - Notify signer infrastructure team
+  - Coordinate signer upgrade timeline
 
-### Alert: Parameter Change Vetoed
-- **Event**: `prm_veto` (parameter_change_vetoed)
+### Alert: Model Version Deprecated
+- **Event**: `mdl_dep` (model_version_deprecated)
 - **Severity**: Warning
-- **Threshold**: Veto of pending parameter change
-- **Example**: Cooldown change vetoed before execution
+- **Threshold**: Any model version deprecation
+- **Example**: Model v3 deprecated; signers must upgrade to v4
 - **Response**:
-  - Contact admin to understand veto reason
-  - Verify if modified change is planned
-  - Assess impact of veto
+  - Notify all signers using deprecated version
+  - Monitor for rejections due to deprecated model
+  - Set deadline for signer upgrades
 
-## Configuration Examples
+## Security Events
 
-### Prometheus AlertRule Configuration
+### Alert: Admin Changed
+- **Event**: `adm_chg` (admin_changed)
+- **Severity**: Critical
+- **Threshold**: Any admin address change
+- **Example**: Admin address changed from GABC... to GXYZ...
+- **Response**:
+  - Verify change with governance team immediately
+  - Check for unauthorized access
+  - Review all recent admin actions
 
-```yaml
-groups:
-- name: ledgerlens-operators
-  rules:
-  
-  # Critical: Contract Paused
-  - alert: LedgerLensPaused
-    expr: contract_events{event="paused"} > 0
-    for: 1m
-    severity: critical
-    annotations:
-      summary: "LedgerLens contract is paused"
-      action: "Verify pause reason with admin; check for rejections"
-  
-  # Warning: Batch Rejection Spike
-  - alert: BatchRejectionSpike
-    expr: |
-      (batch_summary:rejected / (batch_summary:rejected + batch_summary:accepted) 
-       > 0.2)
-    for: 5m
-    severity: warning
-    annotations:
-      summary: "Batch rejection rate > 20%"
-      action: "Check rejection codes and signer data quality"
-  
-  # Critical: High Signer Churn
-  - alert: SignerChurnHigh
-    expr: |
-      increase(signer_events:removed[1h]) > 2 AND
-      signer_count < required_signers + 2
-    for: 1m
-    severity: critical
-    annotations:
-      summary: "Multiple signers removed; quorum at risk"
-      action: "Verify signer additions and replacement timeline"
-  
-  # Warning: Oracle Staleness
-  - alert: OracleStaleness
-    expr: |
-      time() - oracle_events:last_update > oracle_staleness_threshold
-    for: 5m
-    severity: warning
-    annotations:
-      summary: "Oracle data is stale"
-      action: "Check oracle feed; restart if needed"
-```yaml
+### Alert: Authorization Failure
+- **Event**: `auth_fail` (authorization_failure)
+- **Severity**: Warning
+- **Threshold**: `count > 3` authorization failures in 5-minute window
+- **Example**: 5 failed attempts to call admin function
+- **Response**:
+  - Investigate source of failed attempts
+  - Check if legitimate signer has configuration issue
+  - Consider rate limiting or blocking suspicious addresses
 
-### Event Stream Monitoring
+## Performance Events
 
-Monitor these events in real-time from your event indexer:
+### Alert: Rate Limit Hit
+- **Event**: `rl_hit` (rate_limit_hit)
+- **Severity**: Info
+- **Threshold**: `count > 10` rate limit hits in 5-minute window
+- **Example**: 15 rate limit hits from multiple signers
+- **Response**:
+  - Review rate limit configuration
+  - Check if legitimate high-frequency signers
+  - Consider adjusting limits if needed
 
-```bash
-# Watch for pause events
-event_stream watch --topic="paused|unpaused" --severity=critical
+### Alert: Batch Backlog
+- **Event**: `bat_backlog` (batch_backlog_detected)
+- **Severity**: Warning
+- **Threshold**: `backlog_size > 100` pending batches
+- **Example**: 150 batches pending processing
+- **Response**:
+  - Check batch processing infrastructure
+  - Verify signer availability
+  - Monitor for processing delays
 
-# Watch for rejection spikes
-event_stream watch --topic="bat_rej_*" --window=1m --threshold=5
+## Alert Severity Summary
 
-# Watch for signer expiration
-event_stream watch --topic="sig_exp|sig_expd" --severity=warning
+| Severity | Response Time | Escalation |
+|----------|---------------|------------|
+| Critical | Immediate | Page on-call engineer |
+| Warning | < 15 minutes | Notify team channel |
+| Info | < 1 hour | Log for audit |
 
-# Watch for upgrades
-event_stream watch --topic="upg_*" --alert-on=all
+## Integration with Monitoring
 
-## Best Practices
+All alerts should be integrated with your monitoring system (Prometheus, Grafana, PagerDuty, etc.). Event topics map to metrics as follows:
 
-1. **Baseline First**: Run your system normally for 1-2 weeks to establish baselines for "normal" event frequencies
-2. **Correlate Events**: Cross-reference batch rejection spikes with governance changes or signer rotations
-3. **Timeline Windows**: Set alert windows based on your SLA (e.g., 5-minute windows for critical, 1-hour for info)
-4. **Team Coordination**: Assign ownership of different alert categories to teams (security, operations, development)
-5. **Test Runbooks**: Regularly test your response runbooks to ensure procedures are current
-6. **Post-Mortems**: When alerts fire, document the root cause and update thresholds if needed
+- Contract events → Prometheus counters/gauges
+- Indexer health metrics (`indexer_ledger_lag`, `indexer_last_processed_ledger`, `indexer_gap_count`, `indexer_backfill_failures_total`) → Prometheus gauges/counters
+- Alert thresholds → Prometheus alert rules
+- Escalation → PagerDuty/Opsgenie integration
 
-## Event Reference Table
-
-| Event Code | Topic | Data | Severity | Category |
-|-----------|-------|------|----------|----------|
-| `paused` | Contract pause | admin_address | Critical | Operational |
-| `unpaused` | Contract unpause | admin_address | Warning | Operational |
-| `pr_pause` | Pair pause | (pair, paused_bool) | Warning | Operational |
-| `sig_add` | Signer added | signer_address | Info | Security |
-| `sig_rem` | Signer removed | signer_address | Warning | Security |
-| `sig_exp` | Signer expiring | signer_address | Warning | Security |
-| `sig_expd` | Signer expired | signer_address | Critical | Security |
-| `bat_summ` | Batch summary | (accepted, rejected_*) | Warning | Data Quality |
-| `bat_rej_pa` | Pause rejection | count | Critical | Data Quality |
-| `bat_rej_dq` | Data quality rejection | (reason, count) | Warning | Data Quality |
-| `bat_rej_mv` | Model version rejection | (reason, count) | Warning | Configuration |
-| `bat_rej_rl` | Rate limit rejection | count | Warning | Performance |
-| `bat_rej_at` | Attestation rejection | count | Critical | Security |
-| `orc_stale` | Oracle stale | (last_update, threshold) | Warning | Data Quality |
-| `svc_sil` | Service silent | (silent_secs, threshold) | Warning | Performance |
-| `svc_res` | Service resumed | gap_secs | Info | Performance |
-| `upg_prop` | Upgrade proposed | (hash, executable_after) | Info | Governance |
-| `upg_exec` | Upgrade executed | wasm_hash | Info | Governance |
-| `upg_veto` | Upgrade vetoed | admin_address | Warning | Governance |
-| `thresh` | Threshold changed | (old, new) | Info | Governance |
-| `prm_prop` | Param proposed | (key, executable_after) | Info | Governance |
-| `prm_exec` | Param executed | param_key | Info | Governance |
-| `prm_veto` | Param vetoed | (proposal_id, admin) | Warning | Governance |
-
-## Support & Questions
-
-For alert rule questions or to report false positives:
-1. Check the [Operator FAQ](./operator-faq.md)
-2. Review event schema in [contracts/ledgerlens-score/src/events.rs](../contracts/ledgerlens-score/src/events.rs)
-3. File an issue with event logs and context
+See `docs/slo-operational-targets.md` for SLO targets and `tools/indexer` for the reference indexer implementation.

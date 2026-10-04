@@ -210,3 +210,9 @@ Operators that want case-specific hashes can call
 - The worst relevant cases are therefore still bounded by existing constants,
   and the existing batch/history TTL tests and benches remain the governing
   budget references for these paths.
+
+## Compliance reports
+
+Periodic compliance and governance reports aggregate score data under the
+redaction policy and privacy review recorded in
+[compliance-report.md](compliance-report.md#redaction-policy).

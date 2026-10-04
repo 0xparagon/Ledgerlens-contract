@@ -147,6 +147,25 @@ storage — matching the spec's `REVEAL_WINDOW` eviction model.
 | `ResetConsensusRound` | Implicit: TTL expiry of temporary storage entries | host | A new round starts when all temporary commit/reveal entries have expired or been consumed. |
 | `ExpireStaleCommit(s)` | Implicit: Soroban temporary-storage TTL eviction | host | When the TTL elapses the entry is silently removed; a subsequent `reveal_consensus` call finds no commit and returns `RevealWindowExpired`. |
 
+### 4.1 Executable Trace-Replay Projection
+
+The bounded TLA-to-Rust replay uses a machine-readable subset of this mapping
+in [`refinement-replay-map.json`](refinement-replay-map.json). It reuses the
+score, high-water mark, breach counter, last-submit time, and signer-set
+storage accessors identified above, and adds the concrete pause and pending
+upgrade accessors needed for the safety-critical replay slice. Its action table
+maps `SubmitScore`, `PauseContract`, `UnpauseContract`, `MutateAdminSet`,
+`ProposeGov`, and `ExecuteGov` to the corresponding Rust entry points. In the
+replay module, the generic governance proposal/execution actions are
+instantiated as an upgrade proposal/execution; each trace is cut off at the
+successful execute transition because that call replaces the contract WASM.
+
+The Rust test consumes this JSON map for dispatch, and
+`tools/check_refinement_mapping.py` validates its TLA and Rust symbols along
+with the human-readable mapping above. This keeps a runtime mapping for the
+test harness without maintaining an unchecked second source of Rust symbol
+names.
+
 ---
 
 ## 5. Invariant Correspondence
