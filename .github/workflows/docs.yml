@@ -1,0 +1,116 @@
+name: Docs site
+
+# Issue #1231: versioned mdBook site built from docs/ with merged rustdoc,
+# link checking, and a per-PR preview. Layout on the gh-pages branch:
+#   /latest/          main
+#   /<tag>/           one snapshot per release tag (v*)
+#   /pr-preview/pr-N/ pull request previews (same-repo PRs only)
+#   /versions.json    list read by the version selector
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "docs/**"
+      - "*.md"
+      - "tools/docs-site/**"
+      - "contracts/ledgerlens-score/src/**"
+      - ".github/workflows/docs.yml"
+  schedule:
+    - cron: "0 5 * * 1" # weekly external link sweep
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and check docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Broken internal links fail CI
+        run: python3 tools/docs-site/check_links.py
+
+      - name: Spelling and terminology (glossary terms in _typos.toml)
+        uses: crate-ci/typos@v1.24.6
+        continue-on-error: true
+        with:
+          files: docs README.md CONTRIBUTING.md
+
+      - name: Restore external link cache
+        uses: actions/cache@v4
+        with:
+          path: .lycheecache
+          key: lychee-${{ github.sha }}
+          restore-keys: lychee-
+
+      - name: External links (cached, allowlisted via .lycheeignore)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --cache --max-cache-age 3d --no-progress --offline=false
+            --exclude-path target 'docs/**/*.md' README.md CONTRIBUTING.md
+          fail: ${{ github.event_name == 'schedule' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.4.40
+
+      - name: Resolve site version
+        id: ver
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*)  echo "label=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"; echo "dir=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT" ;;
+            refs/pull/*)   n=${{ github.event.pull_request.number }}; echo "label=pr-$n" >> "$GITHUB_OUTPUT"; echo "dir=pr-preview/pr-$n" >> "$GITHUB_OUTPUT" ;;
+            *)             echo "label=latest" >> "$GITHUB_OUTPUT"; echo "dir=latest" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build site
+        run: |
+          python3 tools/docs-site/build.py --version "${{ steps.ver.outputs.label }}"
+          mdbook build target/docs-site
+          cargo doc -p ledgerlens-score --no-deps
+          cp -r target/doc/. target/docs-site/book/api/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: target/docs-site/book
+
+      - name: Deploy to gh-pages
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          DIR: ${{ steps.ver.outputs.dir }}
+          LABEL: ${{ steps.ver.outputs.label }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages && git worktree add pages origin/gh-pages \
+            || { git worktree add --detach pages && git -C pages checkout --orphan gh-pages && git -C pages rm -rfq .; }
+          rm -rf "pages/$DIR" && mkdir -p "pages/$DIR" && cp -r target/docs-site/book/. "pages/$DIR/"
+          # versions.json: latest first, then release tags newest first.
+          (cd pages && { echo latest; ls -d v*/ 2>/dev/null | tr -d / | sort -rV; } \
+            | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' > versions.json)
+          touch pages/.nojekyll
+          git -C pages add -A
+          git -C pages commit -qm "docs: deploy $LABEL from ${GITHUB_SHA::7}" || exit 0
+          git -C pages push origin HEAD:gh-pages
+
+      - name: Post preview link
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: docs-preview
+          message: |
+            Docs preview: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ steps.ver.outputs.dir }}/

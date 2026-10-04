@@ -18,6 +18,8 @@ For every generated operation sequence:
 3. Integrators fail closed for missing, unsafe, low-confidence, malformed, and
    unavailable oracle inputs.
 4. Execution is bounded before any Soroban value is allocated.
+5. The contract's existing testutils invariant registry is evaluated after
+  every operation, and panics from supported read-entry points fail the run.
 
 The smallest observable state is the score, confidence, timestamp, and model
 version for one fixed wallet/pair, plus the ordered outcome category and
@@ -46,18 +48,35 @@ Run a larger local campaign, up to the hard maximum of 512 generated cases:
 
 ```bash
 cargo run -p invocation-fuzzer --locked -- smoke --seed 42 --cases 512
+```
+
+Generate the score contract ABI input schema from the built contract spec and
+use it to add structure-aware read-entry calls to the campaign:
+
+```bash
+cargo run -p schema-gen -- --wasm target/wasm32-unknown-unknown/release/ledgerlens_score.wasm \
+  --invocations --out target/invocation-fuzzer
+cargo run -p invocation-fuzzer --locked -- smoke --seed 42 --cases 512 \
+  --abi-schema target/invocation-fuzzer/ledgerlens_score.invocations.schema.json
+```
 
 Replay one persisted regression exactly twice:
 
 ```bash
 cargo run -p invocation-fuzzer --locked -- replay \
   tools/invocation-fuzzer/corpus/003-boundaries-and-malformed.json
-```yaml
+```
 
 Corpus files are loaded in lexicographic order. The PR smoke seed, mutation
 selection, fresh-environment setup, and replay comparison are deterministic.
 The tool retains an input in its in-memory mutation queue only when it discovers
-a new `(operation kind, observable outcome)` behavior signature.
+a new `(operation kind, observable outcome)` behavior signature. ABI-driven
+generation selects read-only `get_*`, `query_*`, `is_*`, `peek_*`, and
+`supports_*` functions directly from `contractspecv0`; numeric ranges come from
+the schema, and collection generation samples empty, singleton, duplicate, and
+one-over-budget values. Contract initialization and mock dependency setup are
+performed before each campaign, so stateful submissions run only after those
+preconditions hold.
 
 ## Failure shrinking and regression fixtures
 
@@ -73,6 +92,11 @@ After diagnosis, copy every confirmed counterexample into
 `tools/invocation-fuzzer/corpus/` with a descriptive, ordered filename and
 commit it with the fix. CI replays every committed fixture before mutations, so
 regressions cannot be silently skipped.
+
+New behavior signatures also produce minimized seed files under
+`target/invocation-fuzzer/corpus/`. Promote confirmed cases to the committed
+corpus so they become durable regression fixtures. Read-entry panics fail the
+campaign and are saved through the same minimized-failure path.
 
 ## Explicit resource bounds
 

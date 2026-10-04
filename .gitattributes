@@ -1,3 +1,13 @@
+# Normalise line endings: LF in the repo, native in the working tree unless
+# pinned below. Scripts, sources and config must stay LF so they run under
+# bash/WSL and hash identically on every platform.
+* text=auto
+*.rs text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.lock text eol=lf
 *.sh text eol=lf
 
 # Golden ABI/manifest fixtures are compared byte-for-byte against LF-generated

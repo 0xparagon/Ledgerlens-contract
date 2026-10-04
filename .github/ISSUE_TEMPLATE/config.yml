@@ -1,5 +1,10 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Security policy (report vulnerabilities privately)
+    url: https://github.com/Ledger-Lenz/Ledgerlens-contract/security/policy
+    about: >-
+      Do not open a public issue for security problems. Report vulnerabilities via
+      private advisory or the channels in SECURITY.md.
   - name: Repository invariants (read first)
     url: https://github.com/Ledger-Lenz/Ledgerlens-contract/blob/main/docs/invariants.md
     about: >-

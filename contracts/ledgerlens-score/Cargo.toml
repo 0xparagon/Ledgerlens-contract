@@ -13,11 +13,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 soroban-sdk = "21.0.0"
 subtle = { version = "2.6", default-features = false }
-libm = "0.2"
+# `libm` is retained only for the deterministic, integer-backed helpers that
+# were previously expressed with floating point. All consensus-critical math
+# now uses integer / fixed-point arithmetic; see `docs/score-math.md` for the
+# determinism audit (issue #1199).
+libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 ledgerlens-test-support = { version = "0.1.0", path = "../ledgerlens-test-support" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # Used only by tests, to produce real secp256k1 ECDSA signatures that
 # exercise `verify_attestation` end-to-end (see `test_attestation.rs`).
 k256 = { version = "0.13.4", features = ["ecdsa"] }
@@ -85,6 +91,46 @@ path = "benches/estimate_unique_wallets.rs"
 
 [features]
 testutils = ["soroban-sdk/testutils"]
+
+# ---------------------------------------------------------------------------
+# Cargo feature tiers for optional subsystems (see #1193).
+#
+# The feature graph is layered so that each tier is a strict superset of the
+# one below it and no feature silently changes the semantics of another:
+#
+#   core  <  governance  <  privacy  <  proofs  <  oracle  <  dispute
+#
+# `core` is always compiled in (it is the empty baseline). Every optional
+# subsystem feature implies the features it depends on, so enabling a higher
+# tier pulls in exactly the lower tiers it needs and nothing more. When a
+# feature is off, its entry points are compiled out of the ABI entirely
+# (rather than existing and failing) and `supports_interface` reflects the
+# compiled profile.
+#
+# Profiles (documented in docs/wasm-size-budget.md):
+#   core      -> --no-default-features
+#   standard  -> --features standard
+#   full      -> --features full
+#
+# The default release profile is unchanged: `default = ["standard"]` keeps the
+# historical entry-point surface unless an ADR explicitly decides otherwise.
+# ---------------------------------------------------------------------------
+
+# Optional subsystems. Each is additive and implies its prerequisites.
+governance = []
+privacy = ["governance"]
+proofs = ["governance"]
+oracle = ["proofs"]
+dispute = ["oracle", "privacy"]
+
+# Size-tiered build profiles. `standard` and `full` are convenience bundles
+# over the subsystem features above; they do not introduce new semantics.
+standard = ["governance", "privacy", "proofs"]
+full = ["standard", "oracle", "dispute"]
+
+# Default release profile: unchanged entry-point surface (see ADR requirement
+# in #1193). Operators wanting the minimal build use --no-default-features.
+default = ["standard"]
 
 # Reference integration showing how a third-party contract gates on a
 # LedgerLens risk score. Built as a library (it is a Soroban contract, not a
