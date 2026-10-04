@@ -69,6 +69,7 @@ python3 tools/test-tiering.py check        # is every test classified?
 scripts/test-tier.sh fast                  # 3-minute execution budget
 scripts/test-tier.sh standard              # 30-minute execution budget
 cargo build --target wasm32-unknown-unknown --release
+cargo vet
 ```
 
 `cargo test` still works for debugging a single suite; the tiers exist to bound feedback time,
