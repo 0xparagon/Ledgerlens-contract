@@ -75,3 +75,64 @@ the off-chain service's cardinality grows further:
 Documentation only for this issue. The regression test added alongside this
 ADR (`test_high_cardinality_rent.rs`) exercises existing behavior; no
 public ABI, event, error, or storage changes.
+
+## Update: permissionless keeper reward for TTL extension
+
+**Date:** 2026-09-29 · **Status:** Implemented — see `rent_relay_credits.rs`,
+`test_keeper_rewards.rs`.
+
+Liveness of score-entry TTLs previously depended entirely on the admin
+periodically calling `extend_entry_ttls`. A new permissionless
+`keeper_extend_entry_ttls(keeper, entries)` entry point lets *anyone* renew
+dormant entries and be paid a small, governance-configured reward per entry
+actually renewed — closing the "who runs the renewal cron job" single point
+of failure without introducing a new griefing surface.
+
+### Eligibility (bounds gaming)
+
+An entry is reward-eligible only when its estimated remaining TTL (the same
+conservative estimate `get_expiring_entries` already uses) is at or below a
+governance-configured window (`KeeperRewardWindow`, default `0` — i.e.
+already due, matching `get_expiring_entries`'s existing definition). This
+directly prevents "extending entries that don't need it": an entry nowhere
+near expiry is simply not eligible, full stop — `keeper_extend_entry_ttls`
+skips it rather than renewing or paying for it.
+
+"Splitting work to farm rewards" is closed by a property of the *existing*
+TTL-tracking mechanism rather than new bookkeeping: renewing an entry resets
+its last-touched ledger, so its estimated remaining TTL jumps straight back
+to `SCORE_TTL_THRESHOLD` — far outside any sane reward window. The same
+entry therefore cannot be renewed-and-paid again until it has genuinely
+decayed back down near expiry, which is a full TTL cycle away. There is
+deliberately no separate "last rewarded" record: reusing the touch marker
+both is the renewal and is the anti-farming control, at zero extra storage
+cost.
+
+### Bounded payout
+
+- Per-call batch size is capped at `KEEPER_BATCH_MAX` (reuses the existing
+  `MAX_EXPIRING_ENTRIES_PER_CALL`), so the CLI can feed `get_expiring_entries`'s
+  output straight in.
+- Per-entry reward is capped at `MAX_KEEPER_REWARD_PER_ENTRY` regardless of
+  what governance configures.
+- An optional per-ledger cap (`KeeperRewardPerLedgerCap`) bounds total payout
+  across *all* keeper calls in a single ledger, closing the "many small
+  calls in one ledger" variant of batch-splitting.
+- Funds come from a dedicated `KeeperRewardPool`, denominated in a
+  governance-chosen token and topped up only by admin-authorized
+  `fund_keeper_reward_pool` calls — structurally separate from gate-query
+  credits (a different token/storage namespace entirely; see
+  `docs/security/prepaid-gate-credits.md`), so user funds can never leak
+  into keeper payouts.
+- If the pool or per-ledger cap runs out mid-batch, still-eligible entries
+  keep getting renewed (liveness is preserved) — they simply stop earning a
+  reward, which costs the keeper nothing beyond the now-unrewarded
+  transaction fee, so there's no incentive to keep spamming an empty pool.
+
+### Keeper tooling
+
+`tools/recovery`'s `keeper` subcommand takes a JSON array of candidate
+`(wallet, asset_pair, estimated_ttl_remaining)` entries (the shape
+`get_expiring_entries` naturally maps to off-chain) and emits the
+most-urgent-first batch, capped at `KEEPER_BATCH_MAX`, ready to pass to
+`keeper_extend_entry_ttls`.

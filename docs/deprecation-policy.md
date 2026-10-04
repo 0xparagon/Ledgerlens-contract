@@ -228,6 +228,6 @@ Sunset-Announced window. The only cost is the eventual migration effort.
 - Version numbering and breaking vs. non-breaking changes:
   [`docs/interface-versioning-policy.md`](interface-versioning-policy.md)
 - ABI snapshot and CI enforcement:
-  [`docs/abi-compatibility-notes.md`](abi-compatibility-notes.md)
+  [`docs/EVENT_SCHEMA_STABILITY.md`](EVENT_SCHEMA_STABILITY.md) and [`docs/historical-wasm-compatibility.md`](historical-wasm-compatibility.md)
 - Migration guides for past breaking changes:
   [`CHANGELOG.md`](../CHANGELOG.md)

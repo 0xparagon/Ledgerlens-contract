@@ -39,6 +39,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sys
 import tempfile
@@ -46,7 +47,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MAPPING = ROOT / "spec" / "refinement-mapping.md"
+REPLAY_MAPPING = ROOT / "spec" / "refinement-replay-map.json"
 TLA_SPEC = ROOT / "spec" / "LedgerLens.tla"
+TLA_REPLAY = ROOT / "spec" / "LedgerLensReplay.tla"
+TLA_REPLAY_CONFIG = ROOT / "spec" / "LedgerLensReplay.cfg"
 RUST_DIRS = [
     ROOT / "contracts" / "ledgerlens-score" / "src",
     ROOT / "contracts" / "ledgerlens-aggregator" / "src",
@@ -207,7 +211,55 @@ def build_tla_index() -> set:
         if name and name != "vars":
             known.add(name)
 
+    replay_tla = TLA_REPLAY.read_text(encoding="utf-8")
+    for m in re.finditer(r"\bVARIABLES?\s+([A-Za-z_][A-Za-z0-9_]*)", replay_tla):
+        known.add(m.group(1))
+    for m in re.finditer(
+        r"^\s*([A-Za-z_][A-Za-z0-9_]*(?:\([^)]*\))?)\s*==", replay_tla, re.M
+    ):
+        known.add(m.group(1).split("(")[0])
+    m = re.search(r"MODULE\s+([A-Za-z_]\w*)", replay_tla)
+    if m:
+        known.add(m.group(1))
+
     return known
+
+
+def check_replay_mapping(path: Path, rust_index: dict, tla_index: set) -> list[str]:
+    """Check the shared executable replay mapping against TLA and Rust symbols."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    failures = []
+    config = TLA_REPLAY_CONFIG.read_text(encoding="utf-8")
+    for model_constant, expected_value in data.get("model_constants", {}).items():
+        if model_constant not in tla_index:
+            failures.append(f"TLA model constant {model_constant!r} is missing")
+        expected_text = (
+            f"{{{expected_value}}}" if model_constant == "Actions" else str(expected_value)
+        )
+        configured = re.search(
+            rf"^\s*{re.escape(model_constant)}\s*=\s*(\S+)\s*$", config, re.M
+        )
+        if configured is None or configured.group(1) != expected_text:
+            failures.append(
+                f"replay config value for {model_constant!r} does not match {expected_text}"
+            )
+    for model_variable, rust_reference in data["abstract_state"].items():
+        if model_variable not in tla_index:
+            failures.append(f"TLA abstract variable/operator {model_variable!r} is missing")
+        rust_symbol = rust_reference.rsplit("::", 1)[-1]
+        if rust_reference != "Env::ledger::timestamp" and rust_symbol not in rust_index:
+            failures.append(f"Rust abstraction symbol {rust_symbol!r} for {model_variable!r} is missing")
+    for model_action, mapping in data["actions"].items():
+        if model_action not in tla_index:
+            failures.append(f"TLA action {model_action!r} is missing")
+        rust_reference = mapping["rust_entrypoint"]
+        if rust_reference in {"stutter", "Env::ledger::timestamp"}:
+            continue
+        for rust_name in rust_reference.split("/"):
+            rust_symbol = rust_name.rsplit("::", 1)[-1]
+            if rust_symbol not in rust_index:
+                failures.append(f"Rust entry point {rust_symbol!r} for {model_action!r} is missing")
+    return failures
 
 
 # ── Extract candidate symbols from the mapping document ───────────────────────
@@ -318,7 +370,8 @@ def check_mapping(mapping: Path, rust_index: dict, tla_index: set,
     return failures
 
 
-def run_check(mapping: Path, verbose: bool = False) -> int:
+def run_check(mapping: Path, verbose: bool = False,
+              replay_mapping: Path = REPLAY_MAPPING) -> int:
     rust_index = build_rust_index()
     tla_index = build_tla_index()
     failures = check_mapping(mapping, rust_index, tla_index, verbose=verbose)
@@ -336,9 +389,17 @@ def run_check(mapping: Path, verbose: bool = False) -> int:
         print("See issue #928.")
         return 1
 
+    replay_failures = check_replay_mapping(replay_mapping, rust_index, tla_index)
+    if replay_failures:
+        print(f"ERROR: {replay_mapping.name} has unresolved replay mappings:")
+        for failure in replay_failures:
+            print(f"  {failure}")
+        return 1
+
     if verbose:
         print(f"OK: every Rust identifier referenced in {mapping.name} exists "
               f"in the contract sources.")
+        print(f"OK: every replay mapping in {replay_mapping.name} resolves to TLA/Rust symbols.")
     return 0
 
 
@@ -357,6 +418,14 @@ def selftest() -> int:
             print(f"  line {line_no}: {sym!r} ({kind}) in {span[:60]!r}")
         return 1
     print("SELFTEST PASS (1/3): real mapping has no missing symbols")
+
+    replay_failures = check_replay_mapping(REPLAY_MAPPING, rust_index, tla_index)
+    if replay_failures:
+        print("SELFTEST FAIL: executable replay mapping must resolve:")
+        for failure in replay_failures:
+            print(f"  {failure}")
+        return 1
+    print("SELFTEST PASS: executable replay map resolves to the existing spec and contract")
 
     # 2. Fails when a real symbol reference is replaced by a bogus one.
     bogus = "definitely_missing_symbol_928"
@@ -396,6 +465,20 @@ def selftest() -> int:
         return 1
     print("SELFTEST PASS (3/3): injected bogus storage-key variant was flagged")
 
+    replay_data = json.loads(REPLAY_MAPPING.read_text(encoding="utf-8"))
+    bogus_replay_symbol = "missing_replay_entrypoint_1237"
+    replay_data["actions"]["SubmitScore"]["rust_entrypoint"] = bogus_replay_symbol
+    with tempfile.TemporaryDirectory() as tmp:
+        bad_replay_mapping = Path(tmp) / "refinement-replay-map.json"
+        bad_replay_mapping.write_text(json.dumps(replay_data), encoding="utf-8")
+        replay_map_failures = check_replay_mapping(
+            bad_replay_mapping, rust_index, tla_index
+        )
+    if not any(bogus_replay_symbol in failure for failure in replay_map_failures):
+        print("SELFTEST FAIL: injected bogus replay entry point was not flagged")
+        return 1
+    print("SELFTEST PASS: injected bogus replay entry point was flagged")
+
     print("")
     print("check_refinement_mapping self-test passed.")
     return 0
@@ -410,6 +493,8 @@ def main() -> int:
                              "mapping, fail on injected bogus references")
     parser.add_argument("--mapping", type=Path, default=MAPPING,
                         help="mapping file to check (default: spec/refinement-mapping.md)")
+    parser.add_argument("--replay-mapping", type=Path, default=REPLAY_MAPPING,
+                        help="executable trace projection (default: spec/refinement-replay-map.json)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="only print errors")
     args = parser.parse_args()
@@ -418,7 +503,7 @@ def main() -> int:
         return selftest()
 
     verbose = not args.quiet
-    return run_check(args.mapping, verbose=verbose)
+    return run_check(args.mapping, verbose=verbose, replay_mapping=args.replay_mapping)
 
 
 if __name__ == "__main__":

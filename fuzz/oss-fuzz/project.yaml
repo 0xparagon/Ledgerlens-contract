@@ -1,0 +1,12 @@
+# OSS-Fuzz project definition (issue #1232). Copy to
+# oss-fuzz/projects/ledgerlens-contract/ when submitting the application.
+homepage: "https://github.com/Ledger-Lenz/Ledgerlens-contract"
+language: rust
+main_repo: "https://github.com/Ledger-Lenz/Ledgerlens-contract"
+primary_contact: "security@ledgerlens.io" # SECURITY.md contact
+auto_ccs: []
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
+file_github_issue: false

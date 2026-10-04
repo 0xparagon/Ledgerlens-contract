@@ -1,0 +1,51 @@
+name: CI metrics
+
+# Records per-job durations of the Contract CI workflow on main into a
+# persistent JSON-lines dataset, publishes a trend summary and warns when the
+# wall-clock budget in .github/ci-budget.json is exceeded (#1224).
+
+on:
+  workflow_run:
+    workflows: ["Contract CI"]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '30 6 * * 1'   # weekly trend summary (Monday 06:30 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ci-metrics
+  cancel-in-progress: false
+
+jobs:
+  durations:
+    name: Record durations and trend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore duration dataset
+        uses: actions/cache/restore@v4
+        with:
+          path: ci-metrics
+          key: ci-durations-${{ github.run_id }}
+          restore-keys: ci-durations-
+      - name: Collect new runs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tools/ci/job_durations.py collect --dataset ci-metrics/durations.jsonl --workflow ci.yml --branch main
+      - name: Trend summary and budget check
+        run: python3 tools/ci/job_durations.py trend --dataset ci-metrics/durations.jsonl --budget .github/ci-budget.json
+      - name: Save duration dataset
+        uses: actions/cache/save@v4
+        with:
+          path: ci-metrics
+          key: ci-durations-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-durations
+          path: ci-metrics/durations.jsonl
+          retention-days: 90
