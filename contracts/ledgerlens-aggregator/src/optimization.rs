@@ -1,8 +1,75 @@
 /// Aggregator score read optimization for large wallet portfolios.
 /// Reduces redundant storage queries and unnecessary computations when processing
 /// wallets containing numerous asset pairs.
+///
+/// # Extended-precision scores (issue #1155)
+///
+/// Scores are stored internally at basis-point resolution (`0..=10_000`) while the
+/// public 0-100 API is preserved through a documented projection. The projection
+/// uses **ceiling** rounding so that risk gates never under-report: a stored value
+/// of `1` bp projects to `1`, and any non-zero risk projects to at least `1`.
+/// Legacy 0-100 values are migrated implicitly by multiplying by `SCORE_SCALE`
+/// (`100`), so no bulk storage rewrite is required.
 
 use soroban_sdk::{Address, Symbol, Vec};
+
+/// Basis-point resolution of the extended-precision score scale.
+pub const SCORE_SCALE: u32 = 100;
+
+/// Maximum value of the extended-precision (basis-point) score.
+pub const SCORE_BP_MAX: u32 = 10_000;
+
+/// Maximum value of the legacy 0-100 projected score.
+pub const SCORE_LEGACY_MAX: u32 = 100;
+
+/// Projection rounding rule applied when collapsing a basis-point score back to
+/// the legacy 0-100 scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreRounding {
+    /// Round toward zero. Never used for risk gates (can under-report).
+    Floor,
+    /// Round to the nearest integer, ties away from zero.
+    Nearest,
+    /// Round away from zero. Default: risk gates must never under-report.
+    Ceiling,
+}
+
+/// Extended-precision score stored at basis-point resolution (`0..=10_000`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedScore {
+    /// Score in basis points.
+    pub basis_points: u32,
+}
+
+impl ExtendedScore {
+    /// Construct from a basis-point value, saturating at [`SCORE_BP_MAX`].
+    pub fn from_basis_points(basis_points: u32) -> Self {
+        ExtendedScore { basis_points: basis_points.min(SCORE_BP_MAX) }
+    }
+
+    /// Construct from a legacy 0-100 score using the implicit scale factor.
+    /// This is the migration path for existing entries: no storage rewrite is
+    /// needed, the legacy value is simply widened on read.
+    pub fn from_legacy(legacy: u32) -> Self {
+        Self::from_basis_points(legacy.min(SCORE_LEGACY_MAX).saturating_mul(SCORE_SCALE))
+    }
+
+    /// Project back to the legacy 0-100 scale using the given rounding rule.
+    pub fn project(&self, rounding: ScoreRounding) -> u32 {
+        let bp = self.basis_points;
+        let projected = match rounding {
+            ScoreRounding::Floor => bp / SCORE_SCALE,
+            ScoreRounding::Nearest => (bp + SCORE_SCALE / 2) / SCORE_SCALE,
+            ScoreRounding::Ceiling => (bp + SCORE_SCALE - 1) / SCORE_SCALE,
+        };
+        projected.min(SCORE_LEGACY_MAX)
+    }
+
+    /// Project using the default risk-safe rule (ceiling).
+    pub fn to_legacy(&self) -> u32 {
+        self.project(ScoreRounding::Ceiling)
+    }
+}
 
 /// Score read statistics for optimization tracking
 #[derive(Debug, Clone)]
@@ -99,6 +166,14 @@ pub struct BatchedScoreResult {
     pub score: u32,
     /// Whether the score is stale
     pub is_stale: bool,
+}
+
+impl BatchedScoreResult {
+    /// Project the stored basis-point score to the legacy 0-100 scale using the
+    /// risk-safe (ceiling) rounding rule.
+    pub fn projected_score(&self) -> u32 {
+        ExtendedScore::from_basis_points(self.score).to_legacy()
+    }
 }
 
 /// Optimized portfolio scorer using batched reads
