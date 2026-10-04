@@ -389,29 +389,15 @@ Fixed-point representation with `SCALE = 10^6` provides 6 decimal places. Values
 
 ---
 
-## Cross-Reference: Formula Documentation in Source Code
+## Asset-Level Risk Score (Derived from Holder Wallet Scores)
 
-The following functions in `contracts/ledgerlens-score/src/lib.rs` reference this document:
+Protocols listing an asset care about the asset's risk, not only individual wallets. The asset-level score summarises the risk distribution of the wallets that hold or trade the asset, without requiring an on-chain scan of all holders.
 
-- **`get_aggregate_score` (line ~1850):** See [§ Weighted Average](#weighted-average) for the formula and fixed-point implementation notes.
-- **`get_effective_score` (line ~1601):** See [§ Staleness and Filtering](#staleness-and-filtering) and [§ Exponential Decay](#exponential-decay) for staleness filtering and decay logic.
-- **`get_interpolated_score` (line ~1709):** See [§ Linear Interpolation](#linear-interpolation) for the formula and fixed-point implementation notes.
-- **`decay_fixed` (line ~5340):** See [§ Exponential Decay](#exponential-decay) for the Taylor series approximation and fixed-point arithmetic.
+### Derivation
 
----
+The asset score is a **holder-weighted aggregation with a concentration penalty**. It is a pure function suitable for the shared math crate:
 
-## Off-Chain Simulation Checklist
-
-When building an off-chain simulator (indexer, backend, analytics):
-
-- [ ] Use integer arithmetic with the same `SCALE = 1,000,000` factor.
-- [ ] Implement truncating division (not rounding).
-- [ ] Use 64-bit or larger integers for intermediate calculations to prevent overflow.
-- [ ] Implement the decay Taylor series with the same 4-term expansion.
-- [ ] Handle edge cases: empty wallet lists, all-zero weights, invalid thresholds.
-- [ ] Test against on-chain results with known inputs to verify precision.
-
----
+$$\text{asset\_score} = \text{clamp}_{0}^{100}\left( \frac{\sum_{i=1}^{n} w_i \cdot s_i}{\sum_{i=1}^{n} w_i} \cdot \left(1 - \rho \cdot C\right) \right)$$
 
 ---
 
@@ -523,66 +509,64 @@ Truth tables are verified row-by-row in
 
 ---
 
-## Model-Version Risk-Policy Compatibility (#723)
+**Concentration index** (normalised Herfindahl–Hirschman Index):
 
-The active risk policy defines an allowlist of approved model versions.
-Score submissions that carry an unapproved or retired version are rejected
-deterministically at submission time.
+$$C = \frac{n \cdot \sum_{i=1}^{n} w_i^2}{\left(\sum_{i=1}^{n} w_i\right)^2} - \frac{1}{n}$$
 
-### Version Lifecycle
+$C = 0$ when all weights are equal; $C \to 1$ when a single holder dominates. The penalty therefore reduces the score when a few large holders dominate the distribution, which is the intended behaviour: an asset whose risk is concentrated in one wallet is riskier than the same average spread across many wallets.
 
-                  register_model_version(v, delay)
-                           │
-                    delay elapsed?
-                    ┌─── No ───→  Proposed  (not yet accepted)
-                    │
-                    └─── Yes ──→  Active    (accepted by risk policy)
-                                      │
-                              deprecate_model_version(v)
-                                      │
-                                  Deprecated  (permanently retired)
-```yaml
+### Why Holder-Weighted with a Concentration Penalty?
 
-### Compatibility Rules
+- **Holder-weighted** (rather than a plain unweighted mean) reflects that a wallet holding most of the supply matters more to the asset's risk than a dust holder.
+- **Concentration penalty** prevents a single large holder from masking a risky distribution and prevents the score from being dominated by one actor.
+- **Pure function**: the derivation depends only on the list of `(weight, score)` pairs, so it is deterministic, testable, and identical on-chain and off-chain.
 
-| Registry state | Submitted version | Outcome |
-|---|---|---|
-| Empty (no versions registered) | any | ACCEPTED (fallback: no restriction) |
-| Non-empty | Active version | ACCEPTED |
-| Non-empty | Proposed version (delay not elapsed) | REJECTED |
-| Non-empty | Deprecated version | REJECTED |
-| Non-empty | Unknown version (never registered) | REJECTED |
+### Integer Implementation
 
-### Read API
+```rust
+const SCALE: u64 = 1_000_000;
+const MIN_CONTRIBUTORS: u32 = 5;   // sparse-data threshold
+const RHO: u64 = 500_000;          // concentration penalty coefficient (0.5)
 
-- `is_model_version_active(version: u32) -> bool` — returns `true` if and only if the version
-  is in the Active state. Off-chain tooling should call this before submitting to avoid a
-  wasted transaction.
-- `get_model_versions() -> Vec<ModelVersionEntry>` — returns the full registry with each
-  entry's `version`, `status`, and `metadata` bytes.
+/// Pure derivation. Returns `None` when fewer than `MIN_CONTRIBUTORS`
+/// wallets contribute (sparse data — no score is published).
+pub fn derive_asset_score(contributors: &[(u64, u32)]) -> Option<u32> {
+    let n = contributors.len() as u64;
+    if n < MIN_CONTRIBUTORS as u64 {
+        return None;
+    }
 
-### ABI / Storage Notes
+    let mut weight_sum: u64 = 0;
+    let mut weighted_sum: u64 = 0;
+    let mut sq_sum: u64 = 0;
 
-- The registry is stored under a persistent storage key (`MODEL_VERSIONS`).
-- Deprecation is irreversible: a deprecated version cannot be re-activated.
-- The maximum registry size is bounded by `MAX_MODEL_VERSIONS` (defined in `constants.rs`)
-  to prevent unbounded storage growth.
+    for &(w, s) in contributors {
+        weight_sum = weight_sum.checked_add(w)?;
+        weighted_sum = weighted_sum.checked_add(w.checked_mul(s as u64)?)?;
+        sq_sum = sq_sum.checked_add(w.checked_mul(w)?)?;
+    }
 
-### Test Coverage
+    if weight_sum == 0 {
+        return None;
+    }
 
-Model-version policy compatibility is verified in
-`contracts/ledgerlens-score/src/test_model_version_policy_compat.rs`.
-Existing lifecycle tests live in
-`contracts/ledgerlens-score/src/test_model_version.rs`.
+    // Weighted mean, scaled by SCALE.
+    let mean = weighted_sum.checked_mul(SCALE)? / weight_sum;
 
----
+    // Normalised HHI concentration index, scaled by SCALE.
+    // C = n * sq_sum / weight_sum^2 - 1/n
+    let hhi = n.checked_mul(sq_sum)?.checked_mul(SCALE)? / weight_sum.checked_mul(weight_sum)?;
+    let inv_n = SCALE / n;
+    let concentration = hhi.saturating_sub(inv_n);
 
-## Bounded Drift Checks for Consecutive Score Updates (#724)
+    // Penalty factor = 1 - rho * C, clamped to [0, SCALE].
+    let penalty = SCALE.saturating_sub(RHO.checked_mul(concentration)? / SCALE);
 
-Consecutive score updates for the same `(wallet, asset_pair)` are checked
-against a configurable drift threshold (the "jump threshold").  A score change
-whose absolute delta exceeds the threshold is classified as a suspicious jump
-and triggers an on-chain event.
+    // Apply penalty and clamp to [0, 100].
+    let score = mean.checked_mul(penalty)? / SCALE;
+    Some(score.min(100) as u32)
+}
+```
 
 The crate is `#![no_std]` and depends only on `core`. It must not depend on
 `soroban-sdk` or any contract crate.
