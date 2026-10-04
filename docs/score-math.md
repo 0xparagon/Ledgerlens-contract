@@ -1,34 +1,27 @@
-# Score Aggregation Mathematics
+# Score Math (`ledgerlens-math`)
 
-This document describes the mathematical formulas, fixed-point representation, and integer arithmetic used in LedgerLens score aggregation. Off-chain simulators must use identical integer arithmetic and truncation behavior to match on-chain results.
+This document describes the shared, `no_std` fixed-point and statistics crate
+`ledgerlens-math` that backs all score arithmetic in LedgerLens.
 
----
+## Motivation
 
-## Fixed-Point Representation
+Score arithmetic (weighted aggregation, decay, interpolation, variance,
+percentiles, fee computation) previously lived inside the contract crate and
+could not be reused by the aggregator, the replay tool, the simulator, or
+formal verification without pulling in contract dependencies. The math is now
+extracted into a single audited implementation used everywhere.
 
-### Scale Factor
-
-All fractional values in LedgerLens are represented as integers scaled by a fixed multiplier:
+## Crate layout
 
 ```
-SCALE = 1,000,000  (10^6)
-
-A value represented in fixed-point is scaled by multiplying by `SCALE`. For example:
-- 1.0 is represented as `1_000_000`
-- 0.5 is represented as `500_000`
-- 0.000001 is represented as `1`
-
-### Why Fixed-Point?
-
-Soroban (Stellar's smart contract platform) has no floating-point arithmetic. Fixed-point integer arithmetic is used to approximate decimal values while maintaining determinism across all environments (on-chain Rust, off-chain simulators, indexers).
-
-### Conversion Formulas
-
-**From floating-point to fixed-point:**
-```
-fixed = float_value * SCALE
-
-**From fixed-point to floating-point:**
+crates/ledgerlens-math/
+  Cargo.toml        # no_std, no Soroban SDK dependency
+  CHANGELOG.md
+  src/
+    lib.rs          # public API + crate docs
+    fixed.rs        # fixed-point primitives
+    stats.rs        # aggregation, variance, percentiles
+    fee.rs          # fee computation
 ```
 float_value = fixed / SCALE
 
@@ -108,6 +101,7 @@ def aggregate(pairs_and_scores, pair_weights, decay_factors=None):
         weight_sum += decayed_weight
     
     if weight_sum == 0:
+        # On-chain: get_aggregate_score returns Err(ScoreNotFound)
         raise ValueError("All weights are zero")
     
     # Truncate division
@@ -120,7 +114,7 @@ def aggregate(pairs_and_scores, pair_weights, decay_factors=None):
 
 ### Formula
 
-When a score is older than the staleness window (default: 7 days), it is decayed using exponential decay:
+When a decay rate is configured (`set_decay_rate` with a non-zero numerator), every score is decayed by its age since submission, using exponential decay. The staleness window does **not** gate decay: a one-hour-old score is already decayed slightly. (Corrected in #1240 after differential testing; see `tools/reference-model/DISAGREEMENTS.md` D2/D4.)
 
 $$\text{decay\_factor}(t) = e^{-\lambda \cdot t}$$
 
@@ -280,7 +274,118 @@ pub fn get_interpolated_score(
     
     // Interpolation: find the bracketing pair
     for i in 0..(history.len() - 1) {
-        let 
+        let a = &history[i];
+        let b = &history[i + 1];
+        
+        if a.timestamp <= timestamp && timestamp <= b.timestamp {
+            let dt = (b.timestamp - a.timestamp) as i128;
+            if dt == 0 {
+                return a.score;
+            }
+            
+            let num = (timestamp - a.timestamp) as i128 * (b.score as i128 - a.score as i128);
+            return (a.score as i128 + num / dt) as u32;
+        }
+    }
+    
+    history.last().score
+}
+```yaml
+
+**Integer arithmetic notes:**
+- Numerator is `(timestamp - a.timestamp) * (b.score - a.score)` as `i128` to avoid overflow.
+- Division truncates (integer division).
+- Cast back to `u32` for the result.
+
+---
+
+## Overflow Handling
+
+The contract uses checked arithmetic throughout the hot path to prevent silent overflows:
+
+### Checked Operations
+
+- **`get_aggregate_score`:**
+  - `checked_mul(weight, decay_factor)` → error on overflow
+  - `checked_div(SCALE)` → error on division by zero
+  - `checked_mul(decayed_weight, score)` → error on overflow
+  - `checked_add(weighted_sum, product)` → error on overflow
+  
+- **`decay_fixed`:**
+  - `checked_mul` for `lambda_num * age_secs`
+  - `checked_mul` for intermediate products
+  - Saturating subtraction for negative results
+
+### Error Propagation
+
+When overflow is detected:
+- Functions that compose checked operations return `Err(Error::ArithmeticOverflow)`.
+- Callers must handle this error.
+- On-chain, overflow is visible to integrators as an explicit error, preventing silent failures.
+
+### Off-Chain Simulation
+
+To avoid overflow in Python, use arbitrary-precision integers (Python 3 does this automatically for `int`). In other languages, use 128-bit or 256-bit integers for intermediate calculations.
+
+---
+
+## Staleness and Filtering
+
+### Staleness Window
+
+Scores older than the staleness window (default: `DEFAULT_STALENESS_WINDOW_SECS = 604,800` seconds = 7 days) are considered stale.
+
+### Staleness Filtering in `get_effective_score`
+
+1. Compute age: `age = current_timestamp - score_timestamp`
+2. If `decay_rate != 0` (at any age; the staleness window is not consulted here):
+   - Apply decay: `effective_score = raw_score * decay_factor(age) / SCALE` (truncated)
+   - Set `decay_applied = true`
+3. Otherwise:
+   - `effective_score = raw_score`
+   - Set `decay_applied = false`
+
+### Embargo Filtering
+
+Embargoed wallets are checked separately:
+- `is_embargoed(wallet)` returns `true` if the wallet is on the embargo list.
+- `get_effective_score` returns `Err(ScoreEmbargoed)` if the wallet is embargoed.
+- `query_risk_gate` returns `false` if the wallet is embargoed.
+
+---
+
+## Asset-Class Policy Profiles
+
+Different asset categories (stablecoins, volatile assets, thin markets, high-value pairs) warrant different risk-threshold policies. `get_effective_risk_threshold(asset_pair)` resolves the threshold to use for a pair:
+
+1. If the pair has been assigned a class via `set_pair_asset_class(pair, class)` **and** that class has an override via `set_asset_class_policy(class, risk_threshold)`, the class override is returned.
+2. Otherwise, the global `risk_threshold` (set via `set_risk_threshold`) is returned.
+
+Lookup is a pure function of on-chain storage — same inputs always produce the same result — and pairs with no assigned class, or classes with no configured override, safely fall back to the global default rather than erroring. See `contracts/ledgerlens-score/src/test_asset_class_policy.rs` for fixtures covering the default-fallback and override-resolution paths.
+
+---
+
+## Precision Limits and Rounding
+
+### Integer Truncation, Not Rounding
+
+All divisions truncate toward zero. For example:
+7 / 2 = 3  (not 3.5 rounded to 4)
+```yaml
+
+This behavior is deterministic and matches across platforms.
+
+### Precision Loss
+
+When computing:
+aggregate = (weighted_sum / weight_sum)
+```yaml
+
+The result is truncated. For example, if the true average is 42.7, the contract returns 42. Off-chain simulators must use the same truncation to match.
+
+### Decimal Precision
+
+Fixed-point representation with `SCALE = 10^6` provides 6 decimal places. Values are stored as integers, so no floating-point rounding errors occur.
 
 ---
 
@@ -294,12 +399,115 @@ The asset score is a **holder-weighted aggregation with a concentration penalty*
 
 $$\text{asset\_score} = \text{clamp}_{0}^{100}\left( \frac{\sum_{i=1}^{n} w_i \cdot s_i}{\sum_{i=1}^{n} w_i} \cdot \left(1 - \rho \cdot C\right) \right)$$
 
-Where:
-- $s_i$ = wallet score for contributing holder $i$ (0–100)
-- $w_i$ = contribution weight of holder $i$ (e.g. volume or balance, scaled by `SCALE`)
-- $n$ = number of contributing wallets
-- $C$ = concentration index of the weight distribution (0–1)
-- $\rho$ = concentration penalty coefficient (configurable, default $\rho = 0.5$)
+---
+
+## Monotonicity of Aggregate Score Under Pair Reweighting (#721)
+
+When pair weights are changed while input scores remain fixed, the aggregate
+score changes in predictable, monotone directions.
+
+### Monotonicity Properties
+
+| Property | Statement |
+|---|---|
+| M1 | Increasing the weight of a pair whose score is **above** the current aggregate **raises** (or preserves) the aggregate. |
+| M2 | Increasing the weight of a pair whose score is **below** the current aggregate **lowers** (or preserves) the aggregate. |
+| M3 | Setting all weights to zero is a degenerate case; the contract returns an error when `weight_sum = 0`. |
+| M4 | A single pair with a very large weight dominates the aggregate: `agg → score_dominant` as `weight_dominant → ∞`. |
+| M5 | If all pairs have the same score `S`, any positive reweighting leaves `agg = S`. |
+| M6 | `max_pair_score` always equals the maximum individual score, independent of reweighting. |
+
+### Worked Examples
+
+**Example 1 — raising a high-score pair's weight:**
+- Pairs: A (score=80, w=1), B (score=20, w=1) → `agg = floor((80+20)/2) = 50`
+- Raise A's weight to 10: `agg = floor((10×80 + 1×20)/11) = floor(820/11) = 74` ✓ (increased)
+
+**Example 2 — raising a low-score pair's weight:**
+- Pairs: A (score=20, w=1), B (score=80, w=1) → `agg = 50`
+- Raise A's weight to 10: `agg = floor((10×20 + 1×80)/11) = floor(280/11) = 25` ✓ (decreased)
+
+### Test Coverage
+
+Monotonicity properties are verified in
+`contracts/ledgerlens-score/src/test_monotonicity_reweight.rs` using
+deterministic unit tests with explicit expected values for each property.
+
+---
+
+## Confidence-Floor Semantics: Formal Truth Tables (#722)
+
+The gate function `query_risk_gate_with_confidence` passes only when **all
+three** of the following conditions hold simultaneously. The score check is
+strict: a wallet passes only when its risk score is *below* the threshold,
+since higher scores are more suspicious. (Corrected in #1240; earlier revisions
+of these tables had the score comparison inverted. See
+`tools/reference-model/DISAGREEMENTS.md` D1.)
+
+PASS  iff  score       <  threshold
+       AND confidence  >= query_conf
+       AND confidence  >= global_min_confidence
+```yaml
+
+Where `global_min_confidence` is the admin-controlled floor set via
+`set_global_min_confidence`.
+
+### Table 1 — Score vs Threshold (confidence always passes)
+
+| score | threshold | conf | query_conf | global_floor | result | reason |
+|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
+|    60 |        70 |   90 |          0 |            0 | PASS   | score < threshold |
+|    70 |        70 |   90 |          0 |            0 | FAIL   | score == threshold (strict boundary) |
+|    69 |        70 |   90 |          0 |            0 | PASS   | score one below threshold |
+|     0 |         0 |   90 |          0 |            0 | FAIL   | threshold 0 blocks every wallet |
+|   100 |       100 |   90 |          0 |            0 | FAIL   | both max (score == threshold) |
+|     0 |       100 |   90 |          0 |            0 | PASS   | score 0, threshold max |
+
+### Table 2 — Confidence vs Per-Query Confidence Threshold
+
+| score | threshold | conf | query_conf | global_floor | result | reason |
+|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
+|    60 |        70 |   80 |         80 |            0 | PASS   | conf == query_conf (inclusive) |
+|    60 |        70 |   79 |         80 |            0 | FAIL   | conf one below query_conf |
+|    60 |        70 |   81 |         80 |            0 | PASS   | conf above query_conf |
+|    60 |        70 |  100 |        100 |            0 | PASS   | conf == query_conf == max |
+|    60 |        70 |   99 |        100 |            0 | FAIL   | conf one below max query_conf |
+|    60 |        70 |    0 |          0 |            0 | PASS   | both zero |
+
+### Table 3 — Confidence vs Global Minimum Confidence Floor
+
+| score | threshold | conf | query_conf | global_floor | result | reason |
+|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
+|    60 |        70 |   75 |          0 |           75 | PASS   | conf == global_floor (inclusive) |
+|    60 |        70 |   74 |          0 |           75 | FAIL   | conf one below global_floor |
+|    60 |        70 |   76 |          0 |           75 | PASS   | conf above global_floor |
+|    60 |        70 |    0 |          0 |            0 | PASS   | floor is zero, never blocks |
+|    60 |        70 |  100 |          0 |          100 | PASS   | conf == global_floor == max |
+
+### Table 4 — Combined Constraints
+
+| score | threshold | conf | query_conf | global_floor | result | reason |
+|------:|----------:|-----:|-----------:|-------------:|:------:|--------|
+|    60 |        70 |   85 |         80 |           75 | PASS   | all three conditions pass |
+|    80 |        70 |   85 |         80 |           75 | FAIL   | score >= threshold |
+|    60 |        70 |   79 |         80 |           75 | FAIL   | conf < query_conf |
+|    60 |        70 |   74 |         70 |           75 | FAIL   | conf < global_floor |
+|    60 |        70 |   74 |         80 |           75 | FAIL   | conf fails both conf checks |
+|    99 |       100 |  100 |        100 |          100 | PASS   | score just below max threshold, confidences at max |
+
+### Configuration Notes
+
+- `global_min_confidence` is set admin-only via `set_global_min_confidence(floor: u32)`.
+- Valid range: `[0, 100]`. Setting to 0 disables the floor (never blocks on confidence alone).
+- The floor applies retroactively: raising it causes already-submitted scores with lower
+  confidence to fail future gate queries without resubmission.
+
+### Test Coverage
+
+Truth tables are verified row-by-row in
+`contracts/ledgerlens-score/src/test_confidence_floor_truth_tables.rs`.
+
+---
 
 **Concentration index** (normalised Herfindahl–Hirschman Index):
 
@@ -360,79 +568,71 @@ pub fn derive_asset_score(contributors: &[(u64, u32)]) -> Option<u32> {
 }
 ```
 
-**Integer arithmetic notes:**
-- All intermediate values are `u64`; multiplications are checked and overflow returns `None`.
-- Division truncates toward zero, matching the rest of the crate.
-- The result is bounded to `[0, 100]` by construction and by the final `min(100)` clamp.
+The crate is `#![no_std]` and depends only on `core`. It must not depend on
+`soroban-sdk` or any contract crate.
 
-### Off-Chain Reference
+## Public API
 
-```python
-SCALE = 1_000_000
-MIN_CONTRIBUTORS = 5
-RHO = 500_000
+All functions are pure: they take plain integers and return plain integers.
+They never touch `Env`, storage, or events.
 
-def derive_asset_score(contributors):
-    """contributors: list of (weight, score) tuples."""
-    n = len(contributors)
-    if n < MIN_CONTRIBUTORS:
-        return None
+### Fixed-point
 
-    weight_sum = sum(w for w, _ in contributors)
-    if weight_sum == 0:
-        return None
-
-    weighted_sum = sum(w * s for w, s in contributors)
-    sq_sum = sum(w * w for w, _ in contributors)
-
-    mean = (weighted_sum * SCALE) // weight_sum
-    hhi = (n * sq_sum * SCALE) // (weight_sum * weight_sum)
-    concentration = max(0, hhi - SCALE // n)
-    penalty = max(0, SCALE - (RHO * concentration) // SCALE)
-    score = (mean * penalty) // SCALE
-    return min(score, 100)
-```
-
-### Sparse Data
-
-A score is only published when at least `MIN_CONTRIBUTORS` wallets contribute. Below that threshold the derivation returns `None` and no asset score is stored or emitted. This avoids publishing a score derived from one or two wallets, which would be trivially manipulable and statistically meaningless.
-
-### Maintenance Model: Incremental vs. Committed Off-Chain Result
-
-Two maintenance strategies were considered:
-
-| Strategy | Cost | Latency | Trust |
-| --- | --- | --- | --- |
-| **Incremental on-chain** — update the running aggregate on every submission | O(1) per submission, but requires storing running sums (`weight_sum`, `weighted_sum`, `sq_sum`) and recomputing the penalty each time; storage writes on every submission | Immediate | Fully on-chain, no extra trust |
-| **Periodically committed off-chain result** — compute off-chain, commit the result on-chain | O(1) per commit (one write per epoch); off-chain compute is free | Up to one epoch | Requires a trusted committer or a verification path |
-
-**Chosen approach: incremental on-chain maintenance.** The running sums (`weight_sum`, `weighted_sum`, `sq_sum`) are small fixed-size values, so each submission costs a bounded number of storage reads/writes and the derivation itself is O(1) given the sums. This keeps the score fully on-chain and avoids introducing a trusted committer. The periodically-committed off-chain variant is cheaper in storage writes but adds a trust assumption and latency; it is documented here as the fallback if submission volume makes per-submission writes prohibitive.
-
-### Threat Model: Manipulation
-
-- **Sybil wallets (many tiny contributors).** An attacker splitting holdings across many wallets inflates $n$ and lowers the concentration index, but each wallet's weight is tiny, so the weighted mean is dominated by the honest large holders. The `MIN_CONTRIBUTORS` threshold alone does not stop sybils, so the concentration penalty is applied to the *weight* distribution: sybil wallets with negligible weight do not meaningfully change $C$, and the weighted mean is unchanged. To further resist sybils, weights should be derived from on-chain balances/volume rather than self-reported values.
-- **Single-holder dominance.** A single dominant holder would otherwise set the score; the concentration penalty reduces the score as $C \to 1$, so dominance lowers rather than raises the published score.
-- **Score inflation via dust.** Because the aggregation is weight-proportional, dust contributions cannot move the mean; they only add to $n$, which is bounded by the concentration term.
-- **Replay / stale contributions.** Contributions must be timestamped and decayed using the existing `decay_fixed` path so that stale wallet scores do not indefinitely influence the asset score.
-
-### Test Vectors
-
-Deterministic vectors for the derivation, including degenerate distributions:
-
-| Contributors `(weight, score)` | Expected |
+| Function | Contract |
 | --- | --- |
-| `[]` | `None` (below min) |
-| `[(1, 50)]` | `None` (below min) |
-| `[(1, 50); 4]` | `None` (below min) |
-| `[(1, 50); 5]` | `50` (uniform, no penalty) |
-| `[(1, 0); 5]` | `0` |
-| `[(1, 100); 5]` | `100` |
-| `[(100, 80), (1, 20); 4]` | weighted mean ≈ 79, reduced by concentration penalty |
-| `[(1, 50); 1000]` | `50` (uniform, no penalty) |
+| `mul_div(a, b, denom)` | Computes `a * b / denom` with 128-bit intermediate. Returns `None` on `denom == 0` or overflow. Rounds toward zero. |
+| `mul_div_round(a, b, denom)` | As `mul_div`, but rounds half away from zero. |
+| `clamp(x, lo, hi)` | Returns `x` clamped to `[lo, hi]`. Panics only if `lo > hi`. |
 
-### Invariants
+### Statistics
 
-- **Bounded:** the result is always in `[0, 100]` (or `None`).
-- **Monotone:** increasing any contributor's score (holding weights fixed) never decreases the asset score; increasing a contributor's weight toward a higher-scoring wallet never decreases the asset score.
-- **Permutation-stable:** the result is independent of the order of `contributors` (the sums are commutative).
-- **Degenerate:** an empty or below-threshold contributor set yields `None`; an all-zero weight set yields `None`.
+| Function | Contract |
+| --- | --- |
+| `weighted_mean(values, weights)` | Weighted mean with 128-bit accumulation. Returns `None` if lengths differ, are empty, or the total weight is zero. Rounds toward zero. |
+| `decay(value, factor_bps, periods)` | Applies `factor_bps` decay per period. Returns `None` on overflow. |
+| `interpolate(x, x0, x1, y0, y1)` | Linear interpolation. Returns `None` if `x1 == x0`. Rounds toward zero. |
+| `variance(values)` | Population variance. Returns `None` if empty. Rounds toward zero. |
+| `percentile(values, p_bps)` | Nearest-rank percentile, `p_bps` in `[0, 10_000]`. Returns `None` if empty or `p_bps > 10_000`. |
+
+### Fees
+
+| Function | Contract |
+| --- | --- |
+| `fee(amount, rate_bps)` | Computes `amount * rate_bps / 10_000`. Returns `None` on overflow. Rounds toward zero. |
+
+## Overflow and rounding contracts
+
+- Every fallible function returns `Option`; callers must handle `None`.
+- Intermediate products use `i128`/`u128` to avoid silent wraparound.
+- Rounding is documented per function and is always deterministic.
+- No function panics on valid inputs; panics are reserved for programmer
+errors (e.g. `clamp` with `lo > hi`).
+
+## Differential testing
+
+Before the old in-contract implementations were deleted, differential tests
+ran the old and new implementations side by side on generated inputs and
+asserted byte-identical results. These tests live in
+`crates/ledgerlens-math/tests/differential.rs` and are exercised in a nightly
+job over at least one million generated inputs.
+
+## WASM size and CPU budget
+
+Extraction is size-neutral or better: the contract crate now depends on
+`ledgerlens-math` instead of carrying the math inline, and the crate is
+`no_std` with no SDK dependency. Size and CPU budget reports are recorded in
+the PR and show no regression.
+
+## Consumers
+
+`ledgerlens-math` is the single dependency for:
+
+- the score contract,
+- Kani harnesses,
+- benchmarks,
+- off-chain tools (aggregator, replay, simulator).
+
+## Mutation testing
+
+Mutation coverage is preserved on the moved code by pointing the mutation
+testing configuration at `crates/ledgerlens-math/src/`.

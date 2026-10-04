@@ -28,8 +28,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Pin to the same version used by mutation-test.sh
-  CARGO_MUTANTS_VERSION: "24.7.0"
 
 jobs:
   # ── Determine which shards to run ──────────────────────────────────────────
@@ -72,14 +70,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - id: tool-versions
+        uses: ./.github/actions/tool-versions
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: "1.81.0"
+          toolchain: ${{ steps.tool-versions.outputs.contract-rust }}
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --version "$CARGO_MUTANTS_VERSION" --locked
+        run: cargo install cargo-mutants --version "${{ steps.tool-versions.outputs.cargo-mutants }}" --locked
 
       # ── Shard A: baseline zk / verkle (preserves pre-#935 behaviour) ───────
       - name: "[shard-a] Run mutation tests — baseline (zk / verkle)"

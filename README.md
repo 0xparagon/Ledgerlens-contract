@@ -20,7 +20,7 @@ blockchain usage.
 - **On-Chain Risk Score Registry**: Stores the latest LedgerLens risk score, flags, confidence, and timestamp per wallet/asset-pair
 - **Replay Forensics**: The replay harness can emit a deterministic incident evidence bundle that packages transactions, events, configuration snapshots, issue references, and hashes for audits and incident response.
 - **Authorized Score Submission**: Only the authorised LedgerLens off-chain service account can write scores
-- **Composable Read Access**: Any Soroban contract can query risk scores to gate suspicious activity via `query_risk_gate` (score-only) or `query_risk_gate_with_confidence` (score + confidence floor) — both infallible, side-effect free, and safe to call directly inside another protocol's guard clause
+- **Composable Read Access**: Any Soroban contract can query risk scores to gate suspicious activity via `query_risk_gate` (score-only) or `query_risk_gate_with_confidence` (score + confidence floor) — both infallible, free of durable side effects, and safe to call directly inside another protocol's guard clause
 - **Benford & ML Flags**: Distinguishes between statistical anomaly flags and ML classifier flags
 - **Confidence Scoring**: Each risk score carries a model confidence value (0-100)
 - **Open and Auditable**: Methodology, scores, and contract logic are fully transparent
@@ -78,7 +78,7 @@ Read-only function callable by any Soroban contract. Returns the most recent Led
 ### `get_score_count(wallet: Address, asset_pair: Symbol) -> u32`
 Read-only function callable by any account or contract. Returns the total number of score submissions ever recorded for `wallet` / `asset_pair`. Unlike `get_score_history` (which caps at `HISTORY_MAX_DEPTH`), this counter is never truncated, giving off-chain services a cheap O(1) signal to distinguish newly monitored wallets from those with a long history.
 
-### `set_history_max_depth(depth: u32)`
+### `set_history_max_depth(admin_signers: Vec<Address>, depth: u32)`
 Admin-only. Sets the maximum number of entries retained in the per-wallet / per-asset-pair score history ring buffer. `depth` must be in the range `[1, 50]`; values outside this range are rejected with `InvalidHistoryDepth`. Defaults to `10` until configured.
 
 **Lazy-truncation behaviour:** reducing the depth does not remove existing entries immediately. Entries beyond the new cap remain in the ring until the next `submit_score` (or `submit_scores_batch`) call for that pair triggers the eviction loop, at which point the ring is trimmed in a single pass. Off-chain consumers reading `get_score_history` between the depth change and the next submission may temporarily observe more entries than the new cap.
@@ -92,13 +92,13 @@ Rotates the authorised off-chain scoring service address. Admin only.
 ### `get_admin() -> Address` / `get_service() -> Address`
 Read-only lookups of the current admin and authorised scoring service addresses.
 
-### `get_pending_admin() -> Address` / `has_pending_admin_transfer() -> Address`
+### `get_pending_admin() -> Option<Address>` / `has_pending_admin_transfer() -> bool`
 Read-only function to check the state of a pending admin.
 
 ### `get_aggregate_score(wallet: Address) -> AggregateRiskScore`
 Read-only function. Returns `wallet`'s cross-asset aggregate risk score — a weighted average computed live from every asset pair the wallet has a `RiskScore` for. Always recomputed from current per-pair scores, never served from a stale cache. Returns `ScoreNotFound` if the wallet has no scores.
 
-### `set_pair_weight(asset_pair: Symbol, weight: u32)`
+### `set_pair_weight(admin_signers: Vec<Address>, asset_pair: Symbol, weight: u32)`
 Sets the weight used for `asset_pair` in the aggregate risk computation. Defaults to `1` (simple average) for any pair the admin hasn't configured. A weight of `0` excludes the pair from the aggregate's denominator. Admin only.
 
 ### `get_pair_weight(asset_pair: Symbol) -> u32`
@@ -124,28 +124,28 @@ Admin sets a system-wide minimum confidence floor (0–100). When configured, `q
 ### `supports_interface(capability: Symbol) -> bool`
 Runtime capability detection for the composability interface. Returns `true` for the registered capabilities `score`, `history`, `batch`, `gate`, `aggr`, `count`, `cgate`, and `pr_rd`, letting integrators feature-detect instead of hardcoding contract version numbers.
 
-### `propose_upgrade(new_wasm_hash: BytesN<32>)`
+### `propose_upgrade(admin_signers: Vec<Address>, new_wasm_hash: BytesN<32>)`
 Admin only. Starts a time-locked contract upgrade by committing to `new_wasm_hash`. Stores an `UpgradeProposal` with `executable_after = now + get_upgrade_delay()` and emits `upgrade_proposed`. Does not change the code. Rejected with `UpgradeAlreadyPending` if a proposal is already in flight. See [Upgrade Governance](#upgrade-governance).
 
-### `execute_upgrade()`
+### `execute_upgrade(admin_signers: Vec<Address>)`
 Admin only. After the time-lock elapses, re-verifies `now >= executable_after` and installs the new WASM via `env.deployer().update_current_contract_wasm(...)`, clears the proposal, and emits `upgrade_executed`. Returns `UpgradeNotReady` before the delay or `NoPendingUpgrade` if none exists.
 
-### `veto_upgrade()`
+### `veto_upgrade(admin_signers: Vec<Address>)`
 Admin only. Cancels the pending proposal during the time-lock window (emergency escape hatch for a malicious proposal or compromised key) and emits `upgrade_vetoed`.
 
 ### `get_pending_upgrade() -> UpgradeProposal`
 Permissionless. Returns the in-flight proposal so anyone can audit it during the window. Returns `NoPendingUpgrade` if none.
 
-### `set_upgrade_delay(delay_secs: u64)` / `get_upgrade_delay() -> u64`
+### `set_upgrade_delay(admin_signers: Vec<Address>, delay_secs: u64)` / `get_upgrade_delay() -> u64`
 Admin sets the time-lock delay applied to future proposals, bounded to `[MIN_UPGRADE_DELAY_SECS, MAX_UPGRADE_DELAY_SECS]` (48 hours – 14 days); out-of-range values are rejected with `InvalidUpgradeDelay`. Defaults to 48 hours.
 
-### `set_cooldown(secs: u64)` / `get_cooldown() -> u64`
+### `set_cooldown(admin_signers: Vec<Address>, secs: u64)` / `get_cooldown() -> u64`
 Admin sets the cooldown enforced between accepted submissions for the same `(wallet, asset_pair)`, bounded to `[MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS]` (1 minute – 24 hours); out-of-range values are rejected with `InvalidCooldown`. Defaults to 1 hour. See [Rate Limiting](#rate-limiting).
 
-### `override_rate_limit(wallet: Address, asset_pair: Symbol)`
+### `override_rate_limit(admin_signers: Vec<Address>, wallet: Address, asset_pair: Symbol, justification: Bytes)`
 Admin-only emergency escape hatch. Immediately clears the stored cooldown deadline for `(wallet, asset_pair)`, so the next `submit_score` / `submit_scores_batch` call for that pair is accepted regardless of how recently the last one was. Intended for correcting a known-bad score right away, not for routine use. Emits `rl_ovrd`.
 
-### `get_last_submit_time(wallet: Address, asset_pair: Symbol) -> u64`
+### `get_last_submit_time(wallet: Address, asset_pair: Symbol) -> Option<u64>`
 Read-only lookup of the ledger timestamp of the last accepted submission for `(wallet, asset_pair)`, or `0` if none has ever been accepted (or it was cleared by `override_rate_limit`).
 
 ### `set_score_floor_policy(admin_signers: Vec<Address>, enabled: bool, high_water_mark: u32, floor_value: u32)`
@@ -154,18 +154,18 @@ Admin-only (M-of-N). Configures the per-wallet score submission floor. When `ena
 ### `get_score_floor_policy() -> ScoreFloorPolicy`
 Read-only. Returns the current floor policy. Defaults to `{ enabled: false, high_water_mark: 80, floor_value: 20 }` until the admin opts in.
 
-### `get_historical_max_score(wallet: Address, asset_pair: Symbol) -> u32`
+### `get_historical_max_score(wallet: Address, asset_pair: Symbol) -> Option<u32>`
 Read-only. Returns the highest score ever recorded for `(wallet, asset_pair)`, or `0` if none. This running peak is what the floor compares against `high_water_mark`.
 
 ### `override_score_floor(admin_signers: Vec<Address>, wallet: Address, asset_pair: Symbol)`
 Admin-only (M-of-N) emergency escape hatch, analogous to `override_rate_limit`. Clears the stored historical maximum for `(wallet, asset_pair)`, dropping it below the high-water mark so the next submission is accepted regardless of its score — for correcting a genuinely mis-flagged wallet. The peak is rebuilt from subsequent submissions, so the floor's protection resumes once a high score is recorded again. Emits `sf_ovrd`.
 
-### `clear_score_history(wallet: Address, asset_pair: Symbol)` ⚠️ irreversible
+### `clear_score_history(admin_signers: Vec<Address>, wallet: Address, asset_pair: Symbol)` ⚠️ irreversible
 Admin only. Permanently erases the score history ring buffer for `wallet` / `asset_pair`. No-op if no history exists. Emits `clr_hist` for the on-chain audit trail. **Keep off-chain backups before calling — this cannot be undone on-chain.**
 
-### `clear_score(wallet: Address, asset_pair: Symbol)` ⚠️ irreversible
+### `clear_score(admin_signers: Vec<Address>, wallet: Address, asset_pair: Symbol)` ⚠️ irreversible
 Admin only. Permanently erases the latest score entry for `wallet` / `asset_pair`. After this call, `get_score` returns `ScoreNotFound`. No-op if no score exists. Emits `clr_scr` for the on-chain audit trail. **Keep off-chain backups before calling — this cannot be undone on-chain.**
-### `set_service_pubkey(pubkey: Bytes)` / `get_service_pubkey() -> Bytes`
+### `set_service_pubkey(admin_signers: Vec<Address>, pubkey: Bytes)` / `get_service_pubkey() -> Bytes`
 Admin sets (or rotates) the off-chain detection pipeline's secp256k1 public key — 33 bytes compressed or 65 bytes uncompressed, rejected otherwise with `InvalidPubkeyLength` — used to verify `ScoreAttestation`s. Once set it cannot be unset, only rotated. `get_service_pubkey` returns `ServicePubkeyNotSet` before one has been configured. See [Score Attestation](#score-attestation).
 
 ### `set_pair_paused(asset_pair: Symbol, paused: bool)`
@@ -498,13 +498,27 @@ LedgerLens is only useful if other protocols can actually *act* on its scores. A
 
 The problem with composing on a raw getter is fragility. If every integrator reverse-engineers `get_score` and decodes the `RiskScore` struct by hand, then the day we add a field or change an error code, every downstream protocol breaks silently. So LedgerLens exposes a **stable, versioned composability interface** — `ILedgerLensScore` — as the canonical integration point. It is fully specified in [`docs/interface-spec.md`](docs/interface-spec.md); the headline function is `query_risk_gate`.
 
+### Standards and conformance
+
+`ILedgerLensScore` is a LedgerLens-specific interface. To let integrators switch providers without rewriting their guard clauses, the same surface has been generalised into a provider-neutral standard:
+
+| Artefact | Purpose |
+|---|---|
+| [`docs/standards/sep-risk-score-registry-interface.md`](docs/standards/sep-risk-score-registry-interface.md) | Draft standard for a risk-score registry interface any provider can implement (SEP format) |
+| [`docs/standards/ledgerlens-alignment.md`](docs/standards/ledgerlens-alignment.md) | Clause-by-clause mapping of `ILedgerLensScore` onto the draft, with every divergence and its rationale |
+| [`contracts/reference-provider/`](contracts/reference-provider/) | Minimal provider written against the draft, and the worked example for it |
+| [`tests/conformance/`](tests/conformance/) | 33-vector conformance suite, plus instructions for running it against a provider in another language |
+| [`docs/standards/submission-and-discussion.md`](docs/standards/submission-and-discussion.md) | Ecosystem review status, announcement text, and the feedback log |
+
+`contracts/ledgerlens-score` already satisfies every `must`-level vector without an ABI change, and its single `should`-level deviation (it does not advertise the `risk` root capability) is asserted in a test so the divergence list cannot drift silently.
+
 ### Why a dedicated gate function?
 
 A guard clause inside someone else's contract has hard requirements that a normal getter doesn't meet:
 
 - **It must never panic.** A panic in a cross-contract call traps the *caller's* transaction. If LedgerLens could panic, an attacker could craft inputs that disable the AMM's risk guard — or simply burn its gas. So `query_risk_gate` returns a plain `bool` and is engineered to be infallible.
 - **It must fail closed.** Because the answer is a single `bool`, the "we have no score for this wallet" case has to collapse to one value — and that value is `false`. Unknown wallets are treated as *potentially risky*, not waved through.
-- **It must be cheap and side-effect free.** It is a pure read that doesn't even extend storage TTL, so calling it from a hot path is safe.
+- **It must be cheap and free of durable side effects.** It never extends a score's TTL and never writes a durable entry, so calling it from a hot path is safe. The one write on the path is a bounded *temporary* gate-read marker used by the flash-loan protection feature (#300), which the decision logic does not read; a single liveness alert may also be emitted while a read is served.
 
 ### The AMM pattern
 
@@ -577,11 +591,20 @@ These are backed by a set of non-negotiable implementation invariants — fail-c
 
 ## Testing
 
-Run the test suite with:
+Every test in this repository is classified in [`test-tiers.toml`](test-tiers.toml) — a
+machine-readable inventory that says what each test is for and which run executes it. Three
+tiers exist, each with a wall-clock execution budget:
 
 ```bash
-cargo test
+scripts/test-tier.sh fast        # 3-minute budget; what CI runs on every PR
+scripts/test-tier.sh standard    # 30-minute budget; the rest of the per-PR coverage
+scripts/test-tier.sh nightly     # 60-minute budget; scheduled, not on every PR
 ```
+
+Use `--no-budget` locally (the budgets are ceilings for a GitHub-hosted 2-vCPU runner) and
+`--list` / `--dry-run` to see what a tier would run. `cargo test` still works for debugging a
+single suite. The model, the taxonomy, and the rules for adding or moving a test are in
+[`docs/test-tiers.md`](docs/test-tiers.md).
 
 ## Quick Start
 
@@ -650,24 +673,32 @@ soroban contract invoke \
 ├── deploy/manifests/                   ← Reviewed environment deployment manifests
 ├── docs/
 │   ├── deployment-manifests.md         ← Manifest schema and toolchain drift checks
-│   └── interface-spec.md               ← ILedgerLensScore composability spec
-│   └── contract-build-lints.md         ← WASM-only dead-code detection policy
-│   └── ledgerlens-score-module-ownership.md ← Score module ownership map
+│   ├── interface-spec.md               ← ILedgerLensScore composability spec
+│   ├── contract-build-lints.md         ← WASM-only dead-code detection policy
+│   ├── ledgerlens-score-module-ownership.md ← Score module ownership map
+│   └── standards/
+│       ├── sep-risk-score-registry-interface.md ← Provider-neutral interface standard (SEP draft)
+│       ├── ledgerlens-alignment.md      ← Clause-by-clause alignment and every divergence
+│       └── submission-and-discussion.md ← Ecosystem review status and feedback log
 ├── examples/
 │   └── amm_gate.rs                     ← Reference AMM integration (query_risk_gate)
 ├── contracts/
-│   └── ledgerlens-score/
-│       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs                  ← Contract entrypoints
-│           ├── types.rs                ← RiskScore, DataKey
-│           ├── storage.rs              ← Persistent/instance storage helpers
-│           ├── errors.rs               ← Contract error codes
-│           ├── events.rs               ← Event emission helpers
-│           ├── test.rs                 ← Implementation unit tests
-│           ├── test_interface.rs       ← Interface stability tests
-│           ├── test_upgrade.rs         ← Upgrade-governance tests
-│           └── test_rate_limit.rs      ← Submission rate-limiting tests
+│   ├── ledgerlens-score/
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs                  ← Contract entrypoints
+│   │       ├── types.rs                ← RiskScore, DataKey
+│   │       ├── storage.rs              ← Persistent/instance storage helpers
+│   │       ├── errors.rs               ← Contract error codes
+│   │       ├── events.rs               ← Event emission helpers
+│   │       ├── test.rs                 ← Implementation unit tests
+│   │       ├── test_interface.rs       ← Interface stability tests
+│   │       ├── test_upgrade.rs         ← Upgrade-governance tests
+│   │       └── test_rate_limit.rs      ← Submission rate-limiting tests
+│   └── reference-provider/             ← Minimal provider implementing the SEP draft
+├── tests/
+│   ├── composability/                  ← Cross-contract integration tests
+│   └── conformance/                    ← Provider-neutral conformance suite (SEP §11)
 ├── LICENSE
 ├── CONTRIBUTING.md
 └── README.md                            ← This file
@@ -779,7 +810,7 @@ pub struct RiskScore {
 
 - **Networks**: `testnet` for development, `mainnet` for production. Contract IDs per network are recorded in this repo's deployment docs and must be mirrored into `api`'s environment configuration (`CONTRACT_ID`, `RPC_URL`, `NETWORK`).
 - **Secrets**: the "service" keypair that calls `submit_score` lives in `api`'s secret store — never in `core`, `data`, or `dashboard`. This repo only ever stores the **public address** of that account on-chain.
-- **CI**: workflow templates live in `.github`; this repo's contract CI builds with `cargo build --target wasm32-unknown-unknown --release`, runs `cargo test`, checks contract-only wasm lints via `tools/check_contract_build_lints.sh`, and exercises `deploy.sh` RPC failure handling with a shell harness.
+- **CI**: workflow templates live in `.github`; this repo's contract CI builds with `cargo build --target wasm32-unknown-unknown --release`, runs the `fast` and `standard` test tiers under their own budgets (`scripts/test-tier.sh`, see [`docs/test-tiers.md`](docs/test-tiers.md)) plus the `nightly` tier on a schedule, checks contract-only wasm lints via `tools/check_contract_build_lints.sh`, and exercises `deploy.sh` RPC failure handling with a shell harness.
 - **Versioning**: tag contract releases as `contract-vX.Y.Z`. `api` should pin against a specific deployed `CONTRACT_ID` + ABI version, not "latest".
 
 ### Deployment safety notes
@@ -830,8 +861,17 @@ Contributions are welcome. LedgerLens is an open-source public good built for th
 
 ## Handsoff notes
 
-<!-- handsoff-issue-1135 -->
-- #1135: Historical signer-set epochs so past attestations stay verifiable after rotation
+<!-- handsoff-issue-1186 -->
+- #1186: Failure semantics of non-reverting cross-contract calls
 
-<!-- handsoff-issue-1136 -->
-- #1136: Time-travel reads: get_score_at(timestamp) over stored history
+<!-- handsoff-issue-1198 -->
+- #1198: Proof-carrying shard reads in the aggregator
+
+<!-- handsoff-issue-1214 -->
+- #1214: Grafana dashboards as code with provenance and drift checks
+
+<!-- handsoff-issue-1210 -->
+- #1210: Replay tool: interactive debugger with invariant breakpoints and state diffs
+
+<!-- handsoff-issue-1213 -->
+- #1213: Prometheus exporter and alert rules as code
