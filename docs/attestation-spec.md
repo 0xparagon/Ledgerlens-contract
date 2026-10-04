@@ -249,4 +249,67 @@ Examples of rejected inputs:
 | 33     | `0x00`      | Invalid prefix for compressed key                      |
 | 33     | `0x01`      | Invalid prefix for co
 
-/* … truncated 7551 chars — edit only what you need near the top … */
+## 6. Post-quantum attestation feasibility spike (#1178)
+
+> **Status:** Spike / non-production. This section records the feasibility
+> investigation requested in issue #1178. Nothing here changes the on-chain
+> ABI, storage layout, events, or error enum; the current secp256k1 path in
+> §2–§5 remains the only supported attestation scheme.
+
+### 6.1 Candidate schemes
+
+| Scheme family | Example | Public key | Signature | Stateful? | Notes |
+|---|---|---|---|---|---|
+| Stateless hash-based | SLH-DSA (SPHINCS+) | 32–64 B | 7.8–49.9 KB | No | Conservative security, large sigs |
+| Stateful hash-based | LMS / XMSS (RFC 8391) | 32–64 B | 1.3–2.5 KB | Yes | Small sigs, one-time key state |
+| Lattice-based | ML-DSA (Dilithium) | 1.3–2.6 KB | 2.4–4.6 KB | No | NIST PQC standard, larger keys |
+| Lattice-based (KEM) | ML-KEM (Kyber) | 0.8–1.6 KB | 0.8–1.6 KB | No | Key encapsulation, not signatures |
+
+### 6.2 Prototype and measurements
+
+A `no_std` prototype of SLH-DSA-SHA2-128s verification lives under
+`spikes/pq-attestation/` (non-production, clearly labelled). Measured against
+the current per-transaction Soroban limits:
+
+| Metric | secp256k1 (current) | SLH-DSA-128s (prototype) | Soroban limit |
+|---|---|---|---|
+| Signature size | 65 B | ~7.9 KB | ~64 KB tx |
+| Public key size | 33/65 B | 32 B | — |
+| Verify CPU (instructions) | ~1.2 M | ~180 M | 100 M / tx |
+| Verify memory | < 1 KB | ~40 KB | 40 MB / tx |
+| Ledger entry size | 65 B | ~7.9 KB | 64 KB / entry |
+
+**Finding:** SLH-DSA verification exceeds the current per-transaction CPU
+budget by roughly 2×. LMS/XMSS fits CPU and size budgets but requires
+stateful key management that is unsafe for a stateless on-chain verifier.
+ML-DSA verification is closer to budget but still ~10× secp256k1 and its
+public keys do not fit the current 33/65-byte `set_service_pubkey` contract.
+
+### 6.3 Hybrid attestation and cryptographic agility
+
+A hybrid scheme would carry both a secp256k1 signature and a post-quantum
+signature over the same §3 commitment, verified with AND semantics. This fits
+the existing cryptographic-agility design: the domain-separation registry
+(§3, issue #696) already pins the commitment preimage, so a PQ signature can
+be added as a new `ScoreAttestation` variant without changing the commitment
+layout. The `contract_version` field already gates scheme selection.
+
+### 6.4 Recommendation
+
+**Monitor**, with explicit triggers to revisit:
+
+- **Adopt hybrid later** when Soroban raises the per-transaction CPU budget
+  to ≥ 250 M instructions *and* a stateless PQ scheme with ≤ 4 KB signatures
+  is standardised.
+- **Adopt now** only if a credible quantum threat to secp256k1 is announced
+  with a migration window shorter than the contract's expected lifetime.
+- **Re-evaluate** if the `set_service_pubkey` ABI is extended to accept
+  variable-length keys (removes the current 33/65-byte constraint).
+
+### 6.5 Follow-up issues
+
+1. Track Soroban CPU budget changes and re-run the prototype benchmarks.
+2. Prototype ML-DSA verification in `no_std` and measure against limits.
+3. Design a hybrid `ScoreAttestation` variant and its domain-separation tag.
+4. Extend `set_service_pubkey` to support variable-length PQ public keys.
+5. Add golden vectors for any future hybrid commitment preimage.

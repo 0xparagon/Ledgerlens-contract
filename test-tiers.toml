@@ -1,0 +1,1197 @@
+# test-tiers.toml — the machine-readable test inventory and tier manifest
+#
+# Issue #1244. The authoritative statement of *what test exists, why it exists,
+# and which run executes it*. `docs/test-tiers.md` is the prose companion;
+# `scripts/test-tier.sh` is the only command a contributor needs locally.
+#
+# ── Model ──────────────────────────────────────────────────────────────────────
+#
+# A **test unit** is the granularity the tiers are defined over. A unit is one
+# of:
+#
+#   * a `#[cfg(test)]` module of a library target — `contracts/ledgerlens-score/
+#     src/test_upgrade.rs` and its siblings;
+#   * an integration-test target — `tests/composability/tests/sdk_conformance.rs`;
+#   * a doctest target — `contracts/ledgerlens-score::doctests`;
+#   * a shell or python suite — `tests/deploy/test_deploy.sh`;
+#   * a stray test file under `tests/` that belongs to no cargo target.
+#
+# Every unit carries a `kind` (its purpose) and a `tier` (what runs it). The
+# tiers partition the suite: a unit belongs to exactly one of them, and
+# `fast ∪ standard ∪ nightly` is exactly the set of units a cargo target
+# actually compiles. `disabled` is not a run — it records a test file that is
+# present in the tree but wired into nothing, which is a state CI now pins
+# rather than ignores.
+#
+# ── Why `disabled` is in this file ────────────────────────────────────────────
+#
+# 81 of the 138 test-carrying modules in `contracts/ledgerlens-score/src/` are
+# not declared in `src/lib.rs` (17 are commented out, 64 were never wired), the
+# same holds for 5 modules in `contracts/ledgerlens-aggregator` and
+# `tools/replay`, and `tests/doc_sync_check.rs` is not inside any cargo target.
+# 87 units in total, whose tests have never run. Each one is listed below as
+# `disabled` with the evidence for its state, so:
+#
+#   * adding `mod test_foo;` to `src/lib.rs` without classifying `test_foo`
+#     fails the `check` gate (the suite is live but unreachable from a tier);
+#   * un-wiring a live suite again fails the gate until the manifest records it
+#     as `disabled` with a reason, and that edit is a reviewed tier move.
+#
+# Triaging the disabled modules into live tiers (or deleting them) is tracked
+# as follow-up work in docs/test-tiers.md § Disabled inventory.
+#
+# ── Gates enforced on this file ───────────────────────────────────────────────
+#
+#   python3 tools/test-tiering.py check             # completeness, tiers, budgets
+#   python3 tools/test-tiering.py check --base main # ... and no unreviewed tier move
+#
+# Reviewed-change policy: a unit's `kind`, `tier`, or a tier's budget may only
+# change together with a `reviewed = { by, on, note }` annotation on the same
+# entry. `--base` diffs against any revision (a git rev or a manifest path) and
+# fails the build when a change is unannotated, so a test cannot quietly be
+# demoted out of PR coverage.
+#
+# Everything below the generated marker is machine-written. Re-generate it with
+#   python3 tools/test-tiering.py bootstrap --write
+# and review the diff: the bootstrap heuristics (tools/test-tiering.py) only
+# propose a `kind` and a `tier`; every deliberate deviation from a kind's
+# default tier must carry a `reason`, and a human owns those.
+
+schema_version = 1
+
+# Reference runner for the budgets below. Budgets are wall-clock ceilings for
+# *test execution*, measured with the build already warm (CI pre-builds the
+# test binaries; the build cost is reported separately as `build_budget_seconds`
+# and is not enforced, because a cold `lto = true` release build of this
+# workspace is dominated by compilation rather than by anything under test).
+[runner]
+model = "GitHub-hosted ubuntu-latest (2 vCPU, 7 GB RAM)"
+toolchain = "1.81.0 (rust-toolchain.toml)"
+provider = "cargo test, or cargo-nextest when it is installed (docs/test-tiers.md § Provider)"
+
+# ── Execution tiers ───────────────────────────────────────────────────────────
+
+[tiers.fast]
+description = """The pre-push and per-PR feedback loop: contract entry-point behaviour, \
+the advertised interface and error surface, governance and rate-limit units, \
+conformance, and the cheap shell/python checks. Budget: 3 minutes of execution on \
+the reference runner. A PR that adds a slow test must classify it honestly or the \
+`test-tiers-fast` job fails and forces the conversation."""
+command = "scripts/test-tier.sh fast"
+runs_on = ["pull_request", "push:main", "local pre-push"]
+execution_budget_seconds = 180
+build_budget_seconds = 900
+
+[tiers.standard]
+description = """Everything that is correct to run on every PR but too slow or too \
+broad for the 3-minute feedback loop: cross-contract composability, the replay \
+tool, deploy-script and drift suites, attested-batch and privacy suites. Budget: \
+30 minutes of execution on the reference runner."""
+command = "scripts/test-tier.sh standard"
+runs_on = ["pull_request", "push:main", "local"]
+execution_budget_seconds = 1800
+build_budget_seconds = 900
+
+[tiers.nightly]
+description = """The rest: resource-exhaustion and hostile-read stress suites, \
+property/fuzz suites, long-horizon soak suites, and the cargo-mutants \
+kill-suites. Budget: 60 minutes of execution on the reference runner. Runs in \
+`.github/workflows/nightly-tests.yml`, and these are the units that used to \
+have no scheduled home at all."""
+command = "scripts/test-tier.sh nightly"
+runs_on = ["nightly cron", "manual"]
+execution_budget_seconds = 3600
+build_budget_seconds = 1800
+
+# ── Purpose taxonomy ──────────────────────────────────────────────────────────
+#
+# `default_tier` is where a purpose normally belongs. A unit may deviate, but
+# only with a `reason` on the unit — that is what makes the deviation reviewable
+# instead of accidental.
+
+[kinds.smoke]
+description = "The 'if this breaks, stop' set: core entry points, the advertised interface, the error surface, executable invariants, and the runnable doc examples."
+default_tier = "fast"
+
+[kinds.unit]
+description = "A single function or single storage key in isolation: validation branches, getters, setters, event shape."
+default_tier = "fast"
+
+[kinds.integration]
+description = "More than one contract, or one contract's lifecycle: composability, conformance, cross-contract failover, governance/upgrade flows, attestation domain compatibility, replay and deploy tooling."
+default_tier = "standard"
+
+[kinds.property]
+description = "Asserts a property over generated or randomised inputs rather than a fixed example: fuzz seeds, chaos sequences, monotonicity, bounded drift, invariant sweeps."
+default_tier = "standard"
+
+[kinds.stress]
+description = "Asserts bounded work under hostile or maximum-sized input: denial-of-service read patterns, memory exhaustion, panic-path guards, high-cardinality sweeps, malformed-input corpora."
+default_tier = "nightly"
+
+[kinds.soak]
+description = "Walks a long horizon: TTL renewal, score-history depth, epoch and decay progression. Slow by construction; correctness of the curve matters more than turnaround."
+default_tier = "nightly"
+
+[kinds.mutation]
+description = "Exists primarily as the kill-suite for a cargo-mutants shard: commitment-proof and cryptography code where line coverage is not evidence of test strength. Modules that merely appear in a shard's `--test` list are classified by their behavioural purpose and cross-referenced with `mutation_shards` instead."
+default_tier = "nightly"
+
+# ── Benchmarks (classified, deliberately outside the tiers) ────────────────────
+#
+# Criterion suites measure cost; they do not assert behaviour, so a failing
+# benchmark is data, not a gate. They are still classified (so nothing in the
+# tree is unaccounted for) but they are not part of the tier partition: running
+# them needs a release-profile build of this workspace (`lto = true`,
+# `codegen-units = 1`), which costs more wall-clock than any tier budget and
+# would only ever time out. Run them on demand with the command recorded on
+# each entry; `docs/resource-budgets.md` documents the thresholds.
+
+# ── BEGIN GENERATED: unit inventory (tools/test-tiering.py bootstrap) ──
+
+[[unit]]
+id = "contracts/ledgerlens-aggregator/src/optimization.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-aggregator/src/test.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-aggregator/src/test_conflict_arbitration.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/error_coverage.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/event_causality.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/event_emission.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/event_stability.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/storage.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test.rs"
+kind = "smoke"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_abuse_case_overrides.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_active_signer_count.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_adaptive_epsilon.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_adaptive_rate_limit.rs"
+kind = "unit"
+tier = "disabled"
+mutation_shards = ["shard-c", "shard-e"]
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_admin_multisig.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_admin_rotation.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+note = "hand-classified: rotating the admin key while scores are pending is a lifecycle flow across two admin entry points, not a single-function unit test"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_admin_transfer.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_adversarial_sequences.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_adversarial_validation.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_aggregate_invariants.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_aggregate_key_rotation.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_alerts.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_asset_class_policy.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_attestation.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_attestation_domain_compat.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_audit_replay.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_batch_attestation.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_batch_attestation_replay.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_batch_error_events.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_batch_ttl_optimization.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_batch_watchlist.rs"
+kind = "stress"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_bayesian.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_bounded_drift.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_breach_counter_reset.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_bulk_deregister.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_bulk_reset_pair_weight.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_bulk_signer_tier.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_capability_partitioning.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_chaos_pause.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_cluster_boundaries.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_confidence_floor_truth_tables.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_confidence_gate.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_config_export.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_consensus.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_consensus_config.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_cooldown.rs"
+kind = "unit"
+tier = "fast"
+mutation_shards = ["shard-c", "shard-e"]
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_cooldown_period.rs"
+kind = "unit"
+tier = "fast"
+mutation_shards = ["shard-c", "shard-e"]
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_decay.rs"
+kind = "soak"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_deletion_policy.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_deprecation_compat.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_dispute.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_dos_read_patterns.rs"
+kind = "stress"
+tier = "nightly"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_dual_key_pubkey.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_embargo.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_epoch.rs"
+kind = "soak"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_escalation.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_escrow.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_fail_closed_invariants.rs"
+kind = "smoke"
+tier = "fast"
+note = "hand-classified: fail-closed behaviour on every consumer-facing read is the contract's core promise, so it belongs in the smoke set even though the bootstrap rules read 'invariants' as property"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_failover.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_fee_withdrawal.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_finality_buffer.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_flash_protection.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_fuzz_submit_score.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_gate_enforcement.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_gate_fee.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_gdpr_accumulator.rs"
+kind = "property"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_get_gate_callers.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_get_jump_threshold.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_governance_action_registry.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_governance_chain.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_heartbeat.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_high_cardinality_rent.rs"
+kind = "stress"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_histogram.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_history_paginated.rs"
+kind = "soak"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_hll.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_hysteresis.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_incident_event_topics.rs"
+kind = "smoke"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_interface.rs"
+kind = "smoke"
+tier = "standard"
+reason = "cost signal: loop bound 1000 at line 143"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_invariants.rs"
+kind = "smoke"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_iqr_rejection.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_is_paused.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_is_score_floor_enabled.rs"
+kind = "unit"
+tier = "disabled"
+mutation_shards = ["shard-d", "shard-e"]
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_jump.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_jump_stats.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_jump_threshold.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_malformed_proof_corpus.rs"
+kind = "stress"
+tier = "nightly"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_memory_exhaustion.rs"
+kind = "stress"
+tier = "nightly"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_migration_rollback.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_minimal_disclosure.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_model_stats.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_model_version.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_model_version_policy_compat.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_monotonicity_reweight.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_multisig_service.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_oracle_adapter.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_oracle_staleness.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_pair_pause.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_pair_score_count.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_panic_guards.rs"
+kind = "stress"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_param_timelock.rs"
+kind = "integration"
+tier = "disabled"
+mutation_shards = ["shard-b", "shard-e"]
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_parameter_governance.rs"
+kind = "integration"
+tier = "standard"
+mutation_shards = ["shard-b", "shard-e"]
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_policy_bundles.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_portfolio_var.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_privacy_exports.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_privacy_regression_history.rs"
+kind = "unit"
+tier = "fast"
+note = "hand-classified: the 'history' here is a regression record of privacy-preserving exports, not a simulated time horizon, so it is a unit suite and not soak"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_pubkey_canonicalization.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_public_error_snapshots.rs"
+kind = "smoke"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_query_helpers.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_quorum_reduction.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_rate_limit.rs"
+kind = "unit"
+tier = "disabled"
+mutation_shards = ["shard-c", "shard-e"]
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_rate_limit_override_log.rs"
+kind = "unit"
+tier = "disabled"
+mutation_shards = ["shard-c", "shard-e"]
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_rate_limit_window.rs"
+kind = "unit"
+tier = "fast"
+mutation_shards = ["shard-c", "shard-e"]
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_reconciliation.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_rejection_precedence.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_replay_audit.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_schema_version_probes.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_score_delta.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_score_floor.rs"
+kind = "unit"
+tier = "disabled"
+mutation_shards = ["shard-d", "shard-e"]
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_signer_compromise_containment.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_signer_governance.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_signer_reputation.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_signer_tier.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_signers.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_slo_defaults.rs"
+kind = "smoke"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_staleness.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_staleness_window.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_storage_contracts.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_storage_key_collisions.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_submission_normalization.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_submission_provenance.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_threshold_attestation.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_total_wallets_scored.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_ttl_rent_manager.rs"
+kind = "soak"
+tier = "nightly"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_two_person_control.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_upgrade.rs"
+kind = "integration"
+tier = "standard"
+mutation_shards = ["shard-b", "shard-e"]
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_upgrade_multisig.rs"
+kind = "integration"
+tier = "disabled"
+mutation_shards = ["shard-b", "shard-e"]
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_velocity_cap.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: mod declaration is commented out in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_verkle.rs"
+kind = "mutation"
+tier = "nightly"
+mutation_shards = ["shard-a", "shard-e"]
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_volatility.rs"
+kind = "property"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/test_zk_range_proof.rs"
+kind = "mutation"
+tier = "disabled"
+mutation_shards = ["shard-a", "shard-e"]
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/upgrade_smoke.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "contracts/ledgerlens-score/src/zk_range_proof.rs"
+kind = "unit"
+tier = "fast"
+
+[[unit]]
+id = "contracts/ledgerlens-score::doctests"
+kind = "smoke"
+tier = "standard"
+reason = "each doc example compiles as its own test binary"
+
+[[unit]]
+id = "scripts/health_check.test.sh"
+kind = "unit"
+tier = "fast"
+command = "bash scripts/health_check.test.sh"
+
+[[unit]]
+id = "tests/check_error_discriminants.test.sh"
+kind = "unit"
+tier = "fast"
+command = "bash tests/check_error_discriminants.test.sh"
+
+[[unit]]
+id = "tests/check_refinement_mapping.sh"
+kind = "unit"
+tier = "fast"
+command = "bash tests/check_refinement_mapping.sh"
+
+[[unit]]
+id = "tests/composability/tests/adversarial_consumer.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/aggregator_fallback_gate.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/aggregator_fanout.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/aggregator_shard_pause.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/capability_negotiation.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/historical_wasm_compat.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/integration_lifecycle.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/nested_caller_composability.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/sdk_conformance.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/stale_oracle_fallback_fixtures.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/composability/tests/test_composability.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tests/deploy/test_deploy.sh"
+kind = "integration"
+tier = "standard"
+command = "bash tests/deploy/test_deploy.sh"
+
+[[unit]]
+id = "tests/deploy_script_rpc_failures.sh"
+kind = "integration"
+tier = "standard"
+command = "bash tests/deploy_script_rpc_failures.sh"
+
+[[unit]]
+id = "tests/doc_sync_check.rs"
+kind = "unit"
+tier = "disabled"
+reason = "not wired: under tests/ but inside no cargo package target"
+
+[[unit]]
+id = "tests/test_tiers.test.sh"
+kind = "smoke"
+tier = "fast"
+command = "bash tests/test_tiers.test.sh"
+note = "hand-classified: the gate that decides what runs is itself on the fast path, so a regression in the checker cannot wait for a review cycle"
+
+[[unit]]
+id = "tests/test_traceability.py"
+kind = "unit"
+tier = "standard"
+command = "python3 -m unittest discover -s tests -p 'test_traceability.py'"
+reason = "spawns the replay traceability report once per case and writes a temp report per case; tool-level coverage that does not belong on the contract's fast path"
+
+[[unit]]
+id = "tools/replay/src/determinism.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "tools/replay/src/schema.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "tools/replay/src/wasm_analysis.rs"
+kind = "integration"
+tier = "disabled"
+reason = "not wired: no mod declaration in src/lib.rs"
+
+[[unit]]
+id = "tools/replay/tests/integration_test.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tools/replay/tests/reconciliation_test.rs"
+kind = "integration"
+tier = "standard"
+
+[[unit]]
+id = "tools/schema-gen::doctests"
+kind = "smoke"
+tier = "standard"
+reason = "each doc example compiles as its own test binary"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/batch_attested.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench batch_attested"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/batch_submit.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench batch_submit"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/batch_worst_case_profiles.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench batch_worst_case_profiles"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/entry_point_budgets.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench entry_point_budgets"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/estimate_unique_wallets.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench estimate_unique_wallets"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/get_delegation_chain.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench get_delegation_chain"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/get_interpolated_score.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench get_interpolated_score"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/get_private_aggregate_score.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench get_private_aggregate_score"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/get_score_histogram.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench get_score_histogram"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/history_eviction.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench history_eviction"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/portfolio_var.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench portfolio_var"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/query_risk_gate_relative.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench query_risk_gate_relative"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/reconcile_state.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench reconcile_state"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/rent_sweep.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench rent_sweep"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/verify_membership.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench verify_membership"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"
+
+[[benchmark]]
+id = "contracts/ledgerlens-score/benches/wallet_cluster.rs"
+kind = "stress"
+command = "cargo bench -p ledgerlens-score --bench wallet_cluster"
+reason = "criterion measurement rather than an assertion: classified but deliberately outside the tier partition (docs/test-tiers.md)"

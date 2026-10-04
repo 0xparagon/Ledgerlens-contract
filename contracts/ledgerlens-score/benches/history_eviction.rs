@@ -1,5 +1,7 @@
 //! Criterion benchmark comparing the worst-case score-history ring eviction
-//! against the steady-state cost of an ordinary ring push (issue #424).
+//! against the steady-state cost of an ordinary ring push (issue #424), and
+//! measuring the cost curve of the paged history layout across depths
+//! (issue #1144).
 //!
 //! Run: `cargo bench -p ledgerlens-score --bench history_eviction`
 //!
@@ -22,6 +24,14 @@
 //! case can never exceed evicting 49 entries from a 50-entry `Vec`,
 //! regardless of submission history, so the spike is small and fixed rather
 //! than unbounded.
+//!
+//! Issue #1144 replaces that monolithic ring with a paged layout: history is
+//! split into fixed-size pages keyed by page index, with a small index entry
+//! tracking the head/tail page and the total length. Appends only rewrite the
+//! tail page and eviction only touches the oldest page, so write amplification
+//! is O(page size) instead of O(depth). The `paged_history_cost_curve` group
+//! below fills history to depth 10, 100 and `MAX_HISTORY_DEPTH` and reports
+//! the per-submission cost at each depth so the flat cost curve is visible.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
@@ -33,6 +43,10 @@ use soroban_sdk::{
 
 const MAX_HISTORY_DEPTH: u32 = 50;
 const PARAM_CHANGE_DELAY: u64 = 86_401;
+
+/// Depths exercised by the paged cost-curve group. 10 and 100 are the
+/// acceptance-criteria depths; `MAX_HISTORY_DEPTH` is the configured maximum.
+const COST_CURVE_DEPTHS: [u32; 3] = [10, 100, MAX_HISTORY_DEPTH];
 
 fn setup(env: &Env) -> (LedgerLensScoreContractClient<'_>, Address, Symbol) {
     env.mock_all_auths();
@@ -128,6 +142,21 @@ fn worst_case_cost(
     submit_one(env, client, wallet, asset_pair)
 }
 
+/// Paged-layout cost curve: fill history to `depth`, then measure the cost of
+/// one more submission. With the paged layout the append rewrites only the
+/// tail page and eviction touches only the oldest page, so the cost should be
+/// roughly flat across depths rather than growing with `depth`.
+fn paged_cost_at_depth(
+    env: &Env,
+    client: &LedgerLensScoreContractClient,
+    wallet: &Address,
+    asset_pair: &Symbol,
+    depth: u32,
+) -> (u64, u64) {
+    fill_history(env, client, wallet, asset_pair, depth);
+    submit_one(env, client, wallet, asset_pair)
+}
+
 fn bench_history_eviction(c: &mut Criterion) {
     let mut group = c.benchmark_group("history_eviction");
     group.sample_size(10);
@@ -151,5 +180,31 @@ fn bench_history_eviction(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_history_eviction);
+/// Cost curve for the paged history layout at depth 10, 100 and the maximum.
+/// Reported per depth so the flat (page-bounded) cost curve is visible and
+/// regression-tested against the monolithic ring's depth-proportional cost.
+fn bench_paged_history_cost_curve(c: &mut Criterion) {
+    let mut group = c.benchmark_group("paged_history_cost_curve");
+    group.sample_size(10);
+
+    for depth in COST_CURVE_DEPTHS {
+        group.bench_with_input(
+            format!("depth_{depth}"),
+            &depth,
+            |b, &depth| {
+                b.iter(|| {
+                    let env = Env::default();
+                    let (client, wallet, asset_pair) = setup(&env);
+                    black_box(paged_cost_at_depth(
+                        &env, &client, &wallet, &asset_pair, depth,
+                    ))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_history_eviction, bench_paged_history_cost_curve);
 criterion_main!(benches);
