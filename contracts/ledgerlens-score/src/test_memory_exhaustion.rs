@@ -23,7 +23,11 @@
 extern crate std;
 
 use k256::ecdsa::SigningKey;
-use soroban_sdk::{symbol_short, testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Events as _},
+    Address, Bytes, BytesN, Env, Vec,
+};
 
 use crate::{
     constants, BatchAttestation, Error, LedgerLensScoreContract, LedgerLensScoreContractClient,
@@ -240,6 +244,56 @@ fn test_batch_attested_unauthorized_signer_rejected() {
 
     let result = client.try_submit_scores_batch_attested(&signers, &submissions, &attestation);
     assert_eq!(result, Err(Ok(Error::UnauthorizedSigner)));
+}
+
+#[test]
+fn test_submit_score_budget_exhaustion_is_atomic() {
+    let (env, client, _admin, _service) = setup();
+    let existing_wallet = Address::generate(&env);
+    let existing_pair = symbol_short!("XLM_USDC");
+    let existing_score = 42u32;
+    client.submit_score(
+        &Vec::new(&env),
+        &existing_wallet,
+        &existing_pair,
+        &existing_score,
+        &false,
+        &false,
+        &1_700_000_000,
+        &90,
+        &1,
+        &None,
+    );
+
+    let before_score = client.get_score(&existing_wallet, &existing_pair);
+    let before_events = env.events().all();
+
+    let target_wallet = Address::generate(&env);
+    let target_pair = symbol_short!("BTC_USDT");
+    assert_eq!(client.try_get_score(&target_wallet, &target_pair), Err(Ok(Error::ScoreNotFound)));
+
+    env.budget().reset_limits(1, 1);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = client.try_submit_score(
+            &Vec::new(&env),
+            &target_wallet,
+            &target_pair,
+            &50,
+            &false,
+            &false,
+            &1_700_000_001,
+            &90,
+            &1,
+            &None,
+        );
+    }))
+    .is_err();
+    assert!(panicked, "expected host-level budget exhaustion to panic the host call");
+
+    env.budget().reset_unlimited();
+    assert_eq!(client.get_score(&existing_wallet, &existing_pair), before_score);
+    assert_eq!(client.try_get_score(&target_wallet, &target_pair), Err(Ok(Error::ScoreNotFound)));
+    assert_eq!(env.events().all(), before_events);
 }
 
 // ── 6. Bounded public read under a maximum-sized index ──────────────────────

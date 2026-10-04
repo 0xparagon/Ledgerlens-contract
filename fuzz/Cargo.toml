@@ -1,0 +1,41 @@
+# libFuzzer harnesses for OSS-Fuzz / cargo-fuzz (issue #1232).
+# Own workspace so the nightly-only sanitizer build never touches the main one.
+[package]
+name = "ledgerlens-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+ledgerlens-score = { path = "../contracts/ledgerlens-score", features = ["testutils"] }
+invocation-fuzzer = { path = "../tools/invocation-fuzzer" }
+serde_json = "1.0"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "verkle_proof"
+path = "fuzz_targets/verkle_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "range_proof"
+path = "fuzz_targets/range_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invocation_campaign"
+path = "fuzz_targets/invocation_campaign.rs"
+test = false
+doc = false
+bench = false

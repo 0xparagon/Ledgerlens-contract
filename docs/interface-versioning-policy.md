@@ -109,12 +109,13 @@ let client = LedgerLensScoreContractClient::new(&env, &contract_id);
 if client.supports_interface(&symbol_short!("gate")) {
     // This deployment supports query_risk_gate.
 }
-```yaml
+```
 
 ```rust
 // ⚠️ Avoid: version-number comparison
 let ver = client.get_version();
 if ver >= 2 { /* ... */ }  // Fragile: what if v4 removes nothing you use?
+```
 
 `supports_interface` is an append-only capability registry within a major
 interface version. Once a capability symbol is published, it is never removed
@@ -163,3 +164,53 @@ supported, warned about, and eventually removed is specified separately in
   removed the cap, and `true` on deployments still in the deprecation window.
 - The sunset checklist in `docs/deprecation-policy.md §6` must be completed
   before any removal lands on mainnet.
+
+## 9. Rust API Surface Tiers & Semver Enforcement
+
+The contract crates are compiled as both `rlib` and `cdylib`. The `cdylib`
+exports the **contract ABI** (the `ILedgerLensScore` surface described above);
+the `rlib` additionally exposes a **Rust API** that tools, tests, and other
+crates link against. These are two distinct surfaces with two distinct gates.
+
+### 9.1 Tiers
+
+Every public item in a contract crate is classified into exactly one tier:
+
+| Tier | Meaning | Visibility | Docs | Semver gate |
+|------|---------|------------|------|-------------|
+| **Contract ABI** | Functions, `#[contracttype]` structs, error codes, and capability symbols reachable through the deployed contract. | `pub` (required by the Soroban macro) | Documented in `interface-spec.md` | ABI diff gate (§9.4) |
+| **Stable Rust API** | Items intended for external Rust consumers (tools, integration crates). | `pub` | Documented in rustdoc | `cargo public-api` gate (§9.3) |
+| **Internal** | Implementation detail with no external consumer. | `pub(crate)` (or `#[doc(hidden)]` when the macro forces `pub`) | Hidden | None |
+
+### 9.2 Inventory & visibility rules
+
+- New items default to **Internal**. Promoting an item to **Stable Rust API**
+  requires a doc comment and a line in the stable-subset baseline.
+- Items that must remain `pub` only because a Soroban macro requires it are
+  marked `#[doc(hidden)]` and treated as Internal for semver purposes.
+- Tests that need internals use the documented test-support path
+  (`#[cfg(test)]` helpers or the `test-support` feature) rather than widening
+  visibility. No test may depend on an item that is not in one of the three
+  tiers above.
+
+### 9.3 Rust API gate (`cargo public-api`)
+
+CI runs `cargo public-api` against each contract crate and diffs the result
+against the committed baseline of the **Stable Rust API** subset. A diff that
+removes or changes a stable item fails the job unless the PR carries an
+explicit acknowledgement (a `semver: breaking` label plus a `CHANGELOG.md`
+entry). This gate covers the `rlib` surface only.
+
+### 9.4 Relationship to the ABI diff gate
+
+The two gates are complementary and must not be conflated:
+
+- **ABI diff gate** — diffs the generated contract interface (WASM exports,
+  `#[contracttype]` layouts, error discriminants). Governs the **Contract ABI**
+  tier and the versioning rules in §3.
+- **Rust API gate** — diffs the `cargo public-api` output. Governs the
+  **Stable Rust API** tier and Rust semver for downstream crates.
+
+A change may trip one gate without the other (e.g. a new `pub` helper trips the
+Rust API gate only; a reordered struct field trips the ABI gate only). When a
+change trips both, both acknowledgements are required.
