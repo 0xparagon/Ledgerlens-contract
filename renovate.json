@@ -1,0 +1,44 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard"],
+  "timezone": "UTC",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "rangeStrategy": "pin",
+  "prConcurrentLimit": 5,
+  "enabledManagers": ["cargo", "github-actions"],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "labels": ["dependencies", "security"]
+  },
+  "packageRules": [
+    {
+      "description": "Soroban SDK and testutils move together",
+      "groupName": "soroban-sdk",
+      "matchPackageNames": ["soroban-sdk", "soroban-env-host", "soroban-env-common", "soroban-spec", "soroban-sdk-macros", "stellar-xdr"],
+      "labels": ["dependencies", "sdk", "wasm-linked"]
+    },
+    {
+      "description": "SDK majors require explicit human approval via the dependency dashboard",
+      "matchPackageNames": ["soroban-sdk"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true,
+      "labels": ["dependencies", "sdk", "sdk-major", "wasm-linked"]
+    },
+    {
+      "description": "Cryptography crates move together and need approval (linked into WASM)",
+      "groupName": "cryptography",
+      "matchPackageNames": ["sha2", "sha3", "ed25519-dalek", "curve25519-dalek", "k256", "p256", "blake2", "subtle", "rand", "rand_core"],
+      "dependencyDashboardApproval": true,
+      "labels": ["dependencies", "crypto", "wasm-linked"]
+    },
+    {
+      "description": "GitHub Actions are pinned and batched monthly",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "schedule": ["before 6am on the first day of the month"],
+      "pinDigests": true
+    }
+  ]
+}

@@ -13,6 +13,61 @@ important failure modes.
 
 ---
 
+## 0. Quickstart with `ledgerlens-consumer`
+
+`ledgerlens-consumer` is a small `no_std` crate that encodes the recommended
+fail-closed patterns so integrators cannot easily get them wrong. It has **no
+registry-internal dependencies** and is versioned independently with semver.
+
+```toml
+[dependencies]
+ledgerlens-consumer = "0.1"
+```
+
+```rust
+use ledgerlens_consumer::{ConsumerClient, Decision, Guard};
+use soroban_sdk::{symbol_short, Address, Env};
+
+fn swap(env: Env, user: Address) -> Result<(), MyError> {
+    let consumer = ConsumerClient::new(&env, &ledgerlens_contract_id);
+
+    // Fail-closed guard: blocks on risky, missing, stale, or errored scores.
+    if consumer.guard(&user, &symbol_short!("XLM_USDC"), &75).is_blocked() {
+        return Err(MyError::HighRiskWallet);
+    }
+    // ... proceed
+    Ok(())
+}
+```
+
+### Helper → interface function map
+
+| `ledgerlens-consumer` helper | Interface function it calls |
+|---|---|
+| `ConsumerClient::get_score` | `get_score` |
+| `ConsumerClient::get_score_history` | `get_score_history` |
+| `ConsumerClient::get_score_count` | `get_score_count` |
+| `ConsumerClient::gate` | `query_risk_gate` |
+| `ConsumerClient::gate_with_confidence` | `query_risk_gate_with_confidence` |
+| `ConsumerClient::guard` | `query_risk_gate` (fail-closed wrapper) |
+| `Decision::fail_open` / `Decision::fail_closed` | — (decision helpers) |
+| `RevisionGuard::check` | — (staleness/revision guard) |
+
+### ABI compatibility matrix
+
+| `ledgerlens-consumer` | `ledgerlens-score` ABI |
+|---|---|
+| `0.1.x` | `1.x` |
+
+### Size cost
+
+The crate is `no_std` and dependency-free beyond `soroban-sdk`. It compiles for
+WASM (`wasm32-unknown-unknown`) and adds only a thin typed wrapper plus guard
+logic to the consuming contract; measure with `cargo build --target
+wasm32-unknown-unknown --release` and compare the resulting `.wasm` size.
+
+---
+
 ## 1. Score Flow
 
 **Use when:** your off-chain pipeline needs to write scores and your dashboard

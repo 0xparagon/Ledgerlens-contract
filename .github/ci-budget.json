@@ -1,0 +1,15 @@
+{
+  "_comment": "Wall-clock budgets in seconds for the Contract CI workflow (issue #1224). See docs/ci-performance.md.",
+  "required_checks_seconds": 1500,
+  "jobs": {
+    "Format check": 180,
+    "Clippy": 600,
+    "Unit tests (partition 1/4)": 900,
+    "Unit tests (partition 2/4)": 900,
+    "Unit tests (partition 3/4)": 900,
+    "Unit tests (partition 4/4)": 900,
+    "Doctests and benches": 900,
+    "WASM build": 600,
+    "Production acceptance report": 1200
+  }
+}

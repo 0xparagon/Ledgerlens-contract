@@ -1,0 +1,12 @@
+{
+  "contract_rust": "1.81.0",
+  "audit_rust": "1.88.0",
+  "stellar_cli": "21.0.0",
+  "tla_tools": "1.8.0",
+  "java": "17",
+  "cargo_mutants": "24.7.0",
+  "shellcheck": "0.10.0",
+  "cargo_audit": "0.22.2",
+  "cargo_deny": "0.20.2",
+  "cargo_cyclonedx": "0.5.8"
+}

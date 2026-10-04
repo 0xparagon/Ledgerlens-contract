@@ -307,6 +307,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "conformance-tests"
+version = "0.1.0"
+dependencies = [
+ "ledgerlens-score",
+ "reference-provider",
+ "serde",
+ "serde_json",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -946,6 +957,8 @@ dependencies = [
  "k256",
  "ledgerlens-test-support",
  "libm",
+ "serde",
+ "serde_json",
  "soroban-sdk",
  "subtle",
 ]
@@ -1248,11 +1261,29 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+]
+
+[[package]]
+name = "reference-model-driver"
+version = "0.1.0"
+dependencies = [
+ "ledgerlens-score",
+ "serde",
+ "serde_json",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "reference-provider"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
@@ -1351,6 +1382,17 @@ dependencies = [
  "serde_json",
  "soroban-sdk",
  "soroban-spec",
+]
+
+[[package]]
+name = "score-submitter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
