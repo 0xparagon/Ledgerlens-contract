@@ -1,0 +1,17 @@
+[package]
+name = "reference-provider"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Reference implementation of the On-Chain Risk Score Registry Interface (SEP draft in docs/standards/), used as the canonical example other risk-score providers copy"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "21.0.0"
+
+[features]
+testutils = ["soroban-sdk/testutils"]

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>LedgerLens Compliance Report</title>
+<style>body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem}table{border-collapse:collapse;width:100%;margin:.5rem 0 1.5rem}td,th{border:1px solid #ccc;padding:.25rem .5rem;text-align:left;font-size:.9rem}code{word-break:break-all}</style>
+</head><body>
+<h1>LedgerLens Compliance &amp; Governance Report</h1>
+<p>Ledgers <b>1000</b>–<b>3000</b> · 84 events · contracts: CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX, CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</p>
+<p>Content hash (SHA-256): <code>1f0113b76526028e6bde50cc23aa8e95bd53ef254402ed199128114885afbb2d</code></p>
+<h2>Governance actions</h2>
+<table><thead><tr><th>Ledger</th><th>Contract</th><th>Proposal</th><th>Action</th><th>Actor</th><th>Lineage</th></tr></thead><tbody><tr><td>1100</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>P1</td><td>set_param</td><td>GADMIN1</td><td>P1</td></tr><tr><td>1500</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>P2</td><td>set_param</td><td>GADMIN1</td><td>P1 → P2</td></tr><tr><td>1800</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>P3</td><td>remove_signer</td><td>GADMIN2</td><td>P3</td></tr><tr><td>1900</td><td>CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>Q1</td><td>set_quorum</td><td>GADMIN1</td><td>Q1</td></tr></tbody></table>
+<h2>Signer set history</h2>
+<table><thead><tr><th>Ledger</th><th>Contract</th><th>Signer</th><th>Change</th><th>Active signers</th></tr></thead><tbody><tr><td>1000</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>GSIGNERA</td><td>added</td><td>1</td></tr><tr><td>1000</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>GSIGNERB</td><td>added</td><td>2</td></tr><tr><td>1000</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>GSIGNERC</td><td>added</td><td>3</td></tr><tr><td>1800</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>GSIGNERB</td><td>removed</td><td>2</td></tr></tbody></table>
+<h2>Parameter provenance</h2>
+<table><thead><tr><th>Ledger</th><th>Contract</th><th>Parameter</th><th>Old</th><th>New</th><th>Proposal</th></tr></thead><tbody><tr><td>1100</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>jump_threshold</td><td>20</td><td>25</td><td>P1</td></tr><tr><td>1500</td><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>jump_threshold</td><td>25</td><td>30</td><td>P2</td></tr><tr><td>1900</td><td>CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>quorum</td><td>2</td><td>3</td><td>Q1</td></tr></tbody></table>
+<h2>Heartbeat and downtime</h2>
+<table><thead><tr><th>Contract</th><th>Heartbeats</th><th>Downtime ledgers</th><th>Intervals</th></tr></thead><tbody><tr><td>CAGGR7LEDGERLENSAGGREGATORXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>5</td><td>0</td><td>—</td></tr><tr><td>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</td><td>7</td><td>1000</td><td>1600–2600</td></tr></tbody></table>
+<h2>Score distribution</h2><p>Buckets with fewer than 5 scores are suppressed.</p>
+<h3>CSCORE7LEDGERLENSSCOREXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</h3>
+<table><thead><tr><th>Range</th><th>Count</th></tr></thead><tbody><tr><td>0–9</td><td>0</td></tr><tr><td>10–19</td><td>suppressed</td></tr><tr><td>20–29</td><td>suppressed</td></tr><tr><td>30–39</td><td>7</td></tr><tr><td>40–49</td><td>5</td></tr><tr><td>50–59</td><td>22</td></tr><tr><td>60–69</td><td>13</td></tr><tr><td>70–79</td><td>6</td></tr><tr><td>80–89</td><td>suppressed</td></tr><tr><td>90–100</td><td>suppressed</td></tr></tbody></table>
+</body></html>

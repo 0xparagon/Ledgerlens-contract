@@ -1,0 +1,394 @@
+{
+  "suite_version": "1.0.0",
+  "interface": "onchain-risk-score-registry",
+  "spec_status": "draft",
+  "notes": [
+    "Provider-neutral conformance vectors for the On-Chain Risk Score Registry Interface.",
+    "This file is the normative artefact: providers in any language translate it; the Rust harness in tests/conformance executes it.",
+    "`level: must` failures mean the provider is not conformant. `level: should` failures are reported as deviations and do not break conformance.",
+    "Every vector states a precondition in provider-neutral terms (`unknown_subject`, `scored`, `unavailable`); the adapter maps those onto its own deployment API.",
+    "Scores are published at ledger timestamp 1700000000 and the chain clock is then advanced by `age_secs`, so `timestamp` expectations are the constant 1700000000.",
+    "`requires_capability` gates a vector on the provider advertising that symbol: a provider that does not implement `cgate` is not judged on EXT-*, and one that does not expose `score` is not judged on the CORE-*/EXT* vectors that read the payload.",
+    "A vector that reads the score payload is only meaningful for providers that publish one; that is what keeps the advisory `score` capability compatible with must-level payload requirements."
+  ],
+  "levels": {
+    "must": "Required for conformance.",
+    "should": "Strongly recommended; a deviation is reported but does not break conformance."
+  },
+  "vectors": [
+    {
+      "id": "CORE-001",
+      "level": "must",
+      "title": "unknown subject fails closed",
+      "clause": "5.1",
+      "probe": "gate",
+      "setup": { "state": "unknown_subject" },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-002",
+      "level": "must",
+      "title": "score 0 is below every positive threshold",
+      "clause": "5.2",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 0, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "CORE-003",
+      "level": "must",
+      "title": "score one below the threshold passes",
+      "clause": "5.2",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 74, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "CORE-004",
+      "level": "must",
+      "title": "score equal to the threshold does not pass",
+      "clause": "5.2",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 75, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-005",
+      "level": "must",
+      "title": "maximum score does not pass",
+      "clause": "5.2",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 100, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-006",
+      "level": "must",
+      "title": "threshold 0 can never be satisfied",
+      "clause": "5.2",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 0, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 0 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-007",
+      "level": "must",
+      "title": "out-of-range threshold fails closed instead of passing everything",
+      "clause": "5.4",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 0, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 101 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-008",
+      "level": "must",
+      "title": "u32::MAX threshold does not trap",
+      "clause": "5.4",
+      "probe": "gate",
+      "setup": { "state": "scored", "score": 0, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 4294967295 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-009",
+      "level": "must",
+      "title": "repeated gate reads of a safe subject agree",
+      "clause": "5.5",
+      "probe": "gate_deterministic",
+      "setup": { "state": "scored", "score": 42, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "CORE-010",
+      "level": "must",
+      "title": "repeated gate reads of an unknown subject agree",
+      "clause": "5.5",
+      "probe": "gate_deterministic",
+      "setup": { "state": "unknown_subject" },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-011",
+      "level": "must",
+      "title": "an implemented capability is discoverable",
+      "clause": "6.1",
+      "probe": "capability",
+      "setup": { "state": "unknown_subject" },
+      "args": { "capability": "gate" },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "CORE-012",
+      "level": "must",
+      "title": "unrecognised capabilities are rejected without trapping",
+      "clause": "6.2",
+      "probe": "capability_unknown",
+      "setup": { "state": "unknown_subject" },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "CORE-013",
+      "level": "must",
+      "title": "an interface version is reported",
+      "clause": "6.3",
+      "setup": { "state": "unknown_subject" },
+      "probe": "version",
+      "expect": { "kind": "version" }
+    },
+    {
+      "id": "CORE-014",
+      "level": "must",
+      "title": "a missing score is reported as no-data, not as a transport failure",
+      "clause": "7.2",
+      "requires_capability": "score",
+      "probe": "score_absent",
+      "setup": { "state": "unknown_subject" },
+      "expect": { "kind": "error", "error": "not_found" }
+    },
+    {
+      "id": "CORE-015",
+      "level": "must",
+      "title": "a published score round-trips with in-range fields",
+      "clause": "8.1",
+      "requires_capability": "score",
+      "probe": "score_present",
+      "setup": { "state": "scored", "score": 42, "confidence": 90, "age_secs": 0 },
+      "expect": { "kind": "score", "score": 42, "confidence": 90, "model_version": 1 }
+    },
+    {
+      "id": "CORE-016",
+      "level": "should",
+      "title": "gate reads emit no events",
+      "clause": "9.3",
+      "probe": "gate_emits_no_events",
+      "setup": { "state": "scored", "score": 42, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75 },
+      "expect": { "kind": "events", "count": 0 }
+    },
+    {
+      "id": "CORE-017",
+      "level": "should",
+      "title": "provider self-identifies with the root capability",
+      "clause": "6.1",
+      "probe": "capability",
+      "setup": { "state": "unknown_subject" },
+      "args": { "capability": "risk" },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "CORE-018",
+      "level": "must",
+      "title": "every capability in the metadata list is also answered by supports_interface",
+      "clause": "6.2",
+      "probe": "metadata_consistency",
+      "setup": { "state": "unknown_subject" },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "EXT-001",
+      "level": "must",
+      "title": "confidence gate fails closed for an unknown subject",
+      "clause": "5.3",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "unknown_subject" },
+      "args": { "threshold": 75, "min_confidence": 50 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "EXT-002",
+      "level": "must",
+      "title": "low confidence is not evidence of safety",
+      "clause": "5.3",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "scored", "score": 10, "confidence": 20, "age_secs": 0 },
+      "args": { "threshold": 75, "min_confidence": 50 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "EXT-003",
+      "level": "must",
+      "title": "the confidence floor is inclusive",
+      "clause": "5.3",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "scored", "score": 10, "confidence": 50, "age_secs": 0 },
+      "args": { "threshold": 75, "min_confidence": 50 },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "EXT-004",
+      "level": "must",
+      "title": "the confidence floor does not override the risk threshold",
+      "clause": "5.3",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "scored", "score": 80, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75, "min_confidence": 50 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "EXT-005",
+      "level": "must",
+      "title": "out-of-range threshold fails closed on the confidence gate",
+      "clause": "5.4",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "scored", "score": 10, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 101, "min_confidence": 0 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "EXT-006",
+      "level": "must",
+      "title": "out-of-range confidence floor fails closed",
+      "clause": "5.4",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "scored", "score": 10, "confidence": 90, "age_secs": 0 },
+      "args": { "threshold": 75, "min_confidence": 101 },
+      "expect": { "kind": "bool", "value": false }
+    },
+    {
+      "id": "EXT-007",
+      "level": "must",
+      "title": "a stale-but-safe score still passes the gate, leaving freshness to the consumer",
+      "clause": "5.6",
+      "requires_capability": "cgate",
+      "probe": "gate_with_confidence",
+      "setup": { "state": "scored", "score": 10, "confidence": 90, "age_secs": 604801 },
+      "args": { "threshold": 75, "min_confidence": 50 },
+      "expect": { "kind": "bool", "value": true }
+    },
+    {
+      "id": "CONS-001",
+      "level": "must",
+      "title": "consumer allows a fresh, low-risk, confident subject",
+      "clause": "10.2",
+      "probe": "consumer_decision",
+      "setup": { "state": "scored", "score": 10, "confidence": 90, "age_secs": 0 },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "allow" }
+    },
+    {
+      "id": "CONS-002",
+      "level": "must",
+      "title": "consumer denies a high-risk subject",
+      "clause": "10.2",
+      "probe": "consumer_decision",
+      "setup": { "state": "scored", "score": 90, "confidence": 90, "age_secs": 0 },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "deny_high_risk" }
+    },
+    {
+      "id": "CONS-003",
+      "level": "must",
+      "title": "consumer denies a low-confidence subject and says why",
+      "clause": "10.2",
+      "probe": "consumer_decision",
+      "setup": { "state": "scored", "score": 10, "confidence": 20, "age_secs": 0 },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "deny_low_confidence" }
+    },
+    {
+      "id": "CONS-004",
+      "level": "must",
+      "title": "consumer denies a score past its freshness bound",
+      "clause": "10.3",
+      "probe": "consumer_decision",
+      "setup": { "state": "scored", "score": 10, "confidence": 90, "age_secs": 604801 },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "deny_stale" }
+    },
+    {
+      "id": "CONS-005",
+      "level": "must",
+      "title": "consumer denies an unknown subject",
+      "clause": "10.2",
+      "probe": "consumer_decision",
+      "setup": { "state": "unknown_subject" },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "deny_no_score" }
+    },
+    {
+      "id": "CONS-006",
+      "level": "must",
+      "title": "consumer denies a subject whose score equals the threshold",
+      "clause": "10.2",
+      "probe": "consumer_decision",
+      "setup": { "state": "scored", "score": 75, "confidence": 90, "age_secs": 0 },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "deny_high_risk" }
+    },
+    {
+      "id": "CONS-007",
+      "level": "must",
+      "title": "an unreachable provider denies under fail-closed",
+      "clause": "7.1",
+      "probe": "consumer_decision_unavailable",
+      "setup": { "state": "unavailable" },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_closed"
+      },
+      "expect": { "kind": "decision", "decision": "deny_provider_unavailable" }
+    },
+    {
+      "id": "CONS-008",
+      "level": "must",
+      "title": "an unreachable provider allows only under an explicit fail-open policy",
+      "clause": "7.1",
+      "probe": "consumer_decision_unavailable",
+      "setup": { "state": "unavailable" },
+      "args": {
+        "threshold": 75,
+        "min_confidence": 50,
+        "max_age_secs": 604800,
+        "on_unavailable": "fail_open"
+      },
+      "expect": { "kind": "decision", "decision": "allow" }
+    }
+  ]
+}
