@@ -163,3 +163,115 @@ pub fn all_actions() -> &'static [(u8, &'static str)] {
         (GOV_ACTION_PROPOSE_UPGRADE, GOV_ACTION_NAME_PROPOSE_UPGRADE),
     ]
 }
+
+// ── Governed parameter registry ───────────────────────────────────────────────
+//
+// Issue #1172: every governed parameter must have an on-chain provenance
+// record (last-changed ledger, action id, actor-set digest, previous-value
+// digest) that is updated atomically inside the shared setter path.  The
+// registry below is the single source of truth for *which* parameters are
+// governed and *which* governance action owns each one.  The structural test
+// required by the acceptance criteria iterates this table and asserts that
+// every entry has a matching provenance update in the shared setter path.
+
+/// Stable identifier for a governed configuration parameter.
+///
+/// Discriminants are frozen once assigned, exactly like `GOV_ACTION_*`:
+/// off-chain drift-detection tooling keys provenance records by this value,
+/// so reassigning one would silently mis-attribute historical changes.
+pub const PARAM_RESERVED: u8 = 0x00;
+
+/// `service_address` — the single authorised scoring service address.
+pub const PARAM_SERVICE_ADDRESS: u8 = 0x01;
+
+/// `service_signers` — the M-of-N service signer set.
+pub const PARAM_SERVICE_SIGNERS: u8 = 0x02;
+
+/// `admin_threshold` — required quorum for admin M-of-N operations.
+pub const PARAM_ADMIN_THRESHOLD: u8 = 0x03;
+
+/// `paused` — global circuit-breaker flag.
+pub const PARAM_PAUSED: u8 = 0x04;
+
+/// `upgrade_hash` — committed WASM hash for the pending upgrade.
+pub const PARAM_UPGRADE_HASH: u8 = 0x05;
+
+/// Human-readable name for [`PARAM_SERVICE_ADDRESS`].
+pub const PARAM_NAME_SERVICE_ADDRESS: &str = "svc_addr";
+
+/// Human-readable name for [`PARAM_SERVICE_SIGNERS`].
+pub const PARAM_NAME_SERVICE_SIGNERS: &str = "svc_sigs";
+
+/// Human-readable name for [`PARAM_ADMIN_THRESHOLD`].
+pub const PARAM_NAME_ADMIN_THRESHOLD: &str = "adm_thr";
+
+/// Human-readable name for [`PARAM_PAUSED`].
+pub const PARAM_NAME_PAUSED: &str = "paused";
+
+/// Human-readable name for [`PARAM_UPGRADE_HASH`].
+pub const PARAM_NAME_UPGRADE_HASH: &str = "upg_hash";
+
+/// Returns the stable human-readable name for a governed parameter, or
+/// `"unknown"` for unrecognised values.
+pub fn param_name(discriminant: u8) -> &'static str {
+    match discriminant {
+        PARAM_SERVICE_ADDRESS => PARAM_NAME_SERVICE_ADDRESS,
+        PARAM_SERVICE_SIGNERS => PARAM_NAME_SERVICE_SIGNERS,
+        PARAM_ADMIN_THRESHOLD => PARAM_NAME_ADMIN_THRESHOLD,
+        PARAM_PAUSED => PARAM_NAME_PAUSED,
+        PARAM_UPGRADE_HASH => PARAM_NAME_UPGRADE_HASH,
+        _ => "unknown",
+    }
+}
+
+/// Returns `true` when `discriminant` is a known, non-reserved parameter id.
+pub fn is_known_param(discriminant: u8) -> bool {
+    param_name(discriminant) != "unknown" && discriminant != PARAM_RESERVED
+}
+
+/// Returns an ordered slice of every governed `(param_id, name, action_id)`
+/// triple.
+///
+/// The third element is the governance action that is permitted to mutate the
+/// parameter.  The structural test over this registry asserts that each entry
+/// has a provenance update wired into the shared setter path, so a newly added
+/// parameter cannot ship without provenance.
+pub fn all_governed_params() -> &'static [(u8, &'static str, u8)] {
+    &[
+        (
+            PARAM_SERVICE_ADDRESS,
+            PARAM_NAME_SERVICE_ADDRESS,
+            GOV_ACTION_SET_SERVICE,
+        ),
+        (
+            PARAM_SERVICE_SIGNERS,
+            PARAM_NAME_SERVICE_SIGNERS,
+            GOV_ACTION_ADD_SERVICE_SIGNER,
+        ),
+        (
+            PARAM_ADMIN_THRESHOLD,
+            PARAM_NAME_ADMIN_THRESHOLD,
+            GOV_ACTION_SET_ADMIN_THRESHOLD,
+        ),
+        (PARAM_PAUSED, PARAM_NAME_PAUSED, GOV_ACTION_PAUSE),
+        (
+            PARAM_UPGRADE_HASH,
+            PARAM_NAME_UPGRADE_HASH,
+            GOV_ACTION_PROPOSE_UPGRADE,
+        ),
+    ]
+}
+
+/// Returns the governance action id that owns `param_id`, or
+/// [`GOV_ACTION_RESERVED`] when the parameter is unknown.
+pub fn param_action(param_id: u8) -> u8 {
+    let mut i = 0;
+    let params = all_governed_params();
+    while i < params.len() {
+        if params[i].0 == param_id {
+            return params[i].2;
+        }
+        i += 1;
+    }
+    GOV_ACTION_RESERVED
+}

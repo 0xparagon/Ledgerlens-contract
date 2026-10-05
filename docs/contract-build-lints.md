@@ -39,6 +39,14 @@ failure:
 - private numerical/accumulator helpers retained for compatibility tests and
   planned feature paths; each is annotated individually in `lib.rs`
 - `contracts/ledgerlens-aggregator/src/test.rs`
+- `contracts/reference-provider`, which is intentionally excluded from the list
+  in `tools/check_contract_build_lints.sh`. It is a non-production reference
+  implementation, not a deployed production contract, so the "looks covered in
+  native tests but is dead in the deployable WASM build" drift this policy
+  exists to catch is not a risk there; its surface is held to the conformance
+  suite in `tests/conformance/` and to workspace `clippy` instead. If it is ever
+  promoted to a deployed contract, add it to `PACKAGES` in that script in the
+  same change.
 - doctest and shell-test harness code used only to verify host tooling
 
 Those paths are still expected to stay purposeful. They are not part of the

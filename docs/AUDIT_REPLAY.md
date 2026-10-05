@@ -11,6 +11,42 @@ Audit replay testing verifies a fundamental property: **All contract state trans
 3. **Regulatory compliance**: Maintaining a tamper-proof audit trail
 4. **Interoperability**: Third-party systems can operate without read access to contract storage
 
+## Deterministic Partitioned Parallel Replay
+
+Replaying large historical snapshots sequentially is slow, so regression runs are limited to small corpora. Contract state for different wallet and pair keys is independent except for global counters and configuration, which means replay can be partitioned and executed in parallel.
+
+### Partitioning Rule
+
+Events are partitioned by their **primary key** — the `(wallet, asset_pair)` pair for score/dispute/escalation workflows, or the admin/governance key for administrative workflows. Two events may be replayed concurrently only when they touch disjoint keys.
+
+Events that mutate **global state** (global counters, configuration, upgrade state) cannot be assigned to a single partition. These are treated as **ordered barriers**:
+
+- A barrier event is replayed only after every partition that precedes it in the original event order has drained.
+- Partitions that follow the barrier are not started until the barrier completes.
+- This preserves the exact global-state ordering of sequential replay while still allowing the independent segments between barriers to run in parallel.
+
+### Deterministic Merging
+
+Each partition produces its own ordered event log. After all partitions for a segment complete, their logs are merged back into the original global order using the event's stable sequence number (not thread completion order). Because merging is keyed on the sequence number, the merged output — including bundle hashes — is **byte-identical to sequential replay regardless of thread count**.
+
+### `--verify-sequential` Mode
+
+For small inputs, the replay tool supports a cross-check mode:
+
+```
+replay --input <snapshot> --verify-sequential
+```
+
+In this mode the tool runs both the sequential and the partitioned parallel replay, then asserts that the resulting bundle hashes are identical. Any divergence is reported as a hard failure with the earliest offending event, so the mode can be used as a regression guard in CI on small fixtures.
+
+### Failure Attribution
+
+When a replay fails, the tool reports the **earliest offending event** deterministically. Because partitions are merged by sequence number and barriers enforce global ordering, the first failing event in the merged log is always the same event that would fail in sequential replay, independent of worker count.
+
+### Scaling
+
+Scaling is measured on a large synthetic corpus for at least 1, 4 and 16 workers. The reported metrics are wall-clock speedup relative to the 1-worker baseline and the parallel efficiency at each worker count. Results are documented alongside the replay tooling so regressions in scaling are visible.
+
 ## Testing Strategy
 
 The audit replay test suite verifies that:
@@ -250,74 +286,4 @@ fn test_audit_replay_score_lifecycle() {
     env.ledger().set_timestamp(env.ledger().timestamp() + FINALITY_BUFFER);
     
     // Commit score
-    contract.commit_score(&wallet, &asset_pair);
-    
-    // Collect events
-    let events = env.events().all();
-    
-    // Verify event sequence
-    let relevant_events: Vec<_> = events
-        .iter()
-        .filter(|(_, topics, _)| {
-            let event_name = topics.get(0)?;
-            matches!(event_name, ... /* score or scr_comm */)
-        })
-        .collect();
-    
-    // Should have score_submitted and score_committed
-    assert!(relevant_events.len() >= 2);
-}
-```yaml
-
-### Example 2: Admin Transfer Audit
-
-```rust
-#[test]
-fn test_audit_replay_admin_transfer() {
-    let env = Env::default();
-    env.mock_all_auths();
-    
-    let contract = register_contract(&env);
-    contract.initialize(&admin, &service);
-    
-    let new_admin = Address::generate(&env);
-    
-    // Initiate transfer
-    contract.initiate_admin_transfer(&new_admin);
-    
-    // Accept transfer
-    contract.accept_admin_transfer();
-    
-    // Verify events form a complete workflow
-    let events = env.events().all();
-    
-    let mut found_init = false;
-    let mut found_accept = false;
-    
-    for (_, topics, _) in events.iter() {
-        if let Some(event_name) = topics.get(0) {
-            match event_name.to_string().as_str() {
-                "adm_init" => found_init = true,
-                "adm_done" => found_accept = true,
-                _ => {}
-            }
-        }
-    }
-    
-    assert!(found_init && found_accept);
-}
-
-## Compliance Verification
-
-Audit replay tests verify compliance with:
-
-1. **Ledger Lenz Risk Management**: Events provide complete audit trail
-2. **Soroban Guarantees**: Events are tamper-proof and ordered
-3. **Off-Chain Indexers**: Third-party systems can operate without read access
-4. **Regulatory Requirements**: Fraud detection and state reconciliation
-
-## See Also
-
-- [Event Schema Stability](./EVENT_SCHEMA_STABILITY.md) - Stability of event formats
-- [Event Causality](./EVENT_CAUSALITY.md) - Linking related events
-- [Deployment Checklist](./DEPLOYMENT_CHECKLIST.md) - Production sign-off process
+    contract.commit_s

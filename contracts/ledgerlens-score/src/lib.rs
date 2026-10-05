@@ -19,7 +19,22 @@ mod events;
 mod governance_actions;
 #[cfg(any(test, feature = "testutils"))]
 mod invariants;
+
+#[cfg(feature = "testutils")]
+pub fn check_invariants_for_fuzz(env: &soroban_sdk::Env) {
+    invariants::invariant_check(env);
+}
+
+/// Pure fee-tier computation for the tiered gate fee schedule; see
+/// `rent_relay_credits.rs` for where it's wired into `query_risk_gate_metered`.
+mod fee_schedule;
 mod parameter_governance;
+/// Second `#[contractimpl]` block for `LedgerLensScoreContract`, kept in its
+/// own file rather than inline in this one to avoid hand-editing an already
+/// very large `impl` block: permissionless keeper TTL-extension rewards,
+/// the permissionless attested-relay path, prepaid gate-query credits, and
+/// the tiered gate fee schedule.
+mod rent_relay_credits;
 mod storage;
 mod types;
 mod verkle;
@@ -53,6 +68,14 @@ mod test_batch_ttl_optimization;
 mod test_storage_contracts;
 #[cfg(test)]
 mod test_ttl_rent_manager;
+#[cfg(test)]
+mod test_keeper_rewards;
+#[cfg(test)]
+mod test_relay_attestation;
+#[cfg(test)]
+mod test_gate_credits;
+#[cfg(test)]
+mod test_gate_fee_tiers;
 
 #[cfg(test)]
 mod test_invariants;
@@ -228,16 +251,30 @@ mod test_signer_governance;
 mod test_storage_key_collisions;
 
 #[cfg(test)]
+mod test_tla_trace_validation;
+
+#[cfg(test)]
 mod test_schema_version_probes;
 
 #[cfg(test)]
 mod test_dos_read_patterns;
+
+#[cfg(test)]
+mod test_ledger_time_extremes;
 
 use soroban_sdk::{
     contract, contractimpl, crypto::Hash, symbol_short, token, Address, Bytes, BytesN, Env,
     IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
 };
 use subtle::ConstantTimeEq;
+
+// Build-verification metadata (SEP-55 convention) embedded in the WASM
+// `contractmetav0` custom section. Constant, so the build stays reproducible;
+// the commit is bound by the release attestation. See docs/build-verification.md.
+soroban_sdk::contractmeta!(
+    key = "source_repo",
+    val = "github:Ledger-Lenz/Ledgerlens-contract"
+);
 
 pub use constants::CONFIG_DRIFT_MANIFEST_FIELDS;
 pub use errors::Error;
@@ -249,17 +286,17 @@ pub use types::{
     AdaptiveRateLimit, AdaptiveThresholdConfig, AggregateRiskScore, AlertAckRecord, AlertType,
     AuditorScoreExport, BatchAttestation, BatchEntryResult, BatchResult, BatchScoreResult,
     ConfigExportBundle, ConfigExportEntry, DecayCurve, DeletionApprovalPolicy,
-    DeletionAuditWarning, DeletionPreflight, EffectiveRiskScore, EmbargoExpiry,
+    DeletionAuditWarning, DeletionPreflight, EffectiveRiskScore, EmbargoExpiry, FeeTier,
     FlashProtectionMode, HllSketch, InterfaceMetadata, InterpolationMethod, MaybeRiskScore,
     MaybeScoreAttestation, MaybeThresholdAttestation, ModelSubmission, ModelVersionStats,
     ModelVersionStatus, NormalizedSubmission, OperatorScoreExport, ParamChangeProposal, ParamValue,
     ParameterProposal, ParameterProposalRecord, ParameterProposalStatus, PendingConfigExportEntry,
     PendingScoreEntry, Policy, PolicyApproval, PolicyBundle, PolicyBundleProposal,
-    PublicScoreExport, RiskScore, ScoreAttestation, ScoreAttestationInput, ScoreDispute,
-    ScoreFloorPolicy, ScoreHistogram, ScoreQuery, ScoreSubmission, ScoreSubmissionWithProof,
-    ScoreTrend, ScoreVelocityCap, SignerAccuracyRecord, SignerState, SignerStateRecord,
-    SubmissionProvenance, ThresholdAttestation, TierBounds, TokenBucket, UpgradeProposal,
-    WelfordCorrState,
+    PublicScoreExport, RelayScoreAttestation, RiskScore, ScoreAttestation, ScoreAttestationInput,
+    ScoreDispute, ScoreFloorPolicy, ScoreHistogram, ScoreQuery, ScoreSubmission,
+    ScoreSubmissionWithProof, ScoreTrend, ScoreVelocityCap, SignerAccuracyRecord, SignerState,
+    SignerStateRecord, SubmissionProvenance, ThresholdAttestation, TierBounds, TokenBucket,
+    UpgradeProposal, WelfordCorrState,
 };
 /// The 32-byte all-zeros field element used as the value in non-membership proofs.
 pub use verkle::NON_MEMBER_SENTINEL;
@@ -588,6 +625,47 @@ impl LedgerLensScoreContract {
             }
         }
 
+        Self::finalize_score_submission(
+            &env,
+            &signers,
+            &wallet,
+            &asset_pair,
+            score,
+            benford_flag,
+            ml_flag,
+            timestamp,
+            confidence,
+            model_version,
+            commitment,
+        )
+    }
+
+    /// Shared submission finalization, extracted from `submit_score`'s tail
+    /// so the permissionless attested-relay path
+    /// (`relay_attested_score`, `rent_relay_credits.rs`) can reuse the exact
+    /// same finality-buffer / flash-protection / HLL-tracking / rate-limit
+    /// bookkeeping instead of duplicating and risking drift from it. Pure
+    /// refactor: behavior for `submit_score` callers is unchanged.
+    ///
+    /// `signers` is only consulted for `PendingScoreEntry::submitted_by`
+    /// when the finality buffer is active and the service set is non-empty;
+    /// callers with no meaningful signer list (e.g. the relay path, which is
+    /// always a single-key service attestation) may pass an empty `Vec` —
+    /// the existing fallback (`storage::get_service`) resolves it correctly.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_score_submission(
+        env: &Env,
+        signers: &Vec<Address>,
+        wallet: &Address,
+        asset_pair: &Symbol,
+        score: u32,
+        benford_flag: bool,
+        ml_flag: bool,
+        timestamp: u64,
+        confidence: u32,
+        model_version: u32,
+        commitment: Option<Bytes>,
+    ) -> Result<(), Error> {
         // ── issue #686: normalize first, validate second ───────────────────
         // All raw caller fields are collected into a `NormalizedSubmission`
         // before any range or model-version checks run.  This is the single
@@ -605,7 +683,7 @@ impl LedgerLensScoreContract {
             model_version,
             commitment.clone(),
         );
-        Self::validate_normalized_submission(&env, &ns)?;
+        Self::validate_normalized_submission(env, &ns)?;
 
         let risk_score = RiskScore {
             score: ns.score,
@@ -621,10 +699,10 @@ impl LedgerLensScoreContract {
         };
 
         // Flash-loan protection: check for same-ledger gate-read + submit (#300).
-        if let Some(gate_seq) = storage::get_gate_read_ledger(&env, &wallet, &asset_pair) {
+        if let Some(gate_seq) = storage::get_gate_read_ledger(env, wallet, asset_pair) {
             if gate_seq == env.ledger().sequence() {
-                events::suspicious_same_ledger_submission(&env, &wallet, &asset_pair, gate_seq);
-                if storage::get_flash_protection_mode(&env)
+                events::suspicious_same_ledger_submission(env, wallet, asset_pair, gate_seq);
+                if storage::get_flash_protection_mode(env)
                     == crate::types::FlashProtectionMode::Reject
                 {
                     return Err(Error::EpochClosed);
@@ -632,28 +710,28 @@ impl LedgerLensScoreContract {
             }
         }
 
-        let buffer = storage::get_finality_buffer_secs(&env);
+        let buffer = storage::get_finality_buffer_secs(env);
         // ── HLL first-time detection ──────────────────────────────────────────
-        if storage::get_score_count(&env, &wallet, &asset_pair) == 0 {
-            storage::hll_update(&env, &asset_pair, &wallet);
+        if storage::get_score_count(env, wallet, asset_pair) == 0 {
+            storage::hll_update(env, asset_pair, wallet);
         }
 
         if buffer == 0 {
             // Disabled — commit straight to live storage.
-            Self::write_score_with_rate_limit(&env, &wallet, &asset_pair, &risk_score)?;
-            Self::record_service_activity(&env);
+            Self::write_score_with_rate_limit(env, wallet, asset_pair, &risk_score)?;
+            Self::record_service_activity(env);
         } else {
             // Buffer active — validate but hold in pending storage.
             // Rate limit still applies so we can't be flooded with pending entries.
-            let last_submit = storage::get_last_submit_time(&env, &wallet, &asset_pair);
-            let base_cooldown = storage::get_pair_cooldown_secs(&env, &asset_pair);
-            let cooldown = Self::compute_effective_cooldown(&env, &asset_pair, base_cooldown);
+            let last_submit = storage::get_last_submit_time(env, wallet, asset_pair);
+            let base_cooldown = storage::get_pair_cooldown_secs(env, asset_pair);
+            let cooldown = Self::compute_effective_cooldown(env, asset_pair, base_cooldown);
             let now2 = env.ledger().timestamp();
             if last_submit != 0 && now2 < last_submit.saturating_add(cooldown) {
                 return Err(Error::RateLimitExceeded);
             }
-            storage::set_last_submit_time(&env, &wallet, &asset_pair, now2);
-            Self::record_service_activity(&env);
+            storage::set_last_submit_time(env, wallet, asset_pair, now2);
+            Self::record_service_activity(env);
 
             let commit_after = now2.saturating_add(buffer);
             let pending = PendingScoreEntry {
@@ -665,15 +743,15 @@ impl LedgerLensScoreContract {
                 model_version: ns.model_version,
                 timestamp: ns.timestamp,
                 commit_after,
-                submitted_by: if !storage::get_service_set(&env).is_empty() {
-                    signers.get(0).unwrap_or_else(|| storage::get_service(&env))
+                submitted_by: if !storage::get_service_set(env).is_empty() {
+                    signers.get(0).unwrap_or_else(|| storage::get_service(env))
                 } else {
-                    storage::get_service(&env)
+                    storage::get_service(env)
                 },
                 commitment: ns.commitment.clone(),
             };
-            storage::set_pending_score(&env, &wallet, &asset_pair, &pending);
-            events::score_pending(&env, &wallet, &asset_pair, commit_after);
+            storage::set_pending_score(env, wallet, asset_pair, &pending);
+            events::score_pending(env, wallet, asset_pair, commit_after);
         }
         Ok(())
     }
@@ -4710,11 +4788,16 @@ impl LedgerLensScoreContract {
     /// information about as potentially risky rather than waving them through.
     ///
     /// This function is **infallible** (returns `bool`, never `Result`) and
-    /// **side-effect free** — it performs a pure read that does not even
-    /// extend storage TTL. It is designed to be called directly from inside
-    /// another contract's authorization / guard logic: it can never panic and
-    /// can never propagate an `Error` back into the caller, so it cannot be
-    /// used to grief the calling protocol's gas or disable its security guard.
+    /// writes **no durable state** — it reads scores without extending their
+    /// TTL. The one write on this path is a bounded *temporary* per-`(wallet,
+    /// asset_pair)` gate-read marker used by the flash-loan protection path
+    /// (#300); it is not consulted by the decision, and it expires with the
+    /// entry it describes. A liveness alert may also be emitted while a read is
+    /// served, if the heartbeat threshold has been exceeded. It is designed to
+    /// be called directly from inside another contract's authorization / guard
+    /// logic: it can never panic and can never propagate an `Error` back into
+    /// the caller, so it cannot be used to grief the calling protocol's gas or
+    /// disable its security guard.
     ///
     /// This function delegates to [`query_risk_gate_with_confidence`] with
     /// `min_confidence = 0`, meaning no confidence floor is applied. All
@@ -5116,6 +5199,26 @@ impl LedgerLensScoreContract {
     }
 
     /// Returns the baked-in ABI/contract version.
+    ///
+    /// A freshly deployed instance answers with the compile-time
+    /// [`CONTRACT_VERSION`](crate::constants::CONTRACT_VERSION) baked into the WASM.
+    /// The stored key exists so a migration can repoint the value, and nothing
+    /// writes it today.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
+    /// # use ledgerlens_score::constants::CONTRACT_VERSION;
+    /// # use soroban_sdk::Env;
+    /// let env = Env::default();
+    /// let contract_id = env.register_contract(None, LedgerLensScoreContract);
+    /// let client = LedgerLensScoreContractClient::new(&env, &contract_id);
+    ///
+    /// // Compared against the constant, not a literal, so a version bump cannot
+    /// // silently invalidate this example.
+    /// assert_eq!(client.get_contract_version(), CONTRACT_VERSION);
+    /// ```
     pub fn get_contract_version(env: Env) -> u32 {
         storage::get_contract_version(&env)
     }
@@ -5132,8 +5235,38 @@ impl LedgerLensScoreContract {
     /// embargoed, inside the hysteresis risk band, or the confidence floor
     /// is not met.
     ///
-    /// This function is infallible (returns `bool`, never `Result`) and
-    /// side-effect free — it performs pure reads that do not extend TTL.
+    /// This function is infallible (returns `bool`, never `Result`) and reads
+    /// scores without extending their TTL. See [`query_risk_gate`] for the exact
+    /// scope of the temporary gate-read marker and the liveness-alert caveat.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
+    /// # use soroban_sdk::{testutils::Address as _, symbol_short, Env, Address, Vec};
+    /// let env = Env::default();
+    /// env.mock_all_auths();
+    /// let contract_id = env.register_contract(None, LedgerLensScoreContract);
+    /// let client = LedgerLensScoreContractClient::new(&env, &contract_id);
+    /// let admin = Address::generate(&env);
+    /// let service = Address::generate(&env);
+    /// client.initialize(&admin, &service);
+    ///
+    /// let wallet = Address::generate(&env);
+    /// let pair = symbol_short!("XLM_USDC");
+    /// // Score 30 with confidence 90: inside the threshold with room to spare.
+    /// client.submit_score(&Vec::new(&env), &wallet, &pair, &30, &false, &false, &1, &90, &1, &None);
+    ///
+    /// // The caller is satisfied by a confidence floor of 80.
+    /// assert!(client.query_risk_gate_with_confidence(&wallet, &pair, &75, &80));
+    ///
+    /// // Same score, same threshold — but the caller demands more confidence
+    /// // than the score carries, so the gate refuses.
+    /// assert!(!client.query_risk_gate_with_confidence(&wallet, &pair, &75, &95));
+    ///
+    /// // A floor of 0 is the plain `query_risk_gate` path, which delegates here.
+    /// assert!(client.query_risk_gate_with_confidence(&wallet, &pair, &75, &0));
+    /// ```
     pub fn query_risk_gate_with_confidence(
         env: Env,
         wallet: Address,
@@ -5441,6 +5574,28 @@ impl LedgerLensScoreContract {
     /// Returns [`Error::ServiceSetFull`] when the set already contains
     /// `MAX_SERVICE_SIGNERS` members, [`Error::SignerAlreadyInSet`] when
     /// `signer` is already present.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
+    /// # use soroban_sdk::{testutils::Address as _, Env, Address, Vec};
+    /// let env = Env::default();
+    /// env.mock_all_auths();
+    /// let contract_id = env.register_contract(None, LedgerLensScoreContract);
+    /// let client = LedgerLensScoreContractClient::new(&env, &contract_id);
+    /// let admin = Address::generate(&env);
+    /// let service = Address::generate(&env);
+    /// client.initialize(&admin, &service);
+    /// let signer = Address::generate(&env);
+    /// // The service set starts empty and is grown by the admin.
+    /// assert_eq!(client.get_service_signer_count(), 0);
+    /// client.add_service_signer(&Vec::new(&env), &signer);
+    /// assert_eq!(client.get_service_signer_count(), 1);
+    /// assert!(client.get_service_signers().contains(&signer));
+    /// // Onboarding the same signer twice is rejected rather than duplicated.
+    /// assert!(client.try_add_service_signer(&Vec::new(&env), &signer).is_err());
+    /// ```
     pub fn add_service_signer(
         env: Env,
         admin_signers: Vec<Address>,
@@ -5487,6 +5642,29 @@ impl LedgerLensScoreContract {
     /// Returns [`Error::SignerNotInSet`] when `signer` is not in the set.
     /// If removing the signer would make the set smaller than the current
     /// threshold, the threshold is automatically reduced to the new set size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use ledgerlens_score::{LedgerLensScoreContract, LedgerLensScoreContractClient};
+    /// # use soroban_sdk::{testutils::Address as _, Env, Address, Vec};
+    /// let env = Env::default();
+    /// env.mock_all_auths();
+    /// let contract_id = env.register_contract(None, LedgerLensScoreContract);
+    /// let client = LedgerLensScoreContractClient::new(&env, &contract_id);
+    /// let admin = Address::generate(&env);
+    /// let service = Address::generate(&env);
+    /// client.initialize(&admin, &service);
+    /// let signer = Address::generate(&env);
+    /// client.add_service_signer(&Vec::new(&env), &signer);
+    /// assert_eq!(client.get_service_signer_count(), 1);
+    /// // Revoking a signer removes it from the set ...
+    /// client.remove_service_signer(&Vec::new(&env), &signer);
+    /// assert_eq!(client.get_service_signer_count(), 0);
+    /// assert!(!client.get_service_signers().contains(&signer));
+    /// // ... and a second removal of the same address is rejected.
+    /// assert!(client.try_remove_service_signer(&Vec::new(&env), &signer).is_err());
+    /// ```
     pub fn remove_service_signer(
         env: Env,
         admin_signers: Vec<Address>,
@@ -6197,6 +6375,9 @@ impl LedgerLensScoreContract {
         if !storage::validate_pubkey_format(&new_key) {
             return Err(Error::InvalidPubkeyLength);
         }
+        if overlap_secs > constants::MAX_KEY_OVERLAP_SECS {
+            return Err(Error::InvalidKeyOverlap);
+        }
         Self::require_admin_auth(&env, &admin_signers)?;
         // Any previous pending key is superseded.
         storage::clear_pending_service_pubkey(&env);
@@ -6359,6 +6540,9 @@ impl LedgerLensScoreContract {
         }
         if new_key.len() != 33 && new_key.len() != 65 {
             return Err(Error::InvalidPubkeyLength);
+        }
+        if overlap_secs > constants::MAX_KEY_OVERLAP_SECS {
+            return Err(Error::InvalidKeyOverlap);
         }
         Self::require_admin_auth(&env, &admin_signers)?;
         // Any previous pending key is superseded.
@@ -6559,6 +6743,11 @@ impl LedgerLensScoreContract {
     pub fn set_reveal_window(env: Env, secs: u64) -> Result<(), Error> {
         if !storage::has_admin(&env) {
             return Err(Error::NotInitialized);
+        }
+        // Bounded because the value is converted from seconds to a u32 ledger
+        // count when the commitment is stored (storage::set_consensus_commitment).
+        if secs > constants::MAX_REVEAL_WINDOW_SECS {
+            return Err(Error::InvalidRevealWindow);
         }
         storage::get_admin(&env).require_auth();
         storage::set_reveal_window_secs(&env, secs);
@@ -10025,7 +10214,14 @@ impl LedgerLensScoreContract {
         }
 
         let score_delta = (last.score as i32) - (first.score as i32);
-        let momentum = score_delta / (time_delta as i32);
+        // Both history timestamps are caller-supplied `submit_score` arguments
+        // (rejected only when zero), so `time_delta` can be any u64 — including
+        // exactly 2^32, which `as i32` truncates to 0 and turns the division
+        // below into a divide-by-zero panic. Widen both operands instead: for
+        // every value the old expression survived, i64 division truncating
+        // toward zero gives the identical i32 result.
+        let momentum = (score_delta as i64) / (time_delta as i64);
+        let momentum = momentum.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
 
         let alert_threshold = storage::get_momentum_alert_threshold(&env);
         if alert_threshold > 0 && momentum > alert_threshold as i32 {

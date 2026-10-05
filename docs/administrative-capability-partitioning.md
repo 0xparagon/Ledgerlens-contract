@@ -88,3 +88,76 @@ No unbounded loop or caller-controlled iteration is introduced.
   unchanged `require_admin_auth` result. Only after an operator opts a
   policy in via `set_policy_approval` does that policy's mapped endpoints
   require the extra approver signature.
+
+## Feature-flag registry with timelocked kill switches (#1151)
+
+Issue #1151 adds a second, orthogonal administrative control: a governed
+feature-flag registry that lets an individual *optional subsystem* be
+disabled quickly, while re-enabling it stays subject to a timelock. This
+is deliberately separate from the capability partitioning above —
+partitioning decides *who* may call a privileged endpoint; the flag
+registry decides *whether* a subsystem's entry points are live at all.
+
+### Flag set and "disabled" semantics
+
+`FeatureFlag` (in `types.rs`) names one stable identifier per optional
+subsystem. Each flag documents what "disabled" means for its entry
+points — reject writes, reject reads, or both:
+
+| Flag | Subsystem | Disabled means |
+|---|---|---|
+| `ZkRangeProofs` | zero-knowledge range proofs | reject writes and reads |
+| `VerkleCommitments` | Verkle commitments | reject writes and reads |
+| `Delegation` | delegation | reject writes (reads still served) |
+| `Disputes` | disputes | reject writes (reads still served) |
+| `Escrow` | escrow | reject writes and reads |
+| `OracleAdapter` | oracle adapter | reject writes (reads still served) |
+
+### Fast disable, timelocked enable
+
+- **Disabling is fast**: `disable_feature(env, flag)` requires only
+  guardian-level authorisation (`require_guardian_auth`) and takes effect
+  immediately, so a defect can be contained without waiting on a quorum.
+- **Enabling is slow**: `propose_enable_feature(env, flag)` records a
+  pending enable with an `enable_after` ledger, and
+  `execute_enable_feature(env, flag)` only succeeds once that ledger has
+  passed. Both the proposal and the execution require the higher-quorum
+  admin path (`require_admin_auth`), so re-enabling a subsystem needs more
+  authority *and* more time than disabling it.
+- Both transitions emit events: `feat_dis` on disable and `feat_en` on
+  enable, each carrying the flag identifier and the resulting state.
+
+### One shared check helper
+
+Every guarded entry point of a flagged module calls the single helper
+`Self::require_feature_enabled(env, flag)` before doing any work. The
+helper reads the flag's state once and returns `Error::FeatureDisabled`
+when the subsystem is off, so the check is uniform and cannot drift
+between entry points.
+
+### Structural test
+
+`test_feature_flag_coverage.rs` enumerates the public entry points of each
+flagged module and asserts that each one routes through
+`require_feature_enabled`. Adding a new public entry point to a flagged
+module without the check makes this test fail, so the guard cannot be
+silently skipped.
+
+### Discovery via `supports_interface`
+
+Flags are published through `supports_interface` so consumers can detect a
+disabled subsystem and degrade gracefully instead of calling into a
+rejected entry point.
+
+### Interaction with global pause and pair pause
+
+- **Global pause** (`pause` / `unpause`, `EmergencyPause` policy) halts
+  *all* entry points. A feature flag is narrower: it disables one optional
+  subsystem while the rest of the contract keeps operating.
+- **Pair pause** halts operations for a specific pair only. A feature flag
+  is contract-wide for its subsystem and independent of any pair.
+- The three controls compose by conjunction: an entry point runs only when
+  the contract is not globally paused, its pair is not paused, *and* its
+  feature flag is enabled. Disabling a flag never bypasses global or pair
+  pause, and pausing globally or per-pair never re-enables a disabled
+  subsystem.
