@@ -85,6 +85,46 @@ For each pending record:
 - `proposal_id == 0` means legacy simple pending change
 - `proposal_id > 0` means parameter-governance proposal ID
 
+## Provenance index in schema v1
+
+Every governed parameter carries an on-chain provenance record that is written
+atomically by the shared setter path, so it can never diverge from the stored
+value. The export surfaces this index so drift-detection tooling can compare
+last-changed metadata alongside values.
+
+Each provenance record is a compact fixed-width encoding:
+
+| Field | Meaning | Encoding |
+|---|---|---|
+| `last_changed_ledger` | Ledger sequence of the last accepted change | big-endian `u32` |
+| `action_id` | Governance action / proposal id that produced the change (`0` = direct setter) | big-endian `u64` |
+| `actor_set_digest` | SHA-256 over the ordered actor set that authorized the change | 32 bytes |
+| `prev_value_digest` | SHA-256 over the previous canonical value bytes | 32 bytes |
+
+Provenance entries are exported in the same fixed key order as `active_values`,
+so `provenance[i]` always corresponds to `active_values[i]`. The export adds:
+
+- `provenance_hash` — SHA-256 over ordered `(key, provenance)` entries
+- `provenance` — ordered list of `(key, provenance_record)` entries
+
+`export_hash` is computed over
+`(schema_version, active_hash, pending_hash, provenance_hash, omitted_secret_rationale)`.
+
+### Paginated provenance read
+
+`get_configuration_provenance(offset, limit)` returns a page of
+`(key, provenance_record)` entries in the same fixed key order used by the
+export. `offset` is a zero-based entry index and `limit` is clamped to a
+contract-defined maximum page size. The page is aligned with the export format
+so a full paginated sweep reproduces the `provenance` list exactly.
+
+### Storage bound and write cost
+
+Provenance is stored one record per governed parameter, so storage is bounded
+by the fixed active-key set (no unbounded growth). Each setter writes exactly
+one provenance record in addition to the value write: a documented increment of
+one `u32`, one `u64`, and two 32-byte digests (72 bytes) per setter call.
+
 ## Omitted-secret rationale
 
 The export intentionally omits material that is not stored on-chain:
@@ -99,7 +139,7 @@ plaintext itself.
 
 ## Compatibility impact
 
-- Public ABI: adds `export_configuration()`
-- Storage: no migration required for the export itself
-- Events: none for export reads
+- Public ABI: adds `export_configuration()` and `get_configuration_provenance(offset, limit)`
+- Storage: adds one bounded provenance record per governed parameter; no migration required for the export itself
+- Events: none for export or provenance reads
 

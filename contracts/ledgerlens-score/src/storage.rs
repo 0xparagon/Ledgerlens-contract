@@ -9,13 +9,13 @@ use crate::constants::{
 use crate::errors::Error;
 use crate::types::{
     AdaptiveRateLimit, AggregateRiskScore, AlertAckRecord, AlertType, DataKey, DataKeyB, DataKeyC,
-    DataKeyD, DecayCurve, DeletionApprovalPolicy, EmbargoExpiry, FlashProtectionMode, GateDataKey,
-    HllSketch, InterpolationMethod, JumpStats, ModelVersionStats, ModelVersionStatus,
-    PairVolatilityState, ParamChangeProposal, ParameterProposalRecord, ParameterProposalStatus,
-    PendingScoreEntry, Policy, PolicyApproval, PolicyBundleProposal, RateLimitOverrideEntry,
-    RiskScore, ScoreDispute, ScoreFloorPolicy, ScoreHistogram, ScoreTrend, ScoreVelocityCap,
-    SignerAccuracyRecord, SignerStateRecord, SubscorePayload, TokenBucket, UpgradeProposal,
-    WelfordCorrState,
+    DataKeyD, DataKeyF, DecayCurve, DeletionApprovalPolicy, EmbargoExpiry, FeeTier,
+    FlashProtectionMode, GateDataKey, HllSketch, InterpolationMethod, JumpStats,
+    ModelVersionStats, ModelVersionStatus, PairVolatilityState, ParamChangeProposal,
+    ParameterProposalRecord, ParameterProposalStatus, PendingScoreEntry, Policy, PolicyApproval,
+    PolicyBundleProposal, RateLimitOverrideEntry, RiskScore, ScoreDispute, ScoreFloorPolicy,
+    ScoreHistogram, ScoreTrend, ScoreVelocityCap, SignerAccuracyRecord, SignerStateRecord,
+    SubscorePayload, TokenBucket, UpgradeProposal, WelfordCorrState,
 };
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
@@ -2124,7 +2124,11 @@ pub fn set_consensus_commitment(
     commitment: &soroban_sdk::BytesN<32>,
 ) {
     let key = DataKeyC::ConsensusCommitment(model.clone(), wallet.clone(), asset_pair.clone());
-    let ttl = get_reveal_window_secs(env) as u32;
+    // `ledgers_to_live` is a u32 on the host side, and the reveal window is an
+    // unvalidated admin u64. `as u32` would truncate (a 2^32 window becomes 0,
+    // collapsing the entry's life to the 12-ledger floor and making the reveal
+    // permanently impossible), so saturate at the top of the range instead.
+    let ttl = u32::try_from(get_reveal_window_secs(env)).unwrap_or(u32::MAX);
     let ledgers_to_live = (ttl / 5).max(12);
     env.storage().temporary().set(&key, commitment);
     env.storage().temporary().extend_ttl(&key, ledgers_to_live, ledgers_to_live);
@@ -2281,7 +2285,16 @@ pub fn check_signer_expired(env: &Env, signer: &Address) -> Result<(), crate::er
     }
     if let Some(age) = get_signer_age(env, signer) {
         let grace = get_signer_grace_period(env);
-        if age > ttl + grace {
+        // `age > ttl + grace`, written without the addition. `ttl` and `grace`
+        // are independent admin-supplied u64s, so `ttl + grace` can exceed
+        // u64::MAX; with `overflow-checks = true` and `panic = "abort"` in the
+        // release profile that is a panic, not a wrap, and this function is on
+        // the score-submission path — so an admin configuration of
+        // (u64::MAX, 1) would abort every future submission. Saturating the
+        // subtraction gives the same answer for every non-overflowing pair:
+        // when `age <= ttl` the difference is 0 and `0 > grace` is false unless
+        // grace is 0, in which case `age > ttl + 0` is false too.
+        if age.saturating_sub(ttl) > grace {
             crate::events::signer_expired(env, signer);
             return Err(crate::errors::Error::UnauthorizedSigner);
         }
@@ -3453,6 +3466,362 @@ pub fn set_breach_count(env: &Env, wallet: &Address, asset_pair: &Symbol, count:
 pub fn clear_breach_count(env: &Env, wallet: &Address, asset_pair: &Symbol) {
     let key = DataKeyC::BreachCount(wallet.clone(), asset_pair.clone());
     env.storage().persistent().remove(&key);
+}
+
+// ── Keeper TTL reward pool ───────────────────────────────────────────────────
+
+pub fn get_keeper_reward_token(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKeyF::KeeperRewardToken)
+}
+
+pub fn set_keeper_reward_token(env: &Env, token: &Address) {
+    env.storage().instance().set(&DataKeyF::KeeperRewardToken, token);
+}
+
+pub fn get_keeper_reward_pool(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::KeeperRewardPool).unwrap_or(0)
+}
+
+pub fn credit_keeper_reward_pool(env: &Env, amount: i128) -> i128 {
+    let new_balance = get_keeper_reward_pool(env).saturating_add(amount);
+    env.storage().instance().set(&DataKeyF::KeeperRewardPool, &new_balance);
+    new_balance
+}
+
+/// Debits `amount` from the keeper reward pool. Never lets the pool go
+/// negative — returns `Error::ArithmeticOverflow` if `amount` exceeds the
+/// current balance rather than silently clamping, so a caller bug can't
+/// quietly pay out more than the pool actually holds.
+pub fn debit_keeper_reward_pool(env: &Env, amount: i128) -> Result<(), Error> {
+    let balance = get_keeper_reward_pool(env);
+    if amount > balance {
+        return Err(Error::ArithmeticOverflow);
+    }
+    env.storage().instance().set(&DataKeyF::KeeperRewardPool, &(balance - amount));
+    Ok(())
+}
+
+pub fn get_keeper_reward_per_entry(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::KeeperRewardPerEntry).unwrap_or(0)
+}
+
+pub fn get_keeper_reward_window(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKeyF::KeeperRewardWindow)
+        .unwrap_or(crate::constants::DEFAULT_KEEPER_REWARD_WINDOW)
+}
+
+pub fn get_keeper_reward_per_ledger_cap(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::KeeperRewardPerLedgerCap).unwrap_or(0)
+}
+
+pub fn set_keeper_reward_params(env: &Env, per_entry: i128, window: u32, per_ledger_cap: i128) {
+    env.storage().instance().set(&DataKeyF::KeeperRewardPerEntry, &per_entry);
+    env.storage().instance().set(&DataKeyF::KeeperRewardWindow, &window);
+    env.storage().instance().set(&DataKeyF::KeeperRewardPerLedgerCap, &per_ledger_cap);
+}
+
+/// O(1) eligibility check: an entry is keeper-reward-eligible exactly when
+/// its estimated remaining TTL (the same conservative estimate
+/// `get_expiring_entries` uses) has dropped to or below the configured
+/// reward window. Reusing `estimate_entry_ttl` means this is a single
+/// storage read, and reusing the existing touch-based estimate means a
+/// renewed entry's remaining TTL jumps back to `SCORE_TTL_THRESHOLD` — far
+/// outside any sane reward window — so the same entry can't be rewarded
+/// again until it has genuinely decayed back toward expiry. That is what
+/// bounds a keeper to being paid "only once per entry per window" without
+/// needing a separate last-rewarded marker.
+pub fn keeper_entry_eligible(env: &Env, wallet: &Address, asset_pair: &Symbol) -> bool {
+    match estimate_entry_ttl(env, wallet, asset_pair) {
+        Some(remaining) => remaining <= get_keeper_reward_window(env),
+        None => false,
+    }
+}
+
+fn keeper_reward_ledger_spent(env: &Env) -> i128 {
+    let key = DataKeyF::KeeperRewardLedgerSpent(env.ledger().sequence());
+    env.storage().temporary().get(&key).unwrap_or(0)
+}
+
+fn set_keeper_reward_ledger_spent(env: &Env, amount: i128) {
+    let key = DataKeyF::KeeperRewardLedgerSpent(env.ledger().sequence());
+    env.storage().temporary().set(&key, &amount);
+    // Only needs to survive long enough for other calls within the same
+    // ledger to see it; a short fixed TTL bounds its storage cost.
+    env.storage().temporary().extend_ttl(&key, 16, 16);
+}
+
+/// Computes how much of `requested_total` (the reward for entries renewed so
+/// far in this call) is still payable against both the pool balance and the
+/// per-ledger cap, without mutating any storage. Bounding logic is kept pure
+/// so `keeper_extend_entry_ttls` can call it once per candidate entry and
+/// only commit state once, at the end of the batch.
+pub fn keeper_reward_payable(env: &Env, requested_total: i128) -> i128 {
+    let pool = get_keeper_reward_pool(env);
+    let per_ledger_cap = get_keeper_reward_per_ledger_cap(env);
+    let mut payable = requested_total.min(pool);
+    if per_ledger_cap > 0 {
+        let already_spent = keeper_reward_ledger_spent(env);
+        let ledger_headroom = per_ledger_cap.saturating_sub(already_spent).max(0);
+        payable = payable.min(ledger_headroom);
+    }
+    payable
+}
+
+pub fn record_keeper_reward_spent(env: &Env, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let already_spent = keeper_reward_ledger_spent(env);
+    set_keeper_reward_ledger_spent(env, already_spent.saturating_add(amount));
+}
+
+// ── Permissionless attested relay ────────────────────────────────────────────
+
+pub fn is_relayed_attestation_used(env: &Env, digest: &BytesN<32>) -> bool {
+    env.storage().temporary().has(&DataKeyF::RelayedAttestationUsed(digest.clone()))
+}
+
+pub fn mark_relayed_attestation_used(env: &Env, digest: &BytesN<32>) {
+    let key = DataKeyF::RelayedAttestationUsed(digest.clone());
+    env.storage().temporary().set(&key, &true);
+    // Only needs to outlive the attestation's own validity window
+    // (`valid_before_ledger` is capped well inside a TTL threshold by
+    // callers), so a standard score-entry-sized TTL is generous headroom.
+    env.storage().temporary().extend_ttl(&key, SCORE_TTL_THRESHOLD, SCORE_TTL_EXTEND_TO);
+}
+
+pub fn get_relay_tip_token(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKeyF::RelayTipToken)
+}
+
+pub fn set_relay_tip_token(env: &Env, token: &Address) {
+    env.storage().instance().set(&DataKeyF::RelayTipToken, token);
+}
+
+pub fn get_relay_tip_pool(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::RelayTipPool).unwrap_or(0)
+}
+
+pub fn credit_relay_tip_pool(env: &Env, amount: i128) -> i128 {
+    let new_balance = get_relay_tip_pool(env).saturating_add(amount);
+    env.storage().instance().set(&DataKeyF::RelayTipPool, &new_balance);
+    new_balance
+}
+
+pub fn debit_relay_tip_pool(env: &Env, amount: i128) -> Result<(), Error> {
+    let balance = get_relay_tip_pool(env);
+    if amount > balance {
+        return Err(Error::ArithmeticOverflow);
+    }
+    env.storage().instance().set(&DataKeyF::RelayTipPool, &(balance - amount));
+    Ok(())
+}
+
+pub fn get_relay_tip_amount(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::RelayTipAmount).unwrap_or(0)
+}
+
+pub fn get_relay_tip_window_cap(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::RelayTipWindowCap).unwrap_or(0)
+}
+
+pub fn get_relay_tip_window_ledgers(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKeyF::RelayTipWindowLedgers).unwrap_or(1)
+}
+
+pub fn set_relay_tip_params(env: &Env, amount: i128, window_cap: i128, window_ledgers: u32) {
+    env.storage().instance().set(&DataKeyF::RelayTipAmount, &amount);
+    env.storage().instance().set(&DataKeyF::RelayTipWindowCap, &window_cap);
+    env.storage().instance().set(&DataKeyF::RelayTipWindowLedgers, &window_ledgers.max(1));
+}
+
+/// Returns how much of `tip` is still payable under the rolling
+/// `RelayTipWindowCap`, rolling the window forward (resetting the spent
+/// counter to `0`) if it has elapsed. Mutates the window-state record, so
+/// call this at most once per accepted (non-duplicate) relay.
+pub fn relay_tip_payable(env: &Env, tip: i128) -> i128 {
+    if tip <= 0 {
+        return 0;
+    }
+    let cap = get_relay_tip_window_cap(env);
+    let pool = get_relay_tip_pool(env);
+    if cap == 0 {
+        return tip.min(pool);
+    }
+    let window_len = get_relay_tip_window_ledgers(env);
+    let now = env.ledger().sequence();
+    let (window_start, spent): (u32, i128) = env
+        .storage()
+        .instance()
+        .get(&DataKeyF::RelayTipWindowState)
+        .unwrap_or((now, 0));
+    let (window_start, spent) =
+        if now.saturating_sub(window_start) >= window_len { (now, 0) } else { (window_start, spent) };
+    let headroom = cap.saturating_sub(spent).max(0);
+    let payable = tip.min(pool).min(headroom);
+    env.storage()
+        .instance()
+        .set(&DataKeyF::RelayTipWindowState, &(window_start, spent.saturating_add(payable)));
+    payable
+}
+
+// ── Prepaid gate-query credits ───────────────────────────────────────────────
+
+pub fn get_gate_credit_token(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKeyF::GateCreditToken)
+}
+
+pub fn set_gate_credit_token(env: &Env, token: &Address) {
+    env.storage().instance().set(&DataKeyF::GateCreditToken, token);
+}
+
+pub fn get_gate_credit_balance(env: &Env, depositor: &Address) -> i128 {
+    let key = DataKeyF::GateCreditBalance(depositor.clone());
+    env.storage().persistent().get(&key).unwrap_or(0)
+}
+
+fn set_gate_credit_balance(env: &Env, depositor: &Address, balance: i128) {
+    let key = DataKeyF::GateCreditBalance(depositor.clone());
+    if balance == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &balance);
+        env.storage().persistent().extend_ttl(&key, SCORE_TTL_THRESHOLD, SCORE_TTL_EXTEND_TO);
+    }
+}
+
+pub fn credit_gate_balance(env: &Env, depositor: &Address, amount: i128) -> i128 {
+    let new_balance = get_gate_credit_balance(env, depositor).saturating_add(amount);
+    set_gate_credit_balance(env, depositor, new_balance);
+    new_balance
+}
+
+/// Debits `amount` from `depositor`'s credit balance. Returns
+/// `Error::InsufficientGateCredits` rather than clamping — an under-funded
+/// debit must fail the metered call, never silently go negative.
+pub fn debit_gate_balance(env: &Env, depositor: &Address, amount: i128) -> Result<(), Error> {
+    let balance = get_gate_credit_balance(env, depositor);
+    if amount > balance {
+        return Err(Error::InsufficientGateCredits);
+    }
+    set_gate_credit_balance(env, depositor, balance - amount);
+    Ok(())
+}
+
+pub fn get_gate_credit_liability_total(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::GateCreditLiabilityTotal).unwrap_or(0)
+}
+
+pub fn add_gate_credit_liability(env: &Env, amount: i128) {
+    let total = get_gate_credit_liability_total(env).saturating_add(amount);
+    env.storage().instance().set(&DataKeyF::GateCreditLiabilityTotal, &total);
+}
+
+pub fn sub_gate_credit_liability(env: &Env, amount: i128) {
+    let total = (get_gate_credit_liability_total(env) - amount).max(0);
+    env.storage().instance().set(&DataKeyF::GateCreditLiabilityTotal, &total);
+}
+
+pub fn get_gate_credit_revenue(env: &Env) -> i128 {
+    env.storage().instance().get(&DataKeyF::GateCreditRevenue).unwrap_or(0)
+}
+
+pub fn add_gate_credit_revenue(env: &Env, amount: i128) {
+    let total = get_gate_credit_revenue(env).saturating_add(amount);
+    env.storage().instance().set(&DataKeyF::GateCreditRevenue, &total);
+}
+
+pub fn sub_gate_credit_revenue(env: &Env, amount: i128) -> Result<(), Error> {
+    let total = get_gate_credit_revenue(env);
+    if amount > total {
+        return Err(Error::ArithmeticOverflow);
+    }
+    env.storage().instance().set(&DataKeyF::GateCreditRevenue, &(total - amount));
+    Ok(())
+}
+
+pub fn get_gate_credit_withdrawal_delay(env: &Env) -> u64 {
+    env.storage().instance().get(&DataKeyF::GateCreditWithdrawalDelay).unwrap_or(0)
+}
+
+pub fn set_gate_credit_withdrawal_delay(env: &Env, delay_secs: u64) {
+    env.storage().instance().set(&DataKeyF::GateCreditWithdrawalDelay, &delay_secs);
+}
+
+pub fn get_gate_credit_withdrawal_request(env: &Env, depositor: &Address) -> Option<(i128, u64)> {
+    let key = DataKeyF::GateCreditWithdrawalRequest(depositor.clone());
+    env.storage().persistent().get(&key)
+}
+
+pub fn set_gate_credit_withdrawal_request(
+    env: &Env,
+    depositor: &Address,
+    amount: i128,
+    unlock_at: u64,
+) {
+    let key = DataKeyF::GateCreditWithdrawalRequest(depositor.clone());
+    env.storage().persistent().set(&key, &(amount, unlock_at));
+    env.storage().persistent().extend_ttl(&key, SCORE_TTL_THRESHOLD, SCORE_TTL_EXTEND_TO);
+}
+
+pub fn clear_gate_credit_withdrawal_request(env: &Env, depositor: &Address) {
+    env.storage().persistent().remove(&DataKeyF::GateCreditWithdrawalRequest(depositor.clone()));
+}
+
+// ── Tiered gate fee schedule ──────────────────────────────────────────────────
+
+pub fn get_fee_tier_schedule(env: &Env) -> Vec<FeeTier> {
+    env.storage().instance().get(&DataKeyF::FeeTierSchedule).unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn set_fee_tier_schedule(env: &Env, tiers: &Vec<FeeTier>) {
+    env.storage().instance().set(&DataKeyF::FeeTierSchedule, tiers);
+}
+
+pub fn get_fee_tier_window_ledgers(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKeyF::FeeTierWindowLedgers)
+        .unwrap_or(crate::constants::DEFAULT_FEE_TIER_WINDOW_LEDGERS)
+}
+
+pub fn set_fee_tier_window_ledgers(env: &Env, window: u32) {
+    env.storage().instance().set(&DataKeyF::FeeTierWindowLedgers, &window);
+}
+
+pub fn get_fee_exemption(env: &Env, consumer: &Address) -> Option<(u64, u32)> {
+    env.storage().persistent().get(&DataKeyF::FeeExemption(consumer.clone()))
+}
+
+pub fn set_fee_exemption(env: &Env, consumer: &Address, expires_at: u64, reason_code: u32) {
+    let key = DataKeyF::FeeExemption(consumer.clone());
+    env.storage().persistent().set(&key, &(expires_at, reason_code));
+    env.storage().persistent().extend_ttl(&key, SCORE_TTL_THRESHOLD, SCORE_TTL_EXTEND_TO);
+}
+
+pub fn clear_fee_exemption(env: &Env, consumer: &Address) {
+    env.storage().persistent().remove(&DataKeyF::FeeExemption(consumer.clone()));
+}
+
+/// Reads-then-advances the consumer's bounded rolling-window call counter,
+/// returning the call volume *before* this call is counted (so the very
+/// first call in a fresh window is always priced at the base tier). Rolls
+/// the window over (resets the counter to `0`) once `FeeTierWindowLedgers`
+/// have elapsed since the window started. O(1): a single fixed-shape record
+/// per consumer, never a per-call log.
+pub fn advance_consumer_volume_window(env: &Env, consumer: &Address) -> u32 {
+    let key = DataKeyF::ConsumerVolumeWindow(consumer.clone());
+    let window_len = get_fee_tier_window_ledgers(env);
+    let now = env.ledger().sequence();
+    let (window_start, count): (u32, u32) =
+        env.storage().persistent().get(&key).unwrap_or((now, 0));
+    let (window_start, count) =
+        if now.saturating_sub(window_start) >= window_len { (now, 0) } else { (window_start, count) };
+    env.storage().persistent().set(&key, &(window_start, count.saturating_add(1)));
+    env.storage().persistent().extend_ttl(&key, SCORE_TTL_THRESHOLD, SCORE_TTL_EXTEND_TO);
+    count
 }
 
 #[cfg(test)]

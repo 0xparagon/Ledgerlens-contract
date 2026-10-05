@@ -5,11 +5,13 @@ ROLLBACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$ROLLBACK_DIR/.." && pwd)"
 
 DRY_RUN=false
+NON_INTERACTIVE=false
 POSITIONAL=()
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
+    --non-interactive|--yes|-y) NON_INTERACTIVE=true ;;
     --help)
       sed -n '3,20p' "$0"
       exit 0
@@ -41,6 +43,11 @@ if [ "$NETWORK" = "mainnet" ]; then
   echo "  ║  MAINNET ROLLBACK — this action cannot be undone    ║"
   echo "  ╚══════════════════════════════════════════════════════╝"
   echo ""
+  if [ "$NON_INTERACTIVE" = true ]; then
+    echo "ERROR: refusing mainnet rollback in --non-interactive mode without an operator confirmation." >&2
+    echo "Rerun interactively and type 'rollback-mainnet' at the prompt." >&2
+    exit 1
+  fi
   read -rp "  Type 'rollback-mainnet' to confirm: " CONFIRM
   [ "$CONFIRM" = "rollback-mainnet" ] || { echo "Aborted."; exit 1; }
 fi
@@ -78,8 +85,12 @@ log "   soroban contract invoke --id $TARGET_CONTRACT_ID --source $ADMIN_IDENTIT
 log "   Execute only after executable_after has passed."
 
 # ── Step 3: Execute the rollback ──────────────────────────────
-read -rp "  Execute the rollback upgrade now? (yes/no): " EXECUTE_CONFIRM
-[ "$EXECUTE_CONFIRM" = "yes" ] || { log "Rollback aborted by operator."; exit 0; }
+if [ "$NON_INTERACTIVE" = true ]; then
+  log "Non-interactive mode: proceeding with rollback execution (no prompt)"
+else
+  read -rp "  Execute the rollback upgrade now? (yes/no): " EXECUTE_CONFIRM
+  [ "$EXECUTE_CONFIRM" = "yes" ] || { log "Rollback aborted by operator."; exit 0; }
+fi
 
 log "Step 3: Executing rollback upgrade"
 if [ "$DRY_RUN" = true ]; then

@@ -1021,6 +1021,118 @@ pub enum DataKeyD {
     SignerState(Address),
 }
 
+/// Storage keys added for the permissionless-keeper TTL reward, the
+/// permissionless attested-relay path, prepaid gate-query credits, and the
+/// tiered gate fee schedule. Grouped in one new enum (following the existing
+/// `DataKeyB`/`DataKeyC`/`DataKeyD`/`DataKeyE` split-by-feature-era
+/// convention) rather than extending an existing enum, so this is a purely
+/// additive storage change.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKeyF {
+    // ── Keeper TTL reward pool ──────────────────────────────────────────────
+    /// SEP-41 token the keeper reward pool is denominated in.
+    KeeperRewardToken,
+    /// Current reward-pool balance, in `KeeperRewardToken` stroops.
+    KeeperRewardPool,
+    /// Reward paid per entry successfully renewed by a keeper.
+    KeeperRewardPerEntry,
+    /// Estimated-remaining-TTL window (ledgers) within which an entry is
+    /// reward-eligible. See `DEFAULT_KEEPER_REWARD_WINDOW`.
+    KeeperRewardWindow,
+    /// Hard cap on total reward paid out across all keeper calls within a
+    /// single ledger. `0` disables the per-ledger cap (bounded only by the
+    /// pool balance and the per-call batch size).
+    KeeperRewardPerLedgerCap,
+    /// Running total already paid out in the current ledger; keyed by ledger
+    /// sequence so it naturally resets each ledger without an explicit clear.
+    KeeperRewardLedgerSpent(u32),
+
+    // ── Permissionless attested relay ───────────────────────────────────────
+    /// Marks a relayed attestation's commitment digest as already applied,
+    /// so a second relayer posting the identical attestation is a cheap,
+    /// well-defined no-op rather than a state change or error.
+    RelayedAttestationUsed(BytesN<32>),
+    /// SEP-41 token the relayer tip pool is denominated in.
+    RelayTipToken,
+    /// Current relayer tip pool balance.
+    RelayTipPool,
+    /// Tip paid to the relayer of the first accepted attestation in a batch.
+    RelayTipAmount,
+    /// Hard cap on total tips paid out per rolling window (see
+    /// `RelayTipWindowLedgers`). `0` disables the cap.
+    RelayTipWindowCap,
+    /// Length in ledgers of the relayer-tip anti-abuse window.
+    RelayTipWindowLedgers,
+    /// `(window_start_ledger, amount_spent_in_window)` for relayer tips.
+    RelayTipWindowState,
+
+    // ── Prepaid gate-query credits ──────────────────────────────────────────
+    /// SEP-41 token accepted for gate-query credit deposits.
+    GateCreditToken,
+    /// Depositor's current withdrawable/spendable credit balance.
+    GateCreditBalance(Address),
+    /// Pending withdrawal request: `(amount, unlock_timestamp)`.
+    GateCreditWithdrawalRequest(Address),
+    /// Delay (seconds) a withdrawal request must wait before it can be
+    /// completed. May be `0`.
+    GateCreditWithdrawalDelay,
+    /// Sum of all depositor balances currently outstanding — the contract's
+    /// total liability to depositors. Kept as a running counter (not
+    /// recomputed by iterating depositors) so the solvency check stays O(1).
+    GateCreditLiabilityTotal,
+    /// Fees already debited from depositor credit but not yet withdrawn by
+    /// governance — the portion of the contract's `GateCreditToken` holdings
+    /// that is *not* depositor liability.
+    GateCreditRevenue,
+
+    // ── Tiered gate fee schedule ─────────────────────────────────────────────
+    /// Ordered (ascending by `min_volume`) fee tier schedule.
+    FeeTierSchedule,
+    /// Length in ledgers of the rolling volume-accounting window per consumer.
+    FeeTierWindowLedgers,
+    /// Bounded per-consumer accounting record: `(window_start_ledger, calls_in_window)`.
+    ConsumerVolumeWindow(Address),
+    /// Governed exemption allowlist entry: `(expires_at_timestamp, reason_code)`.
+    FeeExemption(Address),
+}
+
+/// A cryptographic attestation for the permissionless attested-relay path
+/// (`relay_attested_score`). Unlike [`ScoreAttestation`] (used by
+/// `submit_score`, which additionally requires the service account's own
+/// Soroban `require_auth`), this attestation is the *sole* authorization for
+/// the state change — so its commitment must bind every field that affects
+/// state or relay safety: the score payload, `nonce` (replay protection),
+/// `valid_before_ledger` (a "sequence" freshness bound so a stale attestation
+/// can't be relayed indefinitely), `contract_id`, `contract_version`, and the
+/// network passphrase (via `env.ledger().network_id()`, included in the
+/// preimage the same way `ScoreAttestation`'s commitment already does — see
+/// `compute_relay_commitment`). Any relayer may submit it; the result does
+/// not depend on which relayer submits first (see `relay_attested_score`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayScoreAttestation {
+    pub commitment: BytesN<32>,
+    pub signature: BytesN<65>,
+    pub contract_id: BytesN<32>,
+    pub contract_version: u32,
+    pub nonce: u64,
+    /// Ledger sequence after which this attestation is no longer relayable.
+    pub valid_before_ledger: u32,
+}
+
+/// One entry in the gate-query fee-tier schedule: consumers whose rolling
+/// per-window call volume is `>= min_volume` (and below the next tier's
+/// `min_volume`) pay `fee` per `query_risk_gate_metered` call. Tiers are a
+/// flat per-call amount rather than a proportional rate, so fee computation
+/// needs no rounding — see `fee_schedule::compute_gate_fee`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeTier {
+    pub min_volume: u32,
+    pub fee: i128,
+}
+
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TierBounds {
